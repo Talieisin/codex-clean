@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}
+{"type":"item.started","item":{"type":"agent_message"}}
+{"type":"item.completed","item":{"type":"tool_call","name":"read_file","arguments":{"path":"Cargo.toml"}}}
+{"type":"item.completed","item":{"type":"agent_message","text":"This is a Rust project. "}}
+{"type":"item.completed","item":{"type":"agent_message","text":"It uses Cargo for dependency management."}}
+{"type":"thread.completed","thread_id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}

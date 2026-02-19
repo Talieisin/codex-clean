@@ -6,6 +6,8 @@ pub struct CodexOutput {
     pub session_id: Option<String>,
     pub messages: Vec<String>,
     pub multiple_threads_seen: bool,
+    /// Token usage: (input_tokens, cached_input_tokens, output_tokens)
+    pub usage: Option<(u64, u64, u64)>,
 }
 
 /// Rendered stdout/stderr strings
@@ -27,6 +29,11 @@ impl CodexOutput {
         } else if self.session_id.as_ref() != Some(&thread_id) {
             self.multiple_threads_seen = true;
         }
+    }
+
+    /// Record token usage (uses last seen values)
+    pub fn add_usage(&mut self, input: u64, cached: u64, output: u64) {
+        self.usage = Some((input, cached, output));
     }
 
     /// Add an agent message text
@@ -67,6 +74,15 @@ impl CodexOutput {
         } else {
             let _ = writeln!(stdout);
             let _ = writeln!(stdout, "{}", message);
+        }
+
+        if let Some((input, cached, output)) = self.usage {
+            let _ = writeln!(stdout);
+            let _ = writeln!(
+                stdout,
+                "Tokens: {} input ({} cached), {} output",
+                input, cached, output
+            );
         }
 
         RenderedOutput { stdout, stderr }
@@ -141,5 +157,33 @@ mod tests {
         assert!(rendered.stderr.contains("No session ID"));
         assert!(!rendered.stderr.contains("No response"));
         assert!(rendered.stdout.is_empty());
+    }
+
+    #[test]
+    fn add_usage_stores_last_seen() {
+        let mut output = CodexOutput::new();
+        output.add_usage(100, 50, 25);
+        assert_eq!(output.usage, Some((100, 50, 25)));
+        output.add_usage(200, 150, 75);
+        assert_eq!(output.usage, Some((200, 150, 75)));
+    }
+
+    #[test]
+    fn render_includes_usage_line() {
+        let mut output = CodexOutput::new();
+        output.session_id = Some("abc".into());
+        output.add_message("hello".into());
+        output.add_usage(15228, 14208, 249);
+        let rendered = output.render();
+        assert!(rendered.stdout.contains("Tokens: 15228 input (14208 cached), 249 output"));
+    }
+
+    #[test]
+    fn render_omits_usage_when_none() {
+        let mut output = CodexOutput::new();
+        output.session_id = Some("abc".into());
+        output.add_message("hello".into());
+        let rendered = output.render();
+        assert!(!rendered.stdout.contains("Tokens:"));
     }
 }

@@ -1,0 +1,7 @@
+{"type":"thread.started","thread_id":"0199b456-review-session-id"}
+{"type":"turn.started"}
+{"type":"reasoning","text":"Reviewing the uncommitted changes."}
+{"type":"command_execution","command":"git diff --cached","exit_code":0}
+{"type":"item.completed","item":{"type":"agent_message","text":"## Code Review\n\nThe changes look good overall. Here are my observations:\n\n1. **Error handling**: The new error handling in `runner.rs` properly propagates errors.\n2. **Test coverage**: New tests cover the happy path but consider adding edge cases."}}
+{"type":"turn.completed","usage":{"input_tokens":8192,"cached_input_tokens":6144,"output_tokens":512}}
+{"type":"thread.completed","thread_id":"0199b456-review-session-id"}

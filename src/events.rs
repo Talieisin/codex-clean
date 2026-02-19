@@ -5,6 +5,11 @@ use serde_json::Value;
 pub enum Event {
     ThreadStarted { thread_id: String },
     AgentMessage { text: Option<String> },
+    TurnCompleted {
+        input_tokens: u64,
+        cached_input_tokens: u64,
+        output_tokens: u64,
+    },
 }
 
 /// Parse a JSON line permissively, extracting only events we care about.
@@ -26,6 +31,17 @@ pub fn extract_event(line: &str) -> Option<Event> {
             } else {
                 None
             }
+        }
+        "turn.completed" => {
+            let usage = v.get("usage")?;
+            let input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            let cached_input_tokens = usage.get("cached_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            let output_tokens = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            Some(Event::TurnCompleted {
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+            })
         }
         _ => None, // Ignore unknown events gracefully
     }
@@ -92,6 +108,48 @@ mod tests {
     #[test]
     fn test_ignore_missing_type() {
         let json = r#"{"data":"no type field"}"#;
+        assert!(extract_event(json).is_none());
+    }
+
+    #[test]
+    fn test_parse_turn_completed() {
+        let json = r#"{"type":"turn.completed","usage":{"input_tokens":15228,"cached_input_tokens":14208,"output_tokens":249}}"#;
+        let event = extract_event(json).unwrap();
+        match event {
+            Event::TurnCompleted {
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+            } => {
+                assert_eq!(input_tokens, 15228);
+                assert_eq!(cached_input_tokens, 14208);
+                assert_eq!(output_tokens, 249);
+            }
+            _ => panic!("Expected TurnCompleted"),
+        }
+    }
+
+    #[test]
+    fn test_parse_turn_completed_partial_usage() {
+        let json = r#"{"type":"turn.completed","usage":{"input_tokens":100}}"#;
+        let event = extract_event(json).unwrap();
+        match event {
+            Event::TurnCompleted {
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+            } => {
+                assert_eq!(input_tokens, 100);
+                assert_eq!(cached_input_tokens, 0);
+                assert_eq!(output_tokens, 0);
+            }
+            _ => panic!("Expected TurnCompleted"),
+        }
+    }
+
+    #[test]
+    fn test_parse_turn_completed_missing_usage() {
+        let json = r#"{"type":"turn.completed"}"#;
         assert!(extract_event(json).is_none());
     }
 }

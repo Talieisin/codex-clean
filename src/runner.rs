@@ -17,39 +17,62 @@ pub enum ResumeTarget {
     Last,
 }
 
+/// Execution mode for codex
+pub enum Mode {
+    /// Run a new exec session
+    Exec,
+    /// Resume an existing session
+    Resume(ResumeTarget),
+    /// Run a code review
+    Review,
+}
+
 /// Run codex with the given arguments and prompt
-pub fn run_codex(args: &[String], prompt: &str, resume: Option<ResumeTarget>) -> Result<i32> {
+pub fn run_codex(args: &[String], prompt: &str, mode: Mode) -> Result<i32> {
     let mut cmd = Command::new("codex");
 
-    // Build command based on mode
-    // Both modes use "codex exec" with --experimental-json for JSON output
+    // All modes use "codex exec" with --json for JSON output
     cmd.arg("exec");
-    cmd.arg("--experimental-json");
-    cmd.arg("--skip-git-repo-check");
 
     // Track if we need to send prompt via stdin (required for --last)
     let mut use_stdin_for_prompt = false;
 
-    if let Some(target) = resume {
-        cmd.arg("resume");
-        match target {
-            ResumeTarget::SessionId(id) => {
-                cmd.arg(id);
-                if !prompt.is_empty() {
-                    cmd.arg(prompt);
+    match mode {
+        Mode::Exec => {
+            cmd.arg("--json");
+            cmd.arg("--skip-git-repo-check");
+            cmd.args(args);
+            cmd.arg(prompt);
+        }
+        Mode::Resume(target) => {
+            cmd.arg("--json");
+            cmd.arg("--skip-git-repo-check");
+            cmd.arg("resume");
+            match target {
+                ResumeTarget::SessionId(id) => {
+                    cmd.arg(id);
+                    if !prompt.is_empty() {
+                        cmd.arg(prompt);
+                    }
                 }
-            }
-            ResumeTarget::Last => {
-                cmd.arg("--last");
-                // With --last, prompt must come via stdin (codex CLI limitation)
-                if !prompt.is_empty() {
-                    use_stdin_for_prompt = true;
+                ResumeTarget::Last => {
+                    cmd.arg("--last");
+                    // With --last, prompt must come via stdin (codex CLI limitation)
+                    if !prompt.is_empty() {
+                        use_stdin_for_prompt = true;
+                    }
                 }
             }
         }
-    } else {
-        cmd.args(args);
-        cmd.arg(prompt);
+        Mode::Review => {
+            cmd.arg("review");
+            cmd.arg("--json");
+            cmd.arg("--skip-git-repo-check");
+            cmd.args(args);
+            if !prompt.is_empty() {
+                cmd.arg(prompt);
+            }
+        }
     }
 
     cmd.stdout(Stdio::piped());
@@ -76,13 +99,14 @@ pub fn run_codex(args: &[String], prompt: &str, resume: Option<ResumeTarget>) ->
     // Process stdout line by line
     let stdout = child.stdout.take().expect("stdout was piped");
     let reader = BufReader::new(stdout);
-    let output =
-        parse_codex_stream(reader).context("Failed to read codex stdout")?;
+    let parse_result = parse_codex_stream(reader);
 
-    // Wait for process to complete
+    // Always wait for child and join stderr thread, even if parsing failed
     let status: ExitStatus = child.wait().context("Failed to wait for codex process")?;
     let (stderr_buffer, stderr_truncated, stderr_error) =
         stderr_handle.join().expect("stderr thread panicked");
+
+    let output = parse_result.context("Failed to read codex stdout")?;
 
     let exit_code = status.code().unwrap_or(1);
 
@@ -136,6 +160,13 @@ pub fn parse_codex_stream<R: BufRead>(reader: R) -> io::Result<CodexOutput> {
                         output.add_message(t);
                     }
                 }
+                Event::TurnCompleted {
+                    input_tokens,
+                    cached_input_tokens,
+                    output_tokens,
+                } => {
+                    output.add_usage(input_tokens, cached_input_tokens, output_tokens);
+                }
             }
         }
     }
@@ -188,6 +219,20 @@ mod tests {
         let output = parse_codex_stream(BufReader::new(cursor)).unwrap();
         assert_eq!(output.session_id, Some("session-1".to_string()));
         assert_eq!(output.messages, vec!["hello".to_string(), "world".to_string()]);
+    }
+
+    #[test]
+    fn parse_codex_stream_extracts_usage() {
+        let data = r#"
+{"type":"thread.started","thread_id":"session-1"}
+{"type":"item.completed","item":{"type":"agent_message","text":"hello"}}
+{"type":"turn.completed","usage":{"input_tokens":15228,"cached_input_tokens":14208,"output_tokens":249}}
+"#;
+        let cursor = Cursor::new(data);
+        let output = parse_codex_stream(BufReader::new(cursor)).unwrap();
+        assert_eq!(output.session_id, Some("session-1".to_string()));
+        assert_eq!(output.messages, vec!["hello".to_string()]);
+        assert_eq!(output.usage, Some((15228, 14208, 249)));
     }
 
     #[test]

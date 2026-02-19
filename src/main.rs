@@ -1,11 +1,9 @@
-mod events;
-mod output;
-mod runner;
-
 use std::io::{self, BufRead};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+
+use codex_clean::runner;
 
 #[derive(Parser)]
 #[command(name = "codex-clean")]
@@ -35,6 +33,12 @@ enum Commands {
         #[arg(allow_hyphen_values = true)]
         prompt: Option<String>,
     },
+    /// Review code changes
+    Review {
+        /// Arguments passed through to codex exec review (e.g., --uncommitted, --base main, --commit SHA)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -46,6 +50,7 @@ fn main() -> ExitCode {
             session_id,
             prompt,
         }) => run_resume(last, session_id, prompt),
+        Some(Commands::Review { args }) => run_review(args),
         None => run_exec(cli.args),
     };
 
@@ -72,7 +77,7 @@ fn run_exec(args: Vec<String>) -> anyhow::Result<i32> {
         anyhow::bail!("Empty prompt provided");
     }
 
-    runner::run_codex(&codex_args.to_vec(), &prompt, None)
+    runner::run_codex(&codex_args.to_vec(), &prompt, runner::Mode::Exec)
 }
 
 fn run_resume(
@@ -80,16 +85,26 @@ fn run_resume(
     session_id: Option<String>,
     prompt: Option<String>,
 ) -> anyhow::Result<i32> {
-    // When --last is used, the first positional (session_id) is actually the prompt
+    // When --last is used, both positionals are prompt fragments
+    // (e.g., `resume --last add error handling` → prompt "add error")
     let (resume_target, actual_prompt) = if last {
-        // With --last, session_id positional becomes the prompt
-        (runner::ResumeTarget::Last, session_id.unwrap_or_default())
+        let parts: Vec<&str> = [session_id.as_deref(), prompt.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect();
+        (runner::ResumeTarget::Last, parts.join(" "))
     } else {
         let id = session_id.ok_or_else(|| anyhow::anyhow!("Either --last or SESSION_ID is required"))?;
         (runner::ResumeTarget::SessionId(id), prompt.unwrap_or_default())
     };
 
-    runner::run_codex(&[], &actual_prompt, Some(resume_target))
+    runner::run_codex(&[], &actual_prompt, runner::Mode::Resume(resume_target))
+}
+
+fn run_review(args: Vec<String>) -> anyhow::Result<i32> {
+    // Pass all args through to codex exec review — it handles its own
+    // flag and optional trailing prompt parsing. No heuristic needed.
+    runner::run_codex(&args, "", runner::Mode::Review)
 }
 
 fn read_stdin() -> anyhow::Result<String> {
@@ -170,6 +185,84 @@ mod tests {
             }) => {
                 assert_eq!(session_id, Some("session-123".to_string()));
                 assert_eq!(prompt, Some("-leading".to_string()));
+            }
+            _ => panic!("Expected resume command"),
+        }
+    }
+
+    #[test]
+    fn review_no_args() {
+        let cli = Cli::parse_from(["codex-clean", "review"]);
+        match cli.command {
+            Some(Commands::Review { args }) => {
+                assert!(args.is_empty());
+            }
+            _ => panic!("Expected review command"),
+        }
+    }
+
+    #[test]
+    fn review_with_flags_only() {
+        let cli = Cli::parse_from(["codex-clean", "review", "--uncommitted"]);
+        match cli.command {
+            Some(Commands::Review { args }) => {
+                assert_eq!(args, vec!["--uncommitted".to_string()]);
+            }
+            _ => panic!("Expected review command"),
+        }
+    }
+
+    #[test]
+    fn review_with_flags_and_prompt() {
+        let cli = Cli::parse_from([
+            "codex-clean",
+            "review",
+            "--base",
+            "main",
+            "focus on error handling",
+        ]);
+        match cli.command {
+            Some(Commands::Review { args }) => {
+                assert_eq!(
+                    args,
+                    vec![
+                        "--base".to_string(),
+                        "main".to_string(),
+                        "focus on error handling".to_string(),
+                    ]
+                );
+            }
+            _ => panic!("Expected review command"),
+        }
+    }
+
+    #[test]
+    fn resume_last_joins_split_prompt() {
+        // Simulates what clap produces for `resume --last add error`
+        // (session_id="add", prompt="error")
+        // run_resume should join them into "add error"
+        let cli = Cli::parse_from([
+            "codex-clean",
+            "resume",
+            "--last",
+            "add",
+            "error",
+        ]);
+        match cli.command {
+            Some(Commands::Resume {
+                last,
+                session_id,
+                prompt,
+            }) => {
+                assert!(last);
+                assert_eq!(session_id, Some("add".to_string()));
+                assert_eq!(prompt, Some("error".to_string()));
+                // Verify run_resume would join them — test the logic directly
+                let parts: Vec<&str> = [session_id.as_deref(), prompt.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                assert_eq!(parts.join(" "), "add error");
             }
             _ => panic!("Expected resume command"),
         }

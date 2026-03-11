@@ -6,6 +6,12 @@ pub struct CodexOutput {
     pub session_id: Option<String>,
     pub messages: Vec<String>,
     pub multiple_threads_seen: bool,
+    /// Token usage: (input_tokens, cached_input_tokens, output_tokens)
+    pub usage: Option<(u64, u64, u64)>,
+    /// Number of non-empty lines received from stdout
+    pub lines_seen: usize,
+    /// Number of lines that matched a recognised event
+    pub events_recognized: usize,
 }
 
 /// Rendered stdout/stderr strings
@@ -27,6 +33,11 @@ impl CodexOutput {
         } else if self.session_id.as_ref() != Some(&thread_id) {
             self.multiple_threads_seen = true;
         }
+    }
+
+    /// Record token usage (uses last seen values)
+    pub fn add_usage(&mut self, input: u64, cached: u64, output: u64) {
+        self.usage = Some((input, cached, output));
     }
 
     /// Add an agent message text
@@ -59,6 +70,15 @@ impl CodexOutput {
             }
         }
 
+        if self.lines_seen > 0 && self.events_recognized == 0 {
+            let _ = writeln!(
+                stderr,
+                "Warning: Received {} lines from codex but none matched known event types \
+                 (possible schema change in upstream codex)",
+                self.lines_seen
+            );
+        }
+
         let message = self.aggregated_message();
         if message.is_empty() {
             if self.session_id.is_some() {
@@ -67,6 +87,15 @@ impl CodexOutput {
         } else {
             let _ = writeln!(stdout);
             let _ = writeln!(stdout, "{}", message);
+        }
+
+        if let Some((input, cached, output)) = self.usage {
+            let _ = writeln!(stdout);
+            let _ = writeln!(
+                stdout,
+                "Tokens: {} input ({} cached), {} output",
+                input, cached, output
+            );
         }
 
         RenderedOutput { stdout, stderr }
@@ -141,5 +170,61 @@ mod tests {
         assert!(rendered.stderr.contains("No session ID"));
         assert!(!rendered.stderr.contains("No response"));
         assert!(rendered.stdout.is_empty());
+    }
+
+    #[test]
+    fn add_usage_stores_last_seen() {
+        let mut output = CodexOutput::new();
+        output.add_usage(100, 50, 25);
+        assert_eq!(output.usage, Some((100, 50, 25)));
+        output.add_usage(200, 150, 75);
+        assert_eq!(output.usage, Some((200, 150, 75)));
+    }
+
+    #[test]
+    fn render_includes_usage_line() {
+        let mut output = CodexOutput::new();
+        output.session_id = Some("abc".into());
+        output.add_message("hello".into());
+        output.add_usage(15228, 14208, 249);
+        let rendered = output.render();
+        assert!(rendered.stdout.contains("Tokens: 15228 input (14208 cached), 249 output"));
+    }
+
+    #[test]
+    fn render_omits_usage_when_none() {
+        let mut output = CodexOutput::new();
+        output.session_id = Some("abc".into());
+        output.add_message("hello".into());
+        let rendered = output.render();
+        assert!(!rendered.stdout.contains("Tokens:"));
+    }
+
+    #[test]
+    fn render_warns_on_unrecognized_lines() {
+        let mut output = CodexOutput::new();
+        output.lines_seen = 5;
+        output.events_recognized = 0;
+        let rendered = output.render();
+        assert!(rendered.stderr.contains("none matched known event types"));
+        assert!(rendered.stderr.contains("5 lines"));
+    }
+
+    #[test]
+    fn render_no_warning_when_some_events_recognized() {
+        let mut output = CodexOutput::new();
+        output.lines_seen = 5;
+        output.events_recognized = 2;
+        output.session_id = Some("abc".into());
+        output.add_message("hello".into());
+        let rendered = output.render();
+        assert!(!rendered.stderr.contains("none matched"));
+    }
+
+    #[test]
+    fn render_no_warning_when_no_lines() {
+        let output = CodexOutput::new();
+        let rendered = output.render();
+        assert!(!rendered.stderr.contains("none matched"));
     }
 }

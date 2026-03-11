@@ -8,6 +8,10 @@ pub struct CodexOutput {
     pub multiple_threads_seen: bool,
     /// Token usage: (input_tokens, cached_input_tokens, output_tokens)
     pub usage: Option<(u64, u64, u64)>,
+    /// Number of non-empty lines received from stdout
+    pub lines_seen: usize,
+    /// Number of lines that matched a recognised event
+    pub events_recognized: usize,
 }
 
 /// Rendered stdout/stderr strings
@@ -64,6 +68,15 @@ impl CodexOutput {
             None => {
                 let _ = writeln!(stderr, "Warning: No session ID received");
             }
+        }
+
+        if self.lines_seen > 0 && self.events_recognized == 0 {
+            let _ = writeln!(
+                stderr,
+                "Warning: Received {} lines from codex but none matched known event types \
+                 (possible schema change in upstream codex)",
+                self.lines_seen
+            );
         }
 
         let message = self.aggregated_message();
@@ -185,5 +198,33 @@ mod tests {
         output.add_message("hello".into());
         let rendered = output.render();
         assert!(!rendered.stdout.contains("Tokens:"));
+    }
+
+    #[test]
+    fn render_warns_on_unrecognized_lines() {
+        let mut output = CodexOutput::new();
+        output.lines_seen = 5;
+        output.events_recognized = 0;
+        let rendered = output.render();
+        assert!(rendered.stderr.contains("none matched known event types"));
+        assert!(rendered.stderr.contains("5 lines"));
+    }
+
+    #[test]
+    fn render_no_warning_when_some_events_recognized() {
+        let mut output = CodexOutput::new();
+        output.lines_seen = 5;
+        output.events_recognized = 2;
+        output.session_id = Some("abc".into());
+        output.add_message("hello".into());
+        let rendered = output.render();
+        assert!(!rendered.stderr.contains("none matched"));
+    }
+
+    #[test]
+    fn render_no_warning_when_no_lines() {
+        let output = CodexOutput::new();
+        let rendered = output.render();
+        assert!(!rendered.stderr.contains("none matched"));
     }
 }

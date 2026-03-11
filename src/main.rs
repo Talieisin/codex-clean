@@ -7,7 +7,7 @@ use codex_clean::runner;
 
 #[derive(Parser)]
 #[command(name = "codex-clean")]
-#[command(about = "Wraps codex exec to filter JSON output, showing only session IDs and agent messages")]
+#[command(about = "Wraps codex exec to filter JSON output, showing session IDs, agent messages, token usage, and supporting session resume and code review")]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
@@ -86,7 +86,7 @@ fn run_resume(
     prompt: Option<String>,
 ) -> anyhow::Result<i32> {
     // When --last is used, both positionals are prompt fragments
-    // (e.g., `resume --last add error handling` → prompt "add error")
+    // (e.g., `resume --last add error` → prompt "add error")
     let (resume_target, actual_prompt) = if last {
         let parts: Vec<&str> = [session_id.as_deref(), prompt.as_deref()]
             .into_iter()

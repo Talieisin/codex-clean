@@ -101,6 +101,12 @@ pub fn run_codex(args: &[String], prompt: &str, mode: Mode) -> Result<i32> {
     let reader = BufReader::new(stdout);
     let parse_result = parse_codex_stream(reader);
 
+    // If parsing failed early, kill the child to avoid a deadlock:
+    // the child may block writing to a full stdout pipe that we stopped reading.
+    if parse_result.is_err() {
+        let _ = child.kill();
+    }
+
     // Always wait for child and join stderr thread, even if parsing failed
     let status: ExitStatus = child.wait().context("Failed to wait for codex process")?;
     let (stderr_buffer, stderr_truncated, stderr_error) =
@@ -149,8 +155,13 @@ pub fn parse_codex_stream<R: BufRead>(reader: R) -> io::Result<CodexOutput> {
 
     for line in reader.lines() {
         let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        output.lines_seen += 1;
 
         if let Some(event) = extract_event(&line) {
+            output.events_recognized += 1;
             match event {
                 Event::ThreadStarted { thread_id } => {
                     output.add_thread_id(thread_id);
@@ -233,6 +244,34 @@ mod tests {
         assert_eq!(output.session_id, Some("session-1".to_string()));
         assert_eq!(output.messages, vec!["hello".to_string()]);
         assert_eq!(output.usage, Some((15228, 14208, 249)));
+    }
+
+    #[test]
+    fn parse_codex_stream_tracks_line_counts() {
+        let data = r#"
+{"type":"thread.started","thread_id":"s1"}
+{"type":"unknown.thing","data":"ignored"}
+{"type":"item.completed","item":{"type":"agent_message","text":"hi"}}
+not json at all
+"#;
+        let cursor = Cursor::new(data);
+        let output = parse_codex_stream(BufReader::new(cursor)).unwrap();
+        assert_eq!(output.lines_seen, 4);
+        assert_eq!(output.events_recognized, 2); // thread.started + agent_message
+    }
+
+    #[test]
+    fn parse_codex_stream_all_unrecognized() {
+        let data = r#"
+{"type":"new.unknown","data":"x"}
+{"type":"another.unknown","data":"y"}
+"#;
+        let cursor = Cursor::new(data);
+        let output = parse_codex_stream(BufReader::new(cursor)).unwrap();
+        assert_eq!(output.lines_seen, 2);
+        assert_eq!(output.events_recognized, 0);
+        let rendered = output.render();
+        assert!(rendered.stderr.contains("none matched known event types"));
     }
 
     #[test]

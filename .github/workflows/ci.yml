@@ -1,0 +1,10 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+jobs:
+  test:
+    uses: Talieisin/.github/.github/workflows/ci-cargo.yml@main
+    secrets: inherit

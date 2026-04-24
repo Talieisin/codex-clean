@@ -22,10 +22,10 @@ cargo build --release
 codex-clean "summarize this repo"
 
 # With codex options
-codex-clean -m gpt-5.2-codex --sandbox read-only "explain the main function"
+codex-clean -m gpt-5.5 --sandbox read-only "explain the main function"
 
 # With config options
-codex-clean -m gpt-5.2-codex --config model_reasoning_effort="high" --sandbox read-only "review this code"
+codex-clean -m gpt-5.5 --config model_reasoning_effort="high" --sandbox read-only "review this code"
 
 # Change working directory
 codex-clean -C /path/to/project "analyze the codebase"
@@ -60,7 +60,7 @@ codex-clean review --commit abc1234
 codex-clean review --base main "focus on error handling"
 
 # Review with model options
-codex-clean review -m gpt-5.2-codex --uncommitted
+codex-clean review -m gpt-5.5 --uncommitted
 ```
 
 ## Output Format
@@ -86,10 +86,12 @@ Tokens: 15228 input (14208 cached), 249 output
 3. Parses JSON events permissively, extracting:
    - `thread.started` → Session ID
    - `item.completed` with `agent_message` → Final response text
-   - `turn.completed` → Token usage stats
+   - `turn.completed` → Token usage stats (input / cached / output / reasoning)
+   - `turn.failed` and `error` → Error messages surfaced to stderr
 4. Silently ignores other event types (`reasoning`, `command_execution`, `turn.started`, etc.)
 5. On success: outputs session ID, aggregated messages, and usage stats; discards stderr
-6. On failure: outputs session ID, messages, usage stats, and stderr for debugging
+6. On failure: outputs session ID, messages, usage stats, surfaced errors, and codex stderr for debugging
+7. Closes child stdin with `Stdio::null()` so codex never waits on an inherited pipe from the parent (prevents hangs when invoked from orchestration tools like Claude Code)
 
 ### Generated Commands
 
@@ -137,7 +139,7 @@ codex-clean review [OPTIONS...] [prompt]
 
 ## Requirements
 
-- [Codex CLI](https://github.com/openai/codex) v0.104.0+ installed and in PATH
+- [Codex CLI](https://github.com/openai/codex) v0.124.0+ installed and in PATH
 - Rust 1.70+ (for building from source)
 
 ## Licence

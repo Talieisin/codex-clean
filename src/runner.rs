@@ -151,8 +151,13 @@ pub fn run_codex(args: &[String], prompt: &str, mode: Mode) -> Result<i32> {
             eprintln!("--- end stderr ---");
         }
 
-        if output.events_recognized == 0 {
+        if output.lines_seen == 0 {
             eprintln!("Codex exited with code {} and produced no JSON output", child_exit);
+        } else if output.events_recognized == 0 {
+            eprintln!(
+                "Codex exited with code {} and produced no recognized JSON events",
+                child_exit
+            );
         }
     } else if let Some(err) = stderr_error {
         eprintln!("Warning: Failed to capture codex stderr: {}", err);

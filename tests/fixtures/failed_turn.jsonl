@@ -1,0 +1,3 @@
+{"type":"thread.started","thread_id":"0199c789-failed-session-id"}
+{"type":"turn.started"}
+{"type":"turn.failed","error":{"message":"invalid_request_error: The following tools cannot be used with reasoning.effort 'minimal': image_gen, web_search."}}

@@ -6,12 +6,14 @@ pub struct CodexOutput {
     pub session_id: Option<String>,
     pub messages: Vec<String>,
     pub multiple_threads_seen: bool,
-    /// Token usage: (input_tokens, cached_input_tokens, output_tokens)
-    pub usage: Option<(u64, u64, u64)>,
+    /// Token usage: (input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens)
+    pub usage: Option<(u64, u64, u64, u64)>,
     /// Number of non-empty lines received from stdout
     pub lines_seen: usize,
     /// Number of lines that matched a recognised event
     pub events_recognized: usize,
+    /// Errors surfaced by codex via `turn.failed` or stream `error` events
+    pub errors: Vec<String>,
 }
 
 /// Rendered stdout/stderr strings
@@ -19,6 +21,10 @@ pub struct CodexOutput {
 pub struct RenderedOutput {
     pub stdout: String,
     pub stderr: String,
+}
+
+fn normalize_error_key(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 impl CodexOutput {
@@ -36,14 +42,29 @@ impl CodexOutput {
     }
 
     /// Record token usage (uses last seen values)
-    pub fn add_usage(&mut self, input: u64, cached: u64, output: u64) {
-        self.usage = Some((input, cached, output));
+    pub fn add_usage(&mut self, input: u64, cached: u64, output: u64, reasoning: u64) {
+        self.usage = Some((input, cached, output, reasoning));
     }
 
     /// Add an agent message text
     pub fn add_message(&mut self, text: String) {
         if !text.is_empty() {
             self.messages.push(text);
+        }
+    }
+
+    /// Record an error surfaced by codex (turn.failed or stream error).
+    /// Deduped — codex often emits the same error via both an `error`
+    /// event and a `turn.failed` event. Comparison is whitespace-normalised
+    /// so that trivial formatting drift between the two shapes does not
+    /// bypass the dedupe.
+    pub fn add_error(&mut self, message: String) {
+        let key = normalize_error_key(&message);
+        if key.is_empty() {
+            return;
+        }
+        if !self.errors.iter().any(|m| normalize_error_key(m) == key) {
+            self.errors.push(message);
         }
     }
 
@@ -81,7 +102,7 @@ impl CodexOutput {
 
         let message = self.aggregated_message();
         if message.is_empty() {
-            if self.session_id.is_some() {
+            if self.session_id.is_some() && self.errors.is_empty() {
                 let _ = writeln!(stderr, "Note: No response received");
             }
         } else {
@@ -89,13 +110,25 @@ impl CodexOutput {
             let _ = writeln!(stdout, "{}", message);
         }
 
-        if let Some((input, cached, output)) = self.usage {
+        for err in &self.errors {
+            let _ = writeln!(stderr, "Error from codex: {}", err);
+        }
+
+        if let Some((input, cached, output, reasoning)) = self.usage {
             let _ = writeln!(stdout);
-            let _ = writeln!(
-                stdout,
-                "Tokens: {} input ({} cached), {} output",
-                input, cached, output
-            );
+            if reasoning > 0 {
+                let _ = writeln!(
+                    stdout,
+                    "Tokens: {} input ({} cached), {} output ({} reasoning)",
+                    input, cached, output, reasoning
+                );
+            } else {
+                let _ = writeln!(
+                    stdout,
+                    "Tokens: {} input ({} cached), {} output",
+                    input, cached, output
+                );
+            }
         }
 
         RenderedOutput { stdout, stderr }
@@ -175,10 +208,10 @@ mod tests {
     #[test]
     fn add_usage_stores_last_seen() {
         let mut output = CodexOutput::new();
-        output.add_usage(100, 50, 25);
-        assert_eq!(output.usage, Some((100, 50, 25)));
-        output.add_usage(200, 150, 75);
-        assert_eq!(output.usage, Some((200, 150, 75)));
+        output.add_usage(100, 50, 25, 10);
+        assert_eq!(output.usage, Some((100, 50, 25, 10)));
+        output.add_usage(200, 150, 75, 30);
+        assert_eq!(output.usage, Some((200, 150, 75, 30)));
     }
 
     #[test]
@@ -186,9 +219,51 @@ mod tests {
         let mut output = CodexOutput::new();
         output.session_id = Some("abc".into());
         output.add_message("hello".into());
-        output.add_usage(15228, 14208, 249);
+        output.add_usage(15228, 14208, 249, 0);
         let rendered = output.render();
         assert!(rendered.stdout.contains("Tokens: 15228 input (14208 cached), 249 output"));
+        assert!(!rendered.stdout.contains("reasoning"));
+    }
+
+    #[test]
+    fn render_includes_reasoning_tokens_when_nonzero() {
+        let mut output = CodexOutput::new();
+        output.session_id = Some("abc".into());
+        output.add_message("hello".into());
+        output.add_usage(15228, 14208, 249, 512);
+        let rendered = output.render();
+        assert!(rendered
+            .stdout
+            .contains("Tokens: 15228 input (14208 cached), 249 output (512 reasoning)"));
+    }
+
+    #[test]
+    fn add_error_dedupes_whitespace_variants() {
+        let mut output = CodexOutput::new();
+        output.add_error("connection reset".to_string());
+        output.add_error("  connection   reset  ".to_string());
+        output.add_error("connection\nreset".to_string());
+        assert_eq!(output.errors.len(), 1, "whitespace-only differences should dedupe");
+    }
+
+    #[test]
+    fn add_error_skips_empty() {
+        let mut output = CodexOutput::new();
+        output.add_error("".to_string());
+        output.add_error("   \n  ".to_string());
+        assert!(output.errors.is_empty());
+    }
+
+    #[test]
+    fn render_surfaces_turn_failed_error() {
+        let mut output = CodexOutput::new();
+        output.session_id = Some("abc".into());
+        output.add_error("invalid_request_error: bad reasoning effort".into());
+        let rendered = output.render();
+        assert!(rendered.stderr.contains("Error from codex"));
+        assert!(rendered.stderr.contains("invalid_request_error"));
+        // Should not claim "No response received" — the error already explains it
+        assert!(!rendered.stderr.contains("No response received"));
     }
 
     #[test]

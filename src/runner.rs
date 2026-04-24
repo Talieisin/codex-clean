@@ -77,8 +77,14 @@ pub fn run_codex(args: &[String], prompt: &str, mode: Mode) -> Result<i32> {
 
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    // Codex >=0.123 reads additional input from stdin until EOF unless
+    // stdin is piped+closed or /dev/null. If we inherit a long-lived stdin
+    // from the parent (e.g. Claude Code), codex hangs indefinitely waiting
+    // for EOF. Force stdin closed except when we need to send the prompt.
     if use_stdin_for_prompt {
         cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
     }
 
     let mut child = cmd.spawn().context("Failed to spawn codex process")?;
@@ -114,7 +120,15 @@ pub fn run_codex(args: &[String], prompt: &str, mode: Mode) -> Result<i32> {
 
     let output = parse_result.context("Failed to read codex stdout")?;
 
-    let exit_code = status.code().unwrap_or(1);
+    let child_exit = status.code().unwrap_or(1);
+    // Codex normally exits non-zero when it emits turn.failed / error events,
+    // but the JSONL schema does not guarantee this. Escalate so downstream
+    // callers (CI, scripts) do not treat an API failure as success.
+    let exit_code = if child_exit == 0 && !output.errors.is_empty() {
+        1
+    } else {
+        child_exit
+    };
 
     // On failure, print stderr for debugging
     if !status.success() {
@@ -137,8 +151,13 @@ pub fn run_codex(args: &[String], prompt: &str, mode: Mode) -> Result<i32> {
             eprintln!("--- end stderr ---");
         }
 
-        if output.session_id.is_none() && output.messages.is_empty() {
-            eprintln!("Codex exited with code {} and produced no JSON output", exit_code);
+        if output.lines_seen == 0 {
+            eprintln!("Codex exited with code {} and produced no JSON output", child_exit);
+        } else if output.events_recognized == 0 {
+            eprintln!(
+                "Codex exited with code {} and produced no recognized JSON events",
+                child_exit
+            );
         }
     } else if let Some(err) = stderr_error {
         eprintln!("Warning: Failed to capture codex stderr: {}", err);
@@ -175,8 +194,17 @@ pub fn parse_codex_stream<R: BufRead>(reader: R) -> io::Result<CodexOutput> {
                     input_tokens,
                     cached_input_tokens,
                     output_tokens,
+                    reasoning_output_tokens,
                 } => {
-                    output.add_usage(input_tokens, cached_input_tokens, output_tokens);
+                    output.add_usage(
+                        input_tokens,
+                        cached_input_tokens,
+                        output_tokens,
+                        reasoning_output_tokens,
+                    );
+                }
+                Event::TurnFailed { message } | Event::StreamError { message } => {
+                    output.add_error(message);
                 }
             }
         }
@@ -237,13 +265,38 @@ mod tests {
         let data = r#"
 {"type":"thread.started","thread_id":"session-1"}
 {"type":"item.completed","item":{"type":"agent_message","text":"hello"}}
-{"type":"turn.completed","usage":{"input_tokens":15228,"cached_input_tokens":14208,"output_tokens":249}}
+{"type":"turn.completed","usage":{"input_tokens":15228,"cached_input_tokens":14208,"output_tokens":249,"reasoning_output_tokens":64}}
 "#;
         let cursor = Cursor::new(data);
         let output = parse_codex_stream(BufReader::new(cursor)).unwrap();
         assert_eq!(output.session_id, Some("session-1".to_string()));
         assert_eq!(output.messages, vec!["hello".to_string()]);
-        assert_eq!(output.usage, Some((15228, 14208, 249)));
+        assert_eq!(output.usage, Some((15228, 14208, 249, 64)));
+    }
+
+    #[test]
+    fn parse_codex_stream_captures_turn_failed() {
+        let data = r#"
+{"type":"thread.started","thread_id":"session-err"}
+{"type":"turn.started"}
+{"type":"turn.failed","error":{"message":"invalid_request_error: bad effort"}}
+"#;
+        let cursor = Cursor::new(data);
+        let output = parse_codex_stream(BufReader::new(cursor)).unwrap();
+        assert_eq!(output.session_id, Some("session-err".to_string()));
+        assert_eq!(output.errors.len(), 1);
+        assert!(output.errors[0].contains("invalid_request_error"));
+    }
+
+    #[test]
+    fn parse_codex_stream_captures_stream_error() {
+        let data = r#"
+{"type":"thread.started","thread_id":"session-err"}
+{"type":"error","message":"connection reset"}
+"#;
+        let cursor = Cursor::new(data);
+        let output = parse_codex_stream(BufReader::new(cursor)).unwrap();
+        assert_eq!(output.errors, vec!["connection reset".to_string()]);
     }
 
     #[test]

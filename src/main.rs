@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use codex_clean::runner;
+use codex_clean::{runner, seat_cmd};
 
 #[derive(Parser)]
 #[command(name = "codex-clean")]
@@ -39,6 +39,52 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Manage ChatGPT seats (separate OAuth identities) for rotation across usage caps
+    Seat {
+        #[command(subcommand)]
+        action: SeatAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SeatAction {
+    /// Add a new seat (default: device-code login; --import adopts current ~/.codex/auth.json)
+    Add {
+        /// Seat identifier (used in CODEX_CLEAN_SEAT)
+        name: String,
+        /// Human-friendly label shown in `seat list`
+        #[arg(long)]
+        label: Option<String>,
+        /// Adopt the existing ~/.codex/auth.json as this seat (no login flow)
+        #[arg(long)]
+        import: bool,
+        /// Use the browser-redirect login flow instead of device-code
+        #[arg(long)]
+        browser: bool,
+    },
+    /// List configured seats and their current state
+    List,
+    /// Re-authenticate an existing seat
+    Login {
+        /// Name of the seat to re-authenticate
+        name: String,
+        /// Use the browser-redirect login flow instead of device-code
+        #[arg(long)]
+        browser: bool,
+    },
+    /// Pin the active seat for future runs
+    Use {
+        /// Name of the seat to make active
+        name: String,
+    },
+    /// Remove a seat from the configuration
+    Remove {
+        /// Name of the seat to remove
+        name: String,
+        /// Skip the confirmation prompt
+        #[arg(long, short)]
+        yes: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -51,6 +97,7 @@ fn main() -> ExitCode {
             prompt,
         }) => run_resume(last, session_id, prompt),
         Some(Commands::Review { args }) => run_review(args),
+        Some(Commands::Seat { action }) => run_seat(action).map(|()| 0),
         None => run_exec(cli.args),
     };
 
@@ -60,6 +107,21 @@ fn main() -> ExitCode {
             eprintln!("Error: {:#}", e);
             ExitCode::from(1)
         }
+    }
+}
+
+fn run_seat(action: SeatAction) -> anyhow::Result<()> {
+    match action {
+        SeatAction::Add {
+            name,
+            label,
+            import,
+            browser,
+        } => seat_cmd::add(&name, label.as_deref(), import, browser),
+        SeatAction::List => seat_cmd::list(),
+        SeatAction::Login { name, browser } => seat_cmd::login(&name, browser),
+        SeatAction::Use { name } => seat_cmd::use_seat(&name),
+        SeatAction::Remove { name, yes } => seat_cmd::remove(&name, yes),
     }
 }
 

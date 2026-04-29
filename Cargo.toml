@@ -1,12 +1,20 @@
 [package]
 name = "codex-clean"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 
 [dependencies]
 anyhow = "1.0.102"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 clap = { version = "4.6.1", features = ["derive"] }
+dirs = "5"
+fs2 = "0.4"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.149"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 lto = true

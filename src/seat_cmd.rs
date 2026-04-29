@@ -179,9 +179,11 @@ fn add_via_import(name: &str, label: Option<&str>, config: &mut SeatConfig) -> R
     }
     let bytes = fs::read(&active_auth)
         .with_context(|| format!("reading {}", active_auth.display()))?;
+    // Propagate read/parse failures (rather than silently importing without
+    // an account_id and weakening mismatch protection later); a missing
+    // tokens.account_id field is fine and surfaces as Ok(None).
     let account_id = read_account_id(&active_auth)
-        .ok()
-        .flatten();
+        .with_context(|| format!("reading account_id from {}", active_auth.display()))?;
     let dest = seat_auth_path(name)?;
     if let Some(parent) = dest.parent() {
         seat::secure_create_dir_all(parent)?;
@@ -446,7 +448,11 @@ pub fn login(name: &str, browser: bool) -> Result<()> {
     entry.consecutive_failures = 0;
     state.save()?;
 
-    let _ = config.save();
+    // Persist any account_id we may have just adopted. Failing here would
+    // weaken mismatch protection on future re-logins, so propagate.
+    config
+        .save()
+        .with_context(|| format!("saving updated seat config for '{}'", name))?;
     eprintln!("Seat '{}' re-authenticated.", name);
     Ok(())
 }

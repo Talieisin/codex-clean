@@ -328,39 +328,44 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
 
 /// Create `path` (and parents) with restrictive permissions on Unix. Any
 /// directories we create get mode 0700 so the seat private store isn't
-/// world-readable on shared systems.
+/// world-readable on shared systems. Traversal is strictly bounded by
+/// `config_dir()` so a `CODEX_CLEAN_HOME` override pointing outside `~/`
+/// (used in tests, but valid for users too) can never chmod system paths
+/// like `/tmp` or a mount root.
 pub fn secure_create_dir_all(path: &Path) -> Result<()> {
     fs::create_dir_all(path)
         .with_context(|| format!("creating {}", path.display()))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        // Walk the chain we just created and tighten perms on anything that
-        // isn't already at most 0700. We don't want to change perms on
-        // pre-existing dirs further up the tree (e.g. ~/.config) — that's
-        // the user's decision — so only tighten dirs whose mode bits are
-        // wider than 0700.
-        let mut cur: Option<&Path> = Some(path);
-        while let Some(p) = cur {
-            if let Ok(meta) = fs::metadata(p) {
-                let mode = meta.permissions().mode() & 0o777;
-                if mode != 0 && mode != 0o700 && (mode & 0o077) != 0 {
-                    let mut perms = meta.permissions();
-                    perms.set_mode(0o700);
-                    let _ = fs::set_permissions(p, perms);
-                }
-            }
-            cur = p.parent().filter(|pp| !pp.as_os_str().is_empty());
-            // Stop once we hit something outside our config tree to avoid
-            // touching the user's home directory permissions.
-            if let Some(home) = dirs::home_dir() {
-                if cur.map(|c| c == home).unwrap_or(false) {
+        // Always tighten the leaf path itself.
+        chmod_0700_if_loose(path);
+        // Walk upward only while we're still inside the configured
+        // codex-clean tree. We never touch ancestors above config_dir.
+        if let Ok(bound) = config_dir() {
+            let mut cur = path.parent();
+            while let Some(p) = cur {
+                if !p.starts_with(&bound) {
                     break;
                 }
+                chmod_0700_if_loose(p);
+                cur = p.parent().filter(|pp| !pp.as_os_str().is_empty());
             }
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn chmod_0700_if_loose(p: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = fs::metadata(p) {
+        let mode = meta.permissions().mode() & 0o777;
+        if mode != 0 && mode != 0o700 && (mode & 0o077) != 0 {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o700);
+            let _ = fs::set_permissions(p, perms);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

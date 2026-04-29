@@ -242,7 +242,11 @@ fn classify_attempt(attempt: &AttemptResult) -> FailureKind {
 fn log_unmatched(seat: &str, attempt: &AttemptResult) -> Result<()> {
     let path = unmatched_log_path()?;
     if let Some(p) = path.parent() {
-        std::fs::create_dir_all(p).ok();
+        // 0700 on the parent dir; 0600 on the file itself. The captured
+        // stderr tail can include sensitive context (model output, partial
+        // tokens, error payloads) so we treat this log like a credential
+        // file rather than a default-perms application log.
+        seat::secure_create_dir_all(p)?;
     }
     let stderr = String::from_utf8_lossy(&attempt.stderr_buffer);
     let tail: Vec<&str> = stderr.lines().rev().take(20).collect();
@@ -254,13 +258,32 @@ fn log_unmatched(seat: &str, attempt: &AttemptResult) -> Result<()> {
         attempt.exit_code,
         tail
     );
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
         .open(&path)
         .with_context(|| format!("opening {}", path.display()))?;
     f.write_all(entry.as_bytes())
         .with_context(|| format!("writing to {}", path.display()))?;
+
+    // Tighten an existing file's perms in case it was created by an older
+    // build (or another process) at the umask default.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&path) {
+            let mut perms = meta.permissions();
+            if perms.mode() & 0o777 != 0o600 {
+                perms.set_mode(0o600);
+                let _ = std::fs::set_permissions(&path, perms);
+            }
+        }
+    }
     Ok(())
 }
 

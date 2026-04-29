@@ -302,19 +302,9 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     fs::rename(&tmp, path)
         .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
 
-    // Belt-and-braces: ensure existing files take 0600 even if the rename
-    // landed on an older file with looser perms.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = fs::metadata(path) {
-            let mut perms = meta.permissions();
-            if perms.mode() & 0o777 != 0o600 {
-                perms.set_mode(0o600);
-                let _ = fs::set_permissions(path, perms);
-            }
-        }
-    }
+    // No post-rename chmod is needed: rename(2) replaces the destination
+    // entry with the temp file's inode, so the surviving file has the temp
+    // file's perms (0o600 from the OpenOptions::mode above on Unix).
 
     // fsync the parent directory so the rename is durable across crashes.
     #[cfg(unix)]
@@ -326,45 +316,69 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Create `path` (and parents) with restrictive permissions on Unix. Any
-/// directories we create get mode 0700 so the seat private store isn't
-/// world-readable on shared systems. Traversal is strictly bounded by
-/// `config_dir()` so a `CODEX_CLEAN_HOME` override pointing outside `~/`
-/// (used in tests, but valid for users too) can never chmod system paths
-/// like `/tmp` or a mount root.
+/// Create `path` (and parents) with restrictive permissions on Unix.
+///
+/// Only directories that this call actually *creates* are tightened to mode
+/// 0700; any directory that already existed (including the leaf) is left
+/// untouched. That preserves the original intent — fresh seat directories
+/// shouldn't be world-readable — while making it safe to call with a path
+/// rooted outside the user's home (e.g. `CODEX_CLEAN_HOME=/tmp/...` in tests,
+/// or `path == config_dir`). We never chmod a directory we didn't just make.
+///
+/// `lstat` is used so a symlink in the path can't redirect the chmod onto
+/// the link target.
 pub fn secure_create_dir_all(path: &Path) -> Result<()> {
+    // Snapshot the deepest pre-existing ancestor *before* we create anything;
+    // anything strictly below this point is what create_dir_all is about to
+    // create, and only those should be tightened.
+    let pre_existing_root = first_existing_ancestor(path);
+
     fs::create_dir_all(path)
         .with_context(|| format!("creating {}", path.display()))?;
+
     #[cfg(unix)]
     {
-        // Always tighten the leaf path itself.
-        chmod_0700_if_loose(path);
-        // Walk upward only while we're still inside the configured
-        // codex-clean tree. We never touch ancestors above config_dir.
-        if let Ok(bound) = config_dir() {
-            let mut cur = path.parent();
-            while let Some(p) = cur {
-                if !p.starts_with(&bound) {
-                    break;
-                }
-                chmod_0700_if_loose(p);
-                cur = p.parent().filter(|pp| !pp.as_os_str().is_empty());
+        let mut cur: Option<&Path> = Some(path);
+        while let Some(p) = cur {
+            // Stop the moment we reach the first directory that was already
+            // there before this call. Don't touch its perms.
+            if pre_existing_root.as_deref() == Some(p) {
+                break;
             }
+            chmod_0700_if_loose_no_follow(p);
+            cur = p.parent().filter(|pp| !pp.as_os_str().is_empty());
         }
     }
     Ok(())
 }
 
-#[cfg(unix)]
-fn chmod_0700_if_loose(p: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Ok(meta) = fs::metadata(p) {
-        let mode = meta.permissions().mode() & 0o777;
-        if mode != 0 && mode != 0o700 && (mode & 0o077) != 0 {
-            let mut perms = meta.permissions();
-            perms.set_mode(0o700);
-            let _ = fs::set_permissions(p, perms);
+/// Walk up from `path`, returning the deepest ancestor (or `path` itself)
+/// that already exists, or `None` if the entire chain is missing.
+fn first_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut cur: Option<&Path> = Some(path);
+    while let Some(p) = cur {
+        if p.exists() {
+            return Some(p.to_path_buf());
         }
+        cur = p.parent().filter(|pp| !pp.as_os_str().is_empty());
+    }
+    None
+}
+
+#[cfg(unix)]
+fn chmod_0700_if_loose_no_follow(p: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    // lstat: if `p` is a symlink we leave it alone rather than chmod'ing
+    // through to the target.
+    let Ok(meta) = fs::symlink_metadata(p) else { return };
+    if meta.file_type().is_symlink() {
+        return;
+    }
+    let mode = meta.permissions().mode() & 0o777;
+    if mode != 0 && mode != 0o700 && (mode & 0o077) != 0 {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o700);
+        let _ = fs::set_permissions(p, perms);
     }
 }
 
@@ -924,6 +938,51 @@ name = "a"
         let p = dir.join("nested").join("deep").join("data.txt");
         atomic_write(&p, b"x").unwrap();
         assert!(p.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_create_dir_all_does_not_chmod_pre_existing_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir();
+        // Mark the pre-existing tempdir as world-readable to prove we leave it alone.
+        let mut perms = fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&dir, perms).unwrap();
+
+        let nested = dir.join("a").join("b");
+        secure_create_dir_all(&nested).unwrap();
+
+        let outer_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            outer_mode, 0o755,
+            "pre-existing ancestor outside any newly-created chain must be left alone"
+        );
+        let inner_mode = fs::metadata(&nested).unwrap().permissions().mode() & 0o777;
+        assert_eq!(inner_mode, 0o700, "newly created dirs must be tightened");
+        let middle_mode = fs::metadata(dir.join("a")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            middle_mode, 0o700,
+            "intermediate newly-created dir must also be tightened"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_create_dir_all_is_no_op_when_path_already_exists() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir();
+        let mut perms = fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&dir, perms).unwrap();
+
+        // Path is the tempdir itself — already exists, so nothing should be tightened.
+        secure_create_dir_all(&dir).unwrap();
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "secure_create_dir_all must never chmod a pre-existing leaf path"
+        );
     }
 
     fn tempdir() -> PathBuf {

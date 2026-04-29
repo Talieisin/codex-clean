@@ -268,22 +268,27 @@ fn log_unmatched(seat: &str, attempt: &AttemptResult) -> Result<()> {
     let mut f = opts
         .open(&path)
         .with_context(|| format!("opening {}", path.display()))?;
-    f.write_all(entry.as_bytes())
-        .with_context(|| format!("writing to {}", path.display()))?;
 
-    // Tighten an existing file's perms in case it was created by an older
-    // build (or another process) at the umask default.
+    // Tighten perms via the open file descriptor (fchmod) before writing.
+    // Path-based set_permissions would race with another process replacing
+    // the path between our open and the chmod; using the fd we can't be
+    // pointed at a different file. Mode is only applied on creation, so for
+    // a pre-existing log file (created by an older build at the umask
+    // default) this is the only path that tightens it.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(&path) {
+        if let Ok(meta) = f.metadata() {
             let mut perms = meta.permissions();
             if perms.mode() & 0o777 != 0o600 {
                 perms.set_mode(0o600);
-                let _ = std::fs::set_permissions(&path, perms);
+                let _ = f.set_permissions(perms);
             }
         }
     }
+
+    f.write_all(entry.as_bytes())
+        .with_context(|| format!("writing to {}", path.display()))?;
     Ok(())
 }
 

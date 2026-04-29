@@ -140,10 +140,25 @@ fn does_not_hang_when_parent_stdin_stays_open() {
     let orig_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", shim_dir.display(), orig_path);
 
+    // Isolate this test from the user's real ~/.config/codex-clean and
+    // ~/.codex. Without these overrides, if the user has multi-seat
+    // configured locally, the test runs the seat-aware path against their
+    // real lockfile and seat data — which deadlocks against any concurrent
+    // codex-clean activity. Pointing CODEX_CLEAN_HOME at a tempdir with no
+    // seats.toml puts us back on the no-seats backwards-compat path.
+    let isolated_clean_home =
+        std::path::PathBuf::from(tmp).join("codex-clean-isolated-config");
+    std::fs::create_dir_all(&isolated_clean_home).unwrap();
+    let isolated_codex_home = std::path::PathBuf::from(tmp).join("codex-isolated-home");
+    std::fs::create_dir_all(&isolated_codex_home).unwrap();
+
     let binary = env!("CARGO_BIN_EXE_codex-clean");
 
     let mut child = Command::new(binary)
         .env("PATH", &new_path)
+        .env("CODEX_CLEAN_HOME", &isolated_clean_home)
+        .env("CODEX_HOME", &isolated_codex_home)
+        .env_remove("CODEX_CLEAN_SEAT")
         .arg("hello")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

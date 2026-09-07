@@ -903,7 +903,12 @@ pub fn strategy(name: Option<&str>, fixed_seat: Option<&str>) -> Result<()> {
     config.rotation.strategy = strategy;
     config.validate()?;
     config.save()?;
-    log_event("strategy", config.rotation.fixed_seat.as_deref().unwrap_or("-"), &format!("set to {}", strategy));
+    let event_seat = if strategy == seat::Strategy::Fixed {
+        config.rotation.fixed_seat.as_deref().unwrap_or("-")
+    } else {
+        "-"
+    };
+    log_event("strategy", event_seat, &format!("set to {}", strategy));
     eprintln!(
         "Rotation strategy is now {}{}.",
         strategy,

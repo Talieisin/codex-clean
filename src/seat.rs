@@ -1025,10 +1025,11 @@ pub fn pick_seat_excluding(
     if all_eligible.is_empty() {
         return Err(all_blocked_error(config, state));
     }
+    let excluded: std::collections::HashSet<&str> = exclude.iter().map(String::as_str).collect();
     let untried: Vec<&SeatEntry> = all_eligible
         .iter()
         .copied()
-        .filter(|s| !exclude.contains(&s.name))
+        .filter(|s| !excluded.contains(s.name.as_str()))
         .collect();
     let eligible = if untried.is_empty() { all_eligible } else { untried };
 

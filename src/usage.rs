@@ -356,6 +356,12 @@ pub fn app_server_rate_limits(home: &Path, timeout: Duration) -> Result<Value, U
         .recv_timeout(SHUTDOWN_GRACE.min(remaining_or_floor(deadline)))
         .unwrap_or_default();
 
+    // Report the caller's full budget on timeout, not the sliver that was
+    // left when the deadline hit.
+    let result = result.map_err(|e| match e {
+        UsageFetchError::Timeout(_) => UsageFetchError::Timeout(timeout),
+        other => other,
+    });
     let result = match (result, teardown) {
         (Ok(v), Ok(())) => Ok(v),
         (Ok(_), Err(t)) => Err(UsageFetchError::Protocol(format!(

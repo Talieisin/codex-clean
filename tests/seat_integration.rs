@@ -1638,10 +1638,21 @@ fn private_log_refuses_loose_file_it_cannot_tighten_and_rotates_when_large() {
     assert!(seat::append_private_log(&link, "x\n").is_err());
     assert_eq!(fs::read_to_string(&decoy).unwrap(), "");
 
-    // Rotation: a file at the cap is moved aside before the next append.
+    // Rotation: a file at the cap is moved aside before the next append,
+    // replacing any earlier rotated file.
+    let rotated = env.clean_home_path.join("seat-events.log.1");
+    fs::write(&rotated, "stale").unwrap();
     let big = vec![b'z'; seat::PRIVATE_LOG_ROTATE_BYTES as usize];
     fs::write(&path, &big).unwrap();
     seat::append_private_log(&path, "after\n").unwrap();
     assert_eq!(fs::read_to_string(&path).unwrap(), "after\n");
-    assert_eq!(fs::metadata(env.clean_home_path.join("seat-events.log.1")).unwrap().len(), big.len() as u64);
+    assert_eq!(fs::metadata(&rotated).unwrap().len(), big.len() as u64);
+
+    // If rotation cannot happen, the write is refused rather than growing the log.
+    fs::write(&path, &big).unwrap();
+    fs::remove_file(&rotated).unwrap();
+    fs::create_dir(&rotated).unwrap(); // a directory in the way: remove_file fails
+    assert!(seat::append_private_log(&path, "nope\n").is_err());
+    assert_eq!(fs::metadata(&path).unwrap().len(), big.len() as u64, "log not appended to");
+    fs::remove_dir(&rotated).unwrap();
 }

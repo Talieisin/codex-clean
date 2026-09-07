@@ -113,10 +113,23 @@ pub fn append_private_log(path: &Path, entry: &str) -> Result<()> {
             anyhow::bail!("{} is a symlink; refusing to write through it", path.display());
         }
         if meta.len() >= PRIVATE_LOG_ROTATE_BYTES {
+            // Rotation must succeed or the write is refused: appending to an
+            // oversized log would defeat the bound. Callers treat logging as
+            // best-effort, so an error here only drops the entry.
             let rotated = path.with_extension(
                 format!("{}.1", path.extension().and_then(|e| e.to_str()).unwrap_or("log")),
             );
-            let _ = fs::rename(path, &rotated);
+            match fs::remove_file(&rotated) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(anyhow::Error::from(e)
+                        .context(format!("removing old rotated log {}", rotated.display())))
+                }
+            }
+            fs::rename(path, &rotated).with_context(|| {
+                format!("rotating {} to {}", path.display(), rotated.display())
+            })?;
         }
     }
     let mut opts = OpenOptions::new();

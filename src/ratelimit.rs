@@ -6,13 +6,51 @@
 
 use chrono::{DateTime, Duration, Local, NaiveDateTime, NaiveTime, TimeZone, Utc};
 
+/// Why a seat is being cooled. Recorded in `state.json` as a string and used
+/// to pick the cooldown policy: window-based limits reset on their own, the
+/// other two need purchase/admin action so we back off for the maximum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CooldownReason {
+    /// A metered usage window (5-hour / weekly) is exhausted.
+    RateLimit,
+    /// The workspace has run out of credits.
+    Credits,
+    /// A workspace spend cap was hit.
+    SpendControl,
+}
+
+impl CooldownReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RateLimit => "rate_limit",
+            Self::Credits => "credits",
+            Self::SpendControl => "spend_control",
+        }
+    }
+
+    /// Window-based limits come back on a schedule codex tells us about;
+    /// everything else needs a human, so we wait the maximum.
+    pub fn is_window_based(self) -> bool {
+        matches!(self, Self::RateLimit)
+    }
+}
+
+impl std::fmt::Display for CooldownReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Classification of a codex run's failure mode, derived from the messages
 /// surfaced via `turn.failed` / `error` events (and stderr fallback).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FailureKind {
     /// Account or per-model usage cap reached. `recovery` is the wall-clock
     /// time codex reported, if any (already in UTC).
-    RateLimit { recovery: Option<DateTime<Utc>> },
+    RateLimit {
+        recovery: Option<DateTime<Utc>>,
+        reason: CooldownReason,
+    },
     /// Refresh token expired/reused — seat needs re-login, not a cooldown.
     AuthError,
     /// Some other failure we don't classify; caller should bubble exit code
@@ -31,15 +69,46 @@ pub fn classify_text(blob: &str) -> FailureKind {
     if is_auth_error(blob) {
         return FailureKind::AuthError;
     }
-    if is_rate_limit(blob) {
+    if let Some(reason) = rate_limit_reason(blob) {
         let recovery = parse_recovery_time(blob, Local::now()).map(|d| d.with_timezone(&Utc));
-        return FailureKind::RateLimit { recovery };
+        return FailureKind::RateLimit { recovery, reason };
     }
     FailureKind::Other
 }
 
-fn is_rate_limit(s: &str) -> bool {
-    s.contains("You've hit your usage limit")
+/// Exhaustion phrases codex 0.153.x emits in `turn.failed` / `error`
+/// messages. `codex exec --json` carries prose only (no error code), so
+/// detection is text-based. Compared case-insensitively.
+///
+/// Deliberately absent: transient per-minute 429 text (codex retries those
+/// itself) and "usage_not_included" (an entitlement problem a cooldown won't
+/// fix; it stays `Other` and lands in `unmatched.log`).
+///
+/// Phrases are complete affirmative clauses (not bare nouns like "spend cap",
+/// which also appear in prose that merely mentions the feature), and the
+/// workspace-specific reasons come first so a combined message is attributed
+/// to the more specific cause.
+const RATE_LIMIT_PHRASES: &[(&str, CooldownReason)] = &[
+    // "You hit your spend cap set in your workspace…" / "…set by your workspace owner"
+    ("hit your spend cap", CooldownReason::SpendControl),
+    // "Your workspace is out of credits…" / "You're out of credits…"
+    ("workspace is out of credits", CooldownReason::Credits),
+    ("you're out of credits", CooldownReason::Credits),
+    // "You've reached your workspace credit limit"
+    ("reached your workspace credit limit", CooldownReason::Credits),
+    // Personal caps, every plan variant ("…for gpt-5…", "…send a request to
+    // your admin…", "…Upgrade to Pro…").
+    ("you've hit your usage limit", CooldownReason::RateLimit),
+    // "Usage limit reached. You've reached your usage limit. Increase your limits…"
+    ("you've reached your usage limit", CooldownReason::RateLimit),
+];
+
+fn rate_limit_reason(s: &str) -> Option<CooldownReason> {
+    let lower = s.to_lowercase();
+    RATE_LIMIT_PHRASES
+        .iter()
+        .find(|(phrase, _)| lower.contains(phrase))
+        .map(|(_, reason)| *reason)
 }
 
 fn is_auth_error(s: &str) -> bool {
@@ -113,6 +182,22 @@ fn strip_ordinal_suffix(s: &str) -> String {
     out
 }
 
+/// The fallback cooldown length (seconds) for a reason when codex gave no
+/// recovery time. Window limits and depleted credits use the configured
+/// default: the window resets on its own, and credits are something the user
+/// can top up and carry straight on (so a day-long lockout would be wrong).
+/// A spend cap is an admin-set hard stop, so it backs off for the maximum.
+pub fn default_cooldown_for(
+    reason: CooldownReason,
+    default_seconds: u64,
+    max_seconds: u64,
+) -> u64 {
+    match reason {
+        CooldownReason::RateLimit | CooldownReason::Credits => default_seconds,
+        CooldownReason::SpendControl => max_seconds,
+    }
+}
+
 /// Compute the cooldown timestamp from a parsed recovery time.
 /// Adds jitter, clamps total cooldown duration to `[min, max]`, and falls
 /// back to `default_seconds` when no time was parsed.
@@ -146,7 +231,10 @@ mod tests {
     fn rate_limit_detected_admin_variant() {
         let msg = "You've hit your usage limit. To get more access now, send a request to your admin or try again at 5:32 PM.";
         match classify_text(msg) {
-            FailureKind::RateLimit { recovery } => assert!(recovery.is_some()),
+            FailureKind::RateLimit { recovery, reason } => {
+                assert!(recovery.is_some());
+                assert_eq!(reason, CooldownReason::RateLimit);
+            }
             other => panic!("expected RateLimit, got {:?}", other),
         }
     }
@@ -161,9 +249,113 @@ mod tests {
     fn rate_limit_no_recovery_time_variant() {
         let msg = "You've hit your usage limit. Try again later.";
         match classify_text(msg) {
-            FailureKind::RateLimit { recovery } => assert!(recovery.is_none()),
+            FailureKind::RateLimit { recovery, .. } => assert!(recovery.is_none()),
             other => panic!("expected RateLimit, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn rate_limit_detected_per_model_variant() {
+        // "You've hit your usage limit for gpt-5.5. Try again at 5:32 PM."
+        let msg = "You've hit your usage limit for gpt-5.5. Try again at 5:32 PM.";
+        assert!(matches!(
+            classify_text(msg),
+            FailureKind::RateLimit { reason: CooldownReason::RateLimit, .. }
+        ));
+    }
+
+    #[test]
+    fn rate_limit_detected_reached_variant() {
+        let msg = "Usage limit reached. You've reached your usage limit. Increase your limits to continue using codex.";
+        match classify_text(msg) {
+            FailureKind::RateLimit { recovery, reason } => {
+                assert!(recovery.is_none());
+                assert_eq!(reason, CooldownReason::RateLimit);
+            }
+            other => panic!("expected RateLimit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn workspace_credits_variants_classified_as_credits() {
+        for msg in [
+            "Your workspace is out of credits. Add credits to continue.",
+            "Your workspace is out of credits. Ask your workspace owner to refill in order to continue.",
+            "You're out of credits. Your workspace is out of credits. Add credits to continue using Codex.",
+            "You've reached your workspace credit limit",
+        ] {
+            match classify_text(msg) {
+                FailureKind::RateLimit { recovery, reason } => {
+                    assert!(recovery.is_none(), "{}", msg);
+                    assert_eq!(reason, CooldownReason::Credits, "{}", msg);
+                }
+                other => panic!("expected Credits for {:?}, got {:?}", msg, other),
+            }
+        }
+    }
+
+    #[test]
+    fn spend_cap_variants_classified_as_spend_control() {
+        for msg in [
+            "You hit your spend cap set in your workspace. Increase your spend cap to continue.",
+            "You hit your spend cap set by your workspace owner.",
+        ] {
+            assert!(matches!(
+                classify_text(msg),
+                FailureKind::RateLimit { reason: CooldownReason::SpendControl, .. }
+            ), "{}", msg);
+        }
+    }
+
+    #[test]
+    fn matching_is_case_insensitive() {
+        assert!(matches!(
+            classify_text("YOU'VE HIT YOUR USAGE LIMIT."),
+            FailureKind::RateLimit { .. }
+        ));
+    }
+
+    #[test]
+    fn mention_only_prose_is_not_exhaustion() {
+        for msg in [
+            "Your workspace is not out of credits; the request failed for another reason.",
+            "failed to retrieve the spend cap for this workspace",
+            "Usage limit reached is a message you may see when…",
+            "The credits page could not be loaded.",
+        ] {
+            assert_eq!(classify_text(msg), FailureKind::Other, "{}", msg);
+        }
+    }
+
+    #[test]
+    fn specific_workspace_reason_wins_over_generic_usage_text() {
+        let msg = "Usage limit reached. You've reached your usage limit. You hit your spend cap set in your workspace.";
+        assert!(matches!(
+            classify_text(msg),
+            FailureKind::RateLimit { reason: CooldownReason::SpendControl, .. }
+        ));
+    }
+
+    #[test]
+    fn transient_and_entitlement_errors_stay_other() {
+        assert_eq!(
+            classify_text("Rate limit reached for requests (rate_limit_exceeded). Please retry."),
+            FailureKind::Other
+        );
+        assert_eq!(classify_text("usage_not_included: this model is not included in your plan"), FailureKind::Other);
+    }
+
+    #[test]
+    fn cooldown_reason_strings_and_policy() {
+        assert_eq!(CooldownReason::RateLimit.as_str(), "rate_limit");
+        assert_eq!(CooldownReason::Credits.as_str(), "credits");
+        assert_eq!(CooldownReason::SpendControl.as_str(), "spend_control");
+        assert!(CooldownReason::RateLimit.is_window_based());
+        assert!(!CooldownReason::Credits.is_window_based());
+        assert!(!CooldownReason::SpendControl.is_window_based());
+        assert_eq!(default_cooldown_for(CooldownReason::RateLimit, 3600, 86400), 3600);
+        assert_eq!(default_cooldown_for(CooldownReason::Credits, 3600, 86400), 3600);
+        assert_eq!(default_cooldown_for(CooldownReason::SpendControl, 3600, 86400), 86400);
     }
 
     #[test]

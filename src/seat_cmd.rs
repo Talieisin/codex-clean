@@ -6,55 +6,20 @@
 
 use std::fs;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Local, Utc};
+use serde_json::json;
 
 use crate::seat::{
-    self, codex_auth_path, ensure_file_credential_store, read_account_id, refresh_back,
-    seat_auth_path, seats_dir, swap_active_auth, CodexLock, FileStoreOutcome, SeatConfig,
-    SeatEntry, SeatRuntimeState, SeatState,
+    self, codex_auth_path, ensure_file_credential_store, log_event, read_identity, refresh_back_guarded,
+    seat_auth_path, seats_dir, swap_active_auth, validate_seat_name, warn_refresh_back,
+    CodexLock, FileStoreOutcome, ScratchCodexHome, SeatConfig, SeatEntry,
+    SeatIdentity, SeatRuntimeState, SeatState, UsageSnapshot,
 };
-
-/// Guard that removes a partial-login directory on drop unless `commit()`
-/// has been called. Ensures we never leave a Ctrl-C'd login flow's tokens
-/// sitting around in `~/.config/codex-clean/seats/<name>.partial-<pid>/`.
-struct PartialLoginDir {
-    path: PathBuf,
-    committed: bool,
-}
-
-impl PartialLoginDir {
-    fn create_for(name: &str) -> Result<Self> {
-        let path = seats_dir()?
-            .join(format!("{}.partial-{}", name, std::process::id()));
-        // If a previous run died and left this dir, blow it away.
-        let _ = fs::remove_dir_all(&path);
-        seat::secure_create_dir_all(&path)?;
-        Ok(Self { path, committed: false })
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-
-    fn commit(mut self) {
-        self.committed = true;
-        // Tempdir is no longer needed; remove eagerly so we don't leave
-        // tokens on disc a second longer than necessary.
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
-
-impl Drop for PartialLoginDir {
-    fn drop(&mut self) {
-        if !self.committed {
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
-}
+use crate::usage::{self, AppServerClient, UsageClient, UsageFetchError};
 
 /// Read lines from a child stdio handle and forward them to our own
 /// stdout/stderr, flushing after each line. Solves the case where codex's
@@ -82,12 +47,11 @@ fn forward_lines_flushing<R: io::Read>(reader: R, to_stdout: bool) {
 /// explicit flushes so the device-code URL/code is visible immediately
 /// even when this process's stdout is a pipe (CI, Claude Code, etc.).
 fn spawn_codex_login_in(home: &Path, browser: bool) -> Result<()> {
-    // Seed config.toml in the partial home so codex login writes to a file
+    // Seed config.toml in the scratch home so codex login writes to a file
     // (rather than the OS keyring). This is critical: if cli_auth_credentials_store
     // resolves to "keyring", auth.json never appears in our temp home.
+    seat::seed_file_store_config(home)?;
     let cfg_path = home.join("config.toml");
-    fs::write(&cfg_path, "cli_auth_credentials_store = \"file\"\n")
-        .with_context(|| format!("writing {}", cfg_path.display()))?;
 
     let auth_mode = if browser { "browser" } else { "device-auth" };
     let mut cmd = Command::new("codex");
@@ -148,8 +112,12 @@ pub fn add(name: &str, label: Option<&str>, import: bool, browser: bool) -> Resu
     validate_seat_name(name)?;
 
     let mut config = SeatConfig::load()?.unwrap_or_default();
-    if config.find(name).is_some() {
-        bail!("seat '{}' already exists; remove it first or pick a different name", name);
+    if let Some(existing) = config.find_case_insensitive(name) {
+        bail!(
+            "seat '{}' already exists{}; remove it first or pick a different name",
+            existing.name,
+            if existing.name != name { " (names are case-insensitive)" } else { "" }
+        );
     }
 
     let is_first_seat = config.seats.is_empty();
@@ -170,6 +138,7 @@ fn add_via_import(name: &str, label: Option<&str>, config: &mut SeatConfig) -> R
     // Hold the lock for the entire import so a concurrent codex run can't be
     // mid-refresh of ~/.codex/auth.json while we're reading it.
     let _lock = CodexLock::acquire()?;
+    let _ = seat::scavenge_scratch_dirs();
     let active_auth = codex_auth_path()?;
     if !active_auth.exists() {
         bail!(
@@ -179,11 +148,12 @@ fn add_via_import(name: &str, label: Option<&str>, config: &mut SeatConfig) -> R
     }
     let bytes = fs::read(&active_auth)
         .with_context(|| format!("reading {}", active_auth.display()))?;
-    // Propagate read/parse failures (rather than silently importing without
-    // an account_id and weakening mismatch protection later); a missing
-    // tokens.account_id field is fine and surfaces as Ok(None).
-    let account_id = read_account_id(&active_auth)
-        .with_context(|| format!("reading account_id from {}", active_auth.display()))?;
+    // Propagate parse failures (rather than silently importing without an
+    // identity and weakening mismatch protection later); missing fields are
+    // fine and surface as None.
+    let identity = read_identity(&bytes)
+        .with_context(|| format!("reading identity from {}", active_auth.display()))?;
+    warn_if_identity_incomplete(&identity);
     let dest = seat_auth_path(name)?;
     if let Some(parent) = dest.parent() {
         seat::secure_create_dir_all(parent)?;
@@ -193,7 +163,8 @@ fn add_via_import(name: &str, label: Option<&str>, config: &mut SeatConfig) -> R
     config.seats.push(SeatEntry {
         name: name.to_string(),
         label: label.map(String::from),
-        account_id,
+        account_id: identity.account_id,
+        user_id: identity.user_id,
     });
     config.save()?;
 
@@ -213,6 +184,7 @@ fn add_via_login(
     is_first_seat: bool,
 ) -> Result<()> {
     let _lock = CodexLock::acquire()?;
+    let _ = seat::scavenge_scratch_dirs();
 
     eprintln!(
         "Starting login for seat '{}'. The codex CLI will print a URL and code below — open the URL in any browser, sign in to the {}ChatGPT account for this seat, and enter the code.",
@@ -222,50 +194,89 @@ fn add_via_login(
 
     // Run codex login against an isolated temp CODEX_HOME so the active
     // ~/.codex/auth.json is never replaced. Ctrl-C in the middle just leaves
-    // the partial dir, which the guard cleans up on drop.
-    let partial = PartialLoginDir::create_for(name)?;
-    spawn_codex_login_in(partial.path(), browser)?;
+    // the scratch dir, which the guard cleans up on drop (or scavenging
+    // later, if the process was killed outright).
+    let scratch = ScratchCodexHome::create_for(name, "partial")?;
+    spawn_codex_login_in(scratch.path(), browser)?;
 
-    let temp_auth = partial.path().join("auth.json");
+    let temp_auth = scratch.auth_path();
     let auth_bytes = fs::read(&temp_auth)
         .with_context(|| format!("reading {}", temp_auth.display()))?;
-    let account_id = read_account_id(&temp_auth)?;
-    if account_id.is_none() {
-        eprintln!(
-            "Warning: could not extract account_id from the new auth.json; \
-             account-mismatch protection on `seat login` will be unavailable for this seat."
-        );
-    }
+    let identity = read_identity(&auth_bytes)
+        .with_context(|| format!("parsing {}", temp_auth.display()))?;
+    warn_if_identity_incomplete(&identity);
 
     let dest = seat_auth_path(name)?;
     if let Some(parent) = dest.parent() {
         seat::secure_create_dir_all(parent)?;
     }
     seat::atomic_write(&dest, &auth_bytes)?;
-    partial.commit();
+    drop(scratch);
 
     config.seats.push(SeatEntry {
         name: name.to_string(),
         label: label.map(String::from),
-        account_id,
+        account_id: identity.account_id,
+        user_id: identity.user_id,
     });
     config.save()?;
 
-    if is_first_seat {
-        let mut state = SeatState::load()?;
-        state.active_seat = Some(name.to_string());
-        state.save()?;
-    }
+    // Deliberately not recorded as active: ~/.codex/auth.json still holds
+    // whatever the user was logged in as, and recording a seat as active
+    // whose blob is not in the global file would make the next run's
+    // refresh-back copy the wrong blob into this slot. `seat use` (or the
+    // first rotation) swaps it in properly.
+    let _ = is_first_seat;
+    eprintln!(
+        "Seat '{}' added. Run `codex-clean seat use {}` to make it active now, or just run \
+         codex-clean and let rotation pick it.",
+        name, name
+    );
+    Ok(())
+}
 
-    if is_first_seat {
-        eprintln!("Seat '{}' added.", name);
-    } else {
+fn warn_if_identity_incomplete(identity: &SeatIdentity) {
+    if identity.account_id.is_none() || identity.user_id.is_none() {
         eprintln!(
-            "Seat '{}' added. Run `codex-clean seat use {}` to make it active.",
-            name, name
+            "Warning: could not extract a full identity ({}) from the new auth.json; \
+             account-mismatch protection on refresh-back and `seat login` will be \
+             unavailable for this seat.",
+            identity
         );
     }
-    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum LoginIdentityCheck {
+    Ok,
+    /// The new blob lacks a claim the seat has on record.
+    MissingClaims,
+    /// A recorded claim is present in the new blob but differs.
+    Mismatch,
+}
+
+/// Compare a fresh login against a seat's recorded identity. Recorded claims
+/// are mandatory in the new blob; unrecorded ones are not checked.
+pub fn verify_login_identity(expected: &SeatIdentity, got: &SeatIdentity) -> LoginIdentityCheck {
+    let mut missing = false;
+    let mut mismatch = false;
+    for (e, g) in [
+        (&expected.account_id, &got.account_id),
+        (&expected.user_id, &got.user_id),
+    ] {
+        match (e, g) {
+            (Some(_), None) => missing = true,
+            (Some(e), Some(g)) if e != g => mismatch = true,
+            _ => {}
+        }
+    }
+    if mismatch {
+        LoginIdentityCheck::Mismatch
+    } else if missing {
+        LoginIdentityCheck::MissingClaims
+    } else {
+        LoginIdentityCheck::Ok
+    }
 }
 
 fn report_file_store_outcome(outcome: FileStoreOutcome) {
@@ -312,8 +323,8 @@ pub fn list() -> Result<()> {
     let active = state.active_seat.as_deref();
 
     println!(
-        "{:<14} {:<22} {:<22} {:<22}",
-        "NAME", "LABEL", "LAST USED", "STATUS"
+        "{:<14} {:<22} {:<17} {:<18} {:<10} {:<22}",
+        "NAME", "LABEL", "LAST USED", "USAGE", "FETCHED", "STATUS"
     );
     for seat in &config.seats {
         let st = state.get(&seat.name);
@@ -322,10 +333,22 @@ pub fn list() -> Result<()> {
             Some(t) => format_local(t),
             None => "never".to_string(),
         };
+        let (usage_col, fetched_col) = match &st.usage {
+            Some(u) => (
+                usage::summarize_usage_short(u),
+                format!("{} ago", usage::format_duration_short(now - u.fetched_at)),
+            ),
+            None => ("-".to_string(), "-".to_string()),
+        };
         let status = format_status(&st, active.map(|a| a == seat.name).unwrap_or(false), now);
         println!(
-            "{:<14} {:<22} {:<22} {:<22}",
-            seat.name, truncate(label, 22), last_used, status
+            "{:<14} {:<22} {:<17} {:<18} {:<10} {:<22}",
+            seat.name,
+            truncate(label, 22),
+            last_used,
+            truncate(&usage_col, 18),
+            fetched_col,
+            status
         );
     }
     Ok(())
@@ -337,7 +360,17 @@ fn format_status(st: &SeatRuntimeState, is_active: bool, now: DateTime<Utc>) -> 
     }
     if let Some(until) = st.cooldown_until {
         if until > now {
-            return format!("cooling until {}", until.with_timezone(&Local).format("%-I:%M %p"));
+            let reason = st
+                .cooldown_reason
+                .as_deref()
+                .filter(|r| *r != "rate_limit")
+                .map(|r| format!(" ({})", r))
+                .unwrap_or_default();
+            return format!(
+                "cooling{} until {}",
+                reason,
+                until.with_timezone(&Local).format("%-I:%M %p")
+            );
         }
     }
     if is_active {
@@ -345,6 +378,324 @@ fn format_status(st: &SeatRuntimeState, is_active: bool, now: DateTime<Utc>) -> 
     } else {
         "ready".to_string()
     }
+}
+
+// ---------------------------------------------------------------------------
+// status (live usage via codex app-server)
+// ---------------------------------------------------------------------------
+
+/// `codex-clean seat status [NAME] [--json] [--clear-cooldown NAME]`.
+pub fn status(name: Option<&str>, json_out: bool, clear_cooldown: Option<&str>) -> Result<i32> {
+    status_with(&AppServerClient::default(), name, json_out, clear_cooldown)
+}
+
+/// Outcome for one seat, assembled for both the table and `--json`.
+struct SeatStatusRow {
+    name: String,
+    label: Option<String>,
+    active: bool,
+    state: SeatRuntimeState,
+    result: Result<UsageSnapshot, UsageFetchError>,
+    notices: Vec<String>,
+}
+
+/// Injectable core of `status`. Returns the process exit code.
+pub fn status_with(
+    client: &dyn UsageClient,
+    only: Option<&str>,
+    json_out: bool,
+    clear_cooldown: Option<&str>,
+) -> Result<i32> {
+    // Lock first, then load: a concurrent add/remove/run cannot leave us
+    // with stale config, and — more importantly — a codex-clean run's own
+    // refresh-back cannot interleave with the token sync we do below.
+    let Some(_lock) = CodexLock::try_acquire()? else {
+        bail!(
+            "a codex-clean run is in progress (holding {}); \
+             use `codex-clean seat list` for the cached snapshot and retry later",
+            seat::lock_path()?.display()
+        );
+    };
+    let _ = seat::scavenge_scratch_dirs();
+
+    let config = match SeatConfig::load()? {
+        Some(c) if !c.seats.is_empty() => c,
+        _ => {
+            eprintln!("No seats configured. Run `codex-clean seat add <name> --import` to start.");
+            return Ok(0);
+        }
+    };
+    if let Some(n) = only {
+        if config.find(n).is_none() {
+            bail!("seat '{}' not found; run `codex-clean seat list` to see configured seats", n);
+        }
+    }
+    if let Some(n) = clear_cooldown {
+        if config.find(n).is_none() {
+            bail!("--clear-cooldown: seat '{}' not found", n);
+        }
+    }
+    let mut state = SeatState::load()?;
+    let mut global_notices: Vec<String> = Vec::new();
+
+    // --clear-cooldown is independent of which seats are fetched, so
+    // `seat status b --clear-cooldown a` still clears a.
+    if let Some(n) = clear_cooldown {
+        let entry = state.entry_mut(n);
+        if entry.cooldown_until.is_some() {
+            entry.cooldown_until = None;
+            entry.cooldown_reason = None;
+            global_notices.push(format!("cleared cooldown for seat '{}'", n));
+        } else {
+            global_notices.push(format!("seat '{}' had no cooldown to clear", n));
+        }
+    }
+
+    // Sync 1: the active seat's slot may be behind ~/.codex/auth.json (a
+    // plain `codex` session refreshed it). Bring the slot up to date so the
+    // scratch copy starts from the freshest tokens.
+    let active = state.active_seat.clone();
+    let mut active_slot_before: Option<Vec<u8>> = None;
+    if let Some(a) = active.as_deref() {
+        match refresh_back_guarded(a, &config.identity_for(a)) {
+            Ok(outcome) => {
+                warn_refresh_back(a, &outcome);
+                if let seat::RefreshBackOutcome::Copied = outcome {
+                    global_notices.push(format!(
+                        "synced a token refresh from ~/.codex/auth.json into seat '{}'",
+                        a
+                    ));
+                }
+            }
+            Err(e) => eprintln!("Warning: refresh-back for active seat '{}' failed: {:#}", a, e),
+        }
+        active_slot_before = fs::read(seat_auth_path(a)?).ok();
+    }
+
+    let targets: Vec<SeatEntry> = config
+        .seats
+        .iter()
+        .filter(|s| only.is_none_or(|n| n == s.name))
+        .cloned()
+        .collect();
+    let results = usage::fetch_all(client, &targets);
+
+    let now = Utc::now();
+    let mut rows = Vec::with_capacity(results.len());
+    for (seat_entry, (_, result)) in targets.iter().zip(results) {
+        let mut notices = Vec::new();
+        if let Ok(snap) = &result {
+            let verdict = usage::verdict(snap);
+            let entry = state.entry_mut(&seat_entry.name);
+            let mut new_notices = usage::apply_snapshot(
+                &seat_entry.name,
+                entry,
+                snap.clone(),
+                &config.rotation,
+                now,
+            );
+            // Workspace-wide reasons cool the siblings too (extend-only), the
+            // same way the runner does — otherwise `seat status main` could
+            // learn the workspace is out of credits and leave backup1 eligible.
+            if let usage::UsageVerdict::Exhausted { reason, .. } = verdict {
+                if !reason.is_window_based() {
+                    if let Some(until) = state.get(&seat_entry.name).cooldown_until {
+                        let siblings: Vec<String> = seat::workspace_siblings(&config, &seat_entry.name)
+                            .into_iter()
+                            .filter(|n| *n != seat_entry.name)
+                            .collect();
+                        let changed = seat::cool_seats(&mut state, &siblings, until, reason.as_str(), now);
+                        if !changed.is_empty() {
+                            new_notices.push(format!(
+                                "{} is workspace-wide; also cooling {} until {}",
+                                reason,
+                                changed.join(", "),
+                                until.with_timezone(&Local).format("%a %H:%M")
+                            ));
+                        }
+                    }
+                }
+            }
+            for n in &new_notices {
+                log_event("status", &seat_entry.name, n);
+            }
+            notices.extend(new_notices);
+        } else if let Err(e) = &result {
+            log_event("status_error", &seat_entry.name, &e.to_string());
+        }
+        rows.push(SeatStatusRow {
+            name: seat_entry.name.clone(),
+            label: seat_entry.label.clone(),
+            active: active.as_deref() == Some(seat_entry.name.as_str()),
+            state: state.get(&seat_entry.name),
+            result,
+            notices,
+        });
+    }
+    state.save()?;
+
+    // Sync 2: if the app-server rotated the active seat's token, push the new
+    // blob into ~/.codex/auth.json so plain codex does not keep using an
+    // invalidated refresh token. We hold the lock; a concurrently running
+    // plain `codex` session is documented as unsupported.
+    if let Some(a) = active.as_deref() {
+        let after = fs::read(seat_auth_path(a)?).ok();
+        if after.is_some() && after != active_slot_before {
+            match swap_active_auth(a) {
+                Ok(()) => global_notices.push(format!(
+                    "seat '{}' refreshed its token during the check; ~/.codex/auth.json updated",
+                    a
+                )),
+                Err(e) => eprintln!(
+                    "Warning: could not update ~/.codex/auth.json with seat '{}''s refreshed token: {:#}",
+                    a, e
+                ),
+            }
+        }
+    }
+
+    let any_ok = rows.iter().any(|r| r.result.is_ok());
+    if json_out {
+        print_status_json(&rows, &global_notices)?;
+    } else {
+        print_status_table(&rows, &global_notices, now);
+    }
+    Ok(if any_ok { 0 } else { 1 })
+}
+
+fn print_status_table(rows: &[SeatStatusRow], global_notices: &[String], now: DateTime<Utc>) {
+    const W: (usize, usize, usize, usize, usize) = (14, 18, 8, 28, 28);
+    println!(
+        "{:<w0$} {:<w1$} {:<w2$} {:<w3$} {:<w4$} STATUS",
+        "NAME",
+        "LABEL",
+        "PLAN",
+        "5H",
+        "WEEKLY",
+        w0 = W.0,
+        w1 = W.1,
+        w2 = W.2,
+        w3 = W.3,
+        w4 = W.4
+    );
+    let mut footnotes: Vec<String> = Vec::new();
+    for row in rows {
+        let label = row.label.as_deref().unwrap_or("-");
+        let (plan, five_h, weekly) = match &row.result {
+            Ok(snap) => {
+                let plan = snap.plan_type.clone().unwrap_or_else(|| "-".to_string());
+                let bucket = usage::primary_bucket(snap);
+                let cell = |minutes: u64| {
+                    bucket
+                        .and_then(|b| usage::find_window(b, minutes))
+                        .map(|w| usage::format_window_cell(w, now))
+                        .unwrap_or_else(|| "-".to_string())
+                };
+                // Anything outside the two headline windows goes in a footnote
+                // so nothing is silently dropped.
+                for b in &snap.buckets {
+                    let is_primary = bucket.is_some_and(|p| std::ptr::eq(p, b));
+                    for w in &b.windows {
+                        let headline = is_primary
+                            && matches!(
+                                w.window_minutes,
+                                Some(usage::FIVE_HOUR_MINUTES) | Some(usage::WEEKLY_MINUTES)
+                            );
+                        if !headline {
+                            footnotes.push(format!(
+                                "  {}: {} {} {}",
+                                row.name,
+                                b.limit_id.as_deref().unwrap_or("limit"),
+                                usage::window_label(w.window_minutes),
+                                usage::format_window_cell(w, now)
+                            ));
+                        }
+                    }
+                    if let Some(kind) = &b.rate_limit_reached_type {
+                        footnotes.push(format!("  {}: backend reports {}", row.name, kind));
+                    }
+                }
+                if snap.spend_control_reached == Some(true) {
+                    footnotes.push(format!("  {}: workspace spend cap reached", row.name));
+                }
+                (plan, cell(usage::FIVE_HOUR_MINUTES), cell(usage::WEEKLY_MINUTES))
+            }
+            Err(_) => ("?".to_string(), "?".to_string(), "?".to_string()),
+        };
+        let status = format_status(&row.state, row.active, now);
+        println!(
+            "{:<w0$} {:<w1$} {:<w2$} {:<w3$} {:<w4$} {}",
+            row.name,
+            truncate(label, W.1),
+            truncate(&plan, W.2),
+            five_h,
+            weekly,
+            status,
+            w0 = W.0,
+            w1 = W.1,
+            w2 = W.2,
+            w3 = W.3,
+            w4 = W.4
+        );
+    }
+    if !footnotes.is_empty() {
+        println!();
+        for f in footnotes {
+            println!("{}", f);
+        }
+    }
+    let mut any = false;
+    for row in rows {
+        if let Err(e) = &row.result {
+            if !any {
+                println!();
+                any = true;
+            }
+            let hint = match e {
+                UsageFetchError::AuthRequired => {
+                    format!(" — run `codex-clean seat login {}`", row.name)
+                }
+                _ => String::new(),
+            };
+            println!("! {}: {}{}", row.name, e, hint);
+        }
+    }
+    let notices: Vec<&String> = global_notices
+        .iter()
+        .chain(rows.iter().flat_map(|r| r.notices.iter()))
+        .collect();
+    if !notices.is_empty() {
+        println!();
+        for n in notices {
+            println!("• {}", n);
+        }
+    }
+}
+
+fn print_status_json(rows: &[SeatStatusRow], global_notices: &[String]) -> Result<()> {
+    let seats: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            let (usage_v, error_v) = match &r.result {
+                Ok(snap) => (serde_json::to_value(snap).unwrap_or(json!(null)), json!(null)),
+                Err(e) => (json!(null), json!(e.to_string())),
+            };
+            json!({
+                "name": r.name,
+                "label": r.label,
+                "active": r.active,
+                "needs_login": r.state.needs_login,
+                "cooldown_until": r.state.cooldown_until,
+                "cooldown_reason": r.state.cooldown_reason,
+                "usage": usage_v,
+                "error": error_v,
+                "notices": r.notices,
+            })
+        })
+        .collect();
+    let doc = json!({ "seats": seats, "notices": global_notices });
+    println!("{}", serde_json::to_string_pretty(&doc)?);
+    Ok(())
 }
 
 fn format_local(t: DateTime<Utc>) -> String {
@@ -366,7 +717,7 @@ fn truncate(s: &str, max: usize) -> String {
 pub fn login(name: &str, browser: bool) -> Result<()> {
     let mut config = SeatConfig::load()?
         .ok_or_else(|| anyhow!("no seats configured; run `codex-clean seat add <name>` first"))?;
-    let expected_account_id = config
+    let expected = config
         .find(name)
         .ok_or_else(|| {
             anyhow!(
@@ -374,10 +725,10 @@ pub fn login(name: &str, browser: bool) -> Result<()> {
                 name
             )
         })?
-        .account_id
-        .clone();
+        .identity();
 
     let _lock = CodexLock::acquire()?;
+    let _ = seat::scavenge_scratch_dirs();
     // Re-validate config.toml every login in case the user (or some other
     // tool) flipped cli_auth_credentials_store back to keyring.
     let outcome = ensure_file_credential_store()?;
@@ -390,55 +741,60 @@ pub fn login(name: &str, browser: bool) -> Result<()> {
 
     // Run codex login against an isolated temp CODEX_HOME so a Ctrl-C or a
     // wrong-account login can't damage ~/.codex/auth.json.
-    let partial = PartialLoginDir::create_for(name)?;
-    spawn_codex_login_in(partial.path(), browser)?;
+    let scratch = ScratchCodexHome::create_for(name, "partial")?;
+    spawn_codex_login_in(scratch.path(), browser)?;
 
-    let temp_auth = partial.path().join("auth.json");
-    let new_account_id = read_account_id(&temp_auth)?;
-
-    // Account-id verification: if the seat already has an account_id stored,
-    // refuse to overwrite with a different account.
-    if let Some(expected) = expected_account_id.as_ref() {
-        match new_account_id.as_ref() {
-            Some(got) if got == expected => {}
-            Some(got) => {
-                bail!(
-                    "Account mismatch: seat '{}' was registered for account '{}' but you signed in as '{}'. \
-                     The existing tokens were left untouched. \
-                     If you genuinely want to repoint this seat, remove and re-add it: \
-                     `codex-clean seat remove {} && codex-clean seat add {}`.",
-                    name,
-                    expected,
-                    got,
-                    name,
-                    name
-                );
-            }
-            None => {
-                bail!(
-                    "The new auth.json is missing tokens.account_id, so we can't verify it matches \
-                     the previously registered account ('{}'). Refusing to overwrite seat '{}'.",
-                    expected,
-                    name
-                );
-            }
-        }
-    }
-
+    let temp_auth = scratch.auth_path();
     let new_auth = fs::read(&temp_auth)
         .with_context(|| format!("reading {}", temp_auth.display()))?;
+    let got = read_identity(&new_auth).with_context(|| format!("parsing {}", temp_auth.display()))?;
+
+    // Identity verification. Every claim the seat has on record must be
+    // present in the new blob and equal; a claim the seat never recorded
+    // (legacy entry) is adopted below. Two seats in one Team workspace share
+    // an account_id, so the user claim is what catches signing in as the
+    // wrong colleague — and a blob that *lacks* the user claim is refused
+    // rather than waved through.
+    match verify_login_identity(&expected, &got) {
+        LoginIdentityCheck::Ok => {}
+        LoginIdentityCheck::MissingClaims => bail!(
+            "The new auth.json lacks an identity claim that seat '{}' has on record ({}); \
+             got {}. Refusing to overwrite — we cannot prove it is the same user.",
+            name,
+            expected,
+            got
+        ),
+        LoginIdentityCheck::Mismatch => bail!(
+            "Identity mismatch: seat '{}' was registered as {} but you signed in as {}. \
+             The existing tokens were left untouched. \
+             If you genuinely want to repoint this seat, remove and re-add it: \
+             `codex-clean seat remove {} && codex-clean seat add {}`.",
+            name,
+            expected,
+            got,
+            name,
+            name
+        ),
+    }
+    if expected.account_id.is_none() && expected.user_id.is_none() {
+        warn_if_identity_incomplete(&got);
+    }
+
     let dest = seat_auth_path(name)?;
     if let Some(parent) = dest.parent() {
         seat::secure_create_dir_all(parent)?;
     }
     seat::atomic_write(&dest, &new_auth)?;
-    partial.commit();
+    drop(scratch);
 
-    // Adopt the new account_id if the seat didn't have one stored yet
-    // (e.g. it was added before this field existed).
-    if expected_account_id.is_none() {
-        if let Some(seat_entry) = config.seats.iter_mut().find(|s| s.name == name) {
-            seat_entry.account_id = new_account_id;
+    // Adopt any identity fields the seat didn't have stored yet (e.g. it was
+    // added before `user_id` existed).
+    if let Some(seat_entry) = config.seats.iter_mut().find(|s| s.name == name) {
+        if seat_entry.account_id.is_none() {
+            seat_entry.account_id = got.account_id.clone();
+        }
+        if seat_entry.user_id.is_none() {
+            seat_entry.user_id = got.user_id.clone();
         }
     }
 
@@ -448,7 +804,17 @@ pub fn login(name: &str, browser: bool) -> Result<()> {
     entry.consecutive_failures = 0;
     state.save()?;
 
-    // Persist any account_id we may have just adopted. Failing here would
+    // If this seat is the active one, ~/.codex/auth.json still holds its OLD
+    // tokens. Left alone, the next run's refresh-back would see "same
+    // identity, different bytes" and copy the old blob back over the login
+    // we just saved. Keep global and slot in step (we hold the lock).
+    if state.active_seat.as_deref() == Some(name) {
+        swap_active_auth(name)
+            .with_context(|| format!("installing seat '{}''s new login into ~/.codex/auth.json", name))?;
+    }
+    log_event("login", name, &format!("re-authenticated as {}", got));
+
+    // Persist any identity fields we may have just adopted. Failing here would
     // weaken mismatch protection on future re-logins, so propagate.
     config
         .save()
@@ -476,17 +842,41 @@ pub fn use_seat(name: &str) -> Result<()> {
     let mut state = SeatState::load()?;
     let prev_active = state.active_seat.clone();
     if let Some(prev) = prev_active.as_deref() {
-        if prev != name {
-            refresh_back(prev).with_context(|| {
-                format!("refresh-back for previously active seat '{}'", prev)
-            })?;
-        }
+        // Includes prev == name: a fresher global blob must not be clobbered
+        // by a stale slot copy either way.
+        let outcome = refresh_back_guarded(prev, &config.identity_for(prev))
+            .with_context(|| format!("refresh-back for previously active seat '{}'", prev))?;
+        warn_refresh_back(prev, &outcome);
     }
 
     swap_active_auth(name)?;
     state.active_seat = Some(name.to_string());
     state.save()?;
+    log_event("use", name, "made active");
     eprintln!("Active seat is now '{}'.", name);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// events
+// ---------------------------------------------------------------------------
+
+/// Print the last `tail` lines of `seat-events.log`.
+pub fn events(tail: usize) -> Result<()> {
+    let path = seat::seat_events_log_path()?;
+    let raw = match fs::read_to_string(&path) {
+        Ok(r) => r,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            eprintln!("No seat events recorded yet ({} does not exist).", path.display());
+            return Ok(());
+        }
+        Err(e) => return Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
+    };
+    let lines: Vec<&str> = raw.lines().collect();
+    let start = lines.len().saturating_sub(tail);
+    for l in &lines[start..] {
+        println!("{}", l);
+    }
     Ok(())
 }
 
@@ -537,26 +927,6 @@ pub fn remove(name: &str, yes: bool) -> Result<()> {
         fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
     }
     eprintln!("Seat '{}' removed.", name);
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
-
-fn validate_seat_name(name: &str) -> Result<()> {
-    if name.is_empty() {
-        bail!("seat name cannot be empty");
-    }
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-        bail!(
-            "seat name '{}' contains invalid characters (use [a-zA-Z0-9_-])",
-            name
-        );
-    }
-    if name == "." || name == ".." {
-        bail!("seat name '{}' is reserved", name);
-    }
     Ok(())
 }
 

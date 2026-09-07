@@ -84,21 +84,17 @@ impl Drop for TestEnv {
     }
 }
 
+/// A decodable fake auth blob: `account_id` as given, user id derived from
+/// it, token tag = account id. Mirrors what real seats look like closely
+/// enough for identity guards to work.
 fn fake_auth_json(account_id: &str) -> String {
-    format!(
-        r#"{{
-  "auth_mode": "chatgpt",
-  "tokens": {{
-    "id_token": "fake.jwt.token",
-    "access_token": "fake-access-{aid}",
-    "refresh_token": "fake-refresh-{aid}",
-    "account_id": "{aid}"
-  }},
-  "last_refresh": "2026-04-28T12:00:00Z"
-}}
-"#,
-        aid = account_id
-    )
+    seat::fake_auth_json_for_tests(account_id, &format!("user-{}", account_id), account_id)
+}
+
+/// Same identity as `fake_auth_json(account_id)` but a different token, to
+/// simulate a refresh.
+fn fake_auth_json_refreshed(account_id: &str, tag: &str) -> String {
+    seat::fake_auth_json_for_tests(account_id, &format!("user-{}", account_id), tag)
 }
 
 fn cfg_with_seats(seats: &[(&str, &str)]) -> SeatConfig {
@@ -109,6 +105,7 @@ fn cfg_with_seats(seats: &[(&str, &str)]) -> SeatConfig {
                 name: name.to_string(),
                 label: None,
                 account_id: Some(aid.to_string()),
+                user_id: Some(format!("user-{}", aid)),
             })
             .collect(),
         rotation: RotationConfig {
@@ -374,21 +371,1288 @@ fn refresh_back_is_called_after_attempt() {
     let codex_home = env.codex_home_path.clone();
     let clean_home = env.clean_home_path.clone();
     // Mock attempt rewrites ~/.codex/auth.json to simulate a token refresh
-    // mid-run. After the orchestrator's refresh-back, the seat's side
-    // store should reflect that refresh.
+    // mid-run (same identity, new tokens). After the orchestrator's
+    // refresh-back, the seat's side store should reflect that refresh.
     let attempt = move |_args: &[String], _prompt: &str, _mode: &Mode, _scrub: bool| -> anyhow::Result<AttemptResult> {
-        let new_blob = fake_auth_json("acc-a-refreshed");
-        fs::write(codex_home.join("auth.json"), new_blob)?;
+        fs::write(codex_home.join("auth.json"), fake_auth_json_refreshed("acc-a", "refreshed"))?;
         Ok(ok_attempt())
     };
     let exit = runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap();
     assert_eq!(exit, 0);
 
-    let side_store = clean_home.join("seats/a/auth.json");
-    let aid = seat::read_account_id(&side_store).unwrap();
-    assert_eq!(
-        aid.as_deref(),
-        Some("acc-a-refreshed"),
+    let side_store = fs::read_to_string(clean_home.join("seats/a/auth.json")).unwrap();
+    assert!(
+        side_store.contains("fake-access-refreshed"),
         "refresh-back must propagate token rotation into the side store"
     );
+}
+
+// ===========================================================================
+// Rotation hardening: refresh-back before swap, exit codes
+// ===========================================================================
+
+fn cfg_with_seats_min_cooldown(seats: &[(&str, &str)], min_seconds: u64) -> SeatConfig {
+    let mut cfg = cfg_with_seats(seats);
+    cfg.rotation.cooldown_min_seconds = min_seconds;
+    cfg
+}
+
+fn slot_contents(env: &TestEnv, seat: &str) -> String {
+    fs::read_to_string(env.clean_home_path.join("seats").join(seat).join("auth.json")).unwrap()
+}
+
+#[test]
+fn refresh_back_before_swap_persists_previous_seat_refresh() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+
+    env.write_seat("a", "acc-a");
+    env.write_seat("b", "acc-b");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a"), ("b", "acc-b")]));
+
+    // 'a' is active and was used recently → LRU will pick 'b'. Meanwhile a
+    // plain `codex` session refreshed a's tokens in ~/.codex/auth.json.
+    let mut state = SeatState { active_seat: Some("a".to_string()), ..Default::default() };
+    state.entry_mut("a").last_used = Some(chrono::Utc::now());
+    env.save_state(&state);
+    fs::write(
+        env.codex_home_path.join("auth.json"),
+        fake_auth_json_refreshed("acc-a", "a-refreshed-by-plain-codex"),
+    )
+    .unwrap();
+
+    let codex_home = env.codex_home_path.clone();
+    let attempt = mock_attempt(&codex_home, |aid| {
+        assert_eq!(aid, "acc-b", "LRU should have picked b");
+        ok_attempt()
+    });
+    let exit = runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap();
+    assert_eq!(exit, 0);
+
+    assert!(
+        slot_contents(&env, "a").contains("fake-access-a-refreshed-by-plain-codex"),
+        "a's refresh must be stashed before b is swapped in"
+    );
+    assert!(slot_contents(&env, "b").contains("fake-access-acc-b"), "b untouched");
+}
+
+#[test]
+fn refresh_back_before_swap_same_seat_repick() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+
+    env.write_seat("a", "acc-a");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a")]));
+    let state = SeatState { active_seat: Some("a".to_string()), ..Default::default() };
+    env.save_state(&state);
+    // Single seat: the same seat is re-picked. The global blob is fresher.
+    fs::write(
+        env.codex_home_path.join("auth.json"),
+        fake_auth_json_refreshed("acc-a", "fresher"),
+    )
+    .unwrap();
+
+    let codex_home = env.codex_home_path.clone();
+    let seen = std::rc::Rc::new(RefCell::new(String::new()));
+    let seen2 = seen.clone();
+    let attempt = move |_args: &[String], _prompt: &str, _mode: &Mode, _scrub: bool| -> anyhow::Result<AttemptResult> {
+        *seen2.borrow_mut() = fs::read_to_string(codex_home.join("auth.json"))?;
+        Ok(ok_attempt())
+    };
+    let exit = runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap();
+    assert_eq!(exit, 0);
+    assert!(
+        seen.borrow().contains("fake-access-fresher"),
+        "the run must see the fresher token, not the stale slot copy"
+    );
+    assert!(slot_contents(&env, "a").contains("fake-access-fresher"));
+}
+
+#[test]
+fn refresh_back_before_swap_skips_on_user_mismatch_and_writes_orphan() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+
+    // Two seats in the SAME workspace (same account_id), different users —
+    // the Team-plan case. Config records distinct user ids.
+    let mut cfg = cfg_with_seats(&[("a", "ws-1"), ("b", "ws-1")]);
+    cfg.seats[0].user_id = Some("user-alice".into());
+    cfg.seats[1].user_id = Some("user-bob".into());
+    env.save_config(&cfg);
+    let seat_dir = env.clean_home_path.join("seats");
+    fs::create_dir_all(seat_dir.join("a")).unwrap();
+    fs::create_dir_all(seat_dir.join("b")).unwrap();
+    fs::write(
+        seat_dir.join("a/auth.json"),
+        seat::fake_auth_json_for_tests("ws-1", "user-alice", "alice"),
+    )
+    .unwrap();
+    fs::write(
+        seat_dir.join("b/auth.json"),
+        seat::fake_auth_json_for_tests("ws-1", "user-bob", "bob"),
+    )
+    .unwrap();
+
+    // 'a' is recorded active but ~/.codex/auth.json actually holds BOB's
+    // login (someone ran `codex login` as bob in between).
+    let mut state = SeatState { active_seat: Some("a".to_string()), ..Default::default() };
+    state.entry_mut("a").last_used = Some(chrono::Utc::now());
+    env.save_state(&state);
+    fs::write(
+        env.codex_home_path.join("auth.json"),
+        seat::fake_auth_json_for_tests("ws-1", "user-bob", "bob-fresh"),
+    )
+    .unwrap();
+
+    let attempt = |_args: &[String], _prompt: &str, _mode: &Mode, _scrub: bool| Ok(ok_attempt());
+    let exit = runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap();
+    assert_eq!(exit, 0);
+
+    assert!(
+        slot_contents(&env, "a").contains("fake-access-alice"),
+        "bob's blob must NOT be filed under alice's seat"
+    );
+    let orphans: Vec<_> = fs::read_dir(env.clean_home_path.join("orphaned"))
+        .unwrap()
+        .flatten()
+        .collect();
+    assert_eq!(orphans.len(), 1, "the foreign blob must be preserved, not destroyed");
+    let orphan = fs::read_to_string(orphans[0].path()).unwrap();
+    assert!(orphan.contains("fake-access-bob-fresh"));
+}
+
+#[test]
+fn refresh_back_guarded_outcomes() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    env.write_seat("a", "acc-a");
+    let full = seat::SeatIdentity {
+        account_id: Some("acc-a".into()),
+        user_id: Some("user-acc-a".into()),
+    };
+
+    // No source file.
+    assert_eq!(
+        seat::refresh_back_guarded("a", &full).unwrap(),
+        seat::RefreshBackOutcome::SkippedNoSource
+    );
+
+    // Identical bytes.
+    fs::write(env.codex_home_path.join("auth.json"), fake_auth_json("acc-a")).unwrap();
+    assert_eq!(
+        seat::refresh_back_guarded("a", &full).unwrap(),
+        seat::RefreshBackOutcome::Unchanged
+    );
+
+    // Refreshed, same identity → copied.
+    fs::write(
+        env.codex_home_path.join("auth.json"),
+        fake_auth_json_refreshed("acc-a", "new"),
+    )
+    .unwrap();
+    assert_eq!(
+        seat::refresh_back_guarded("a", &full).unwrap(),
+        seat::RefreshBackOutcome::Copied
+    );
+    assert!(slot_contents(&env, "a").contains("fake-access-new"));
+
+    // Expected identity lacks a user claim → unverifiable, nothing written to
+    // the slot, but the differing blob is parked so the caller's swap cannot
+    // destroy it.
+    let partial = seat::SeatIdentity { account_id: Some("acc-a".into()), user_id: None };
+    fs::write(
+        env.codex_home_path.join("auth.json"),
+        fake_auth_json_refreshed("acc-a", "newer"),
+    )
+    .unwrap();
+    match seat::refresh_back_guarded("a", &partial).unwrap() {
+        seat::RefreshBackOutcome::SkippedUnverifiable { orphaned: Some(p) } => {
+            assert!(fs::read_to_string(p).unwrap().contains("fake-access-newer"));
+        }
+        other => panic!("expected parked unverifiable, got {:?}", other),
+    }
+    assert!(slot_contents(&env, "a").contains("fake-access-new"), "slot unchanged");
+
+    // Unverifiable but byte-identical to the slot → nothing to preserve.
+    fs::write(env.codex_home_path.join("auth.json"), slot_contents(&env, "a")).unwrap();
+    assert_eq!(
+        seat::refresh_back_guarded("a", &partial).unwrap(),
+        seat::RefreshBackOutcome::SkippedUnverifiable { orphaned: None }
+    );
+
+    // Source blob has an undecodable id_token → unverifiable, parked.
+    fs::write(
+        env.codex_home_path.join("auth.json"),
+        r#"{"tokens":{"id_token":"nope","access_token":"x","account_id":"acc-a"}}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        seat::refresh_back_guarded("a", &full).unwrap(),
+        seat::RefreshBackOutcome::SkippedUnverifiable { orphaned: Some(_) }
+    ));
+
+    // Not JSON at all → unparseable, parked, no error.
+    fs::write(env.codex_home_path.join("auth.json"), "garbage").unwrap();
+    match seat::refresh_back_guarded("a", &full).unwrap() {
+        seat::RefreshBackOutcome::SkippedUnparseable { orphaned: Some(p) } => {
+            assert_eq!(fs::read_to_string(p).unwrap(), "garbage");
+        }
+        other => panic!("expected parked unparseable, got {:?}", other),
+    }
+}
+
+#[test]
+fn api_key_global_blob_survives_a_rotation_swap() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+
+    env.write_seat("a", "acc-a");
+    env.write_seat("b", "acc-b");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a"), ("b", "acc-b")]));
+    let mut state = SeatState { active_seat: Some("a".to_string()), ..Default::default() };
+    state.entry_mut("a").last_used = Some(chrono::Utc::now());
+    env.save_state(&state);
+    // The user ran `codex login --with-api-key` in between: no identity at all.
+    let api_key_blob = r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-test-not-real","tokens":null}"#;
+    fs::write(env.codex_home_path.join("auth.json"), api_key_blob).unwrap();
+
+    let attempt = |_args: &[String], _prompt: &str, _mode: &Mode, _scrub: bool| Ok(ok_attempt());
+    let exit = runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap();
+    assert_eq!(exit, 0);
+
+    assert!(slot_contents(&env, "a").contains("fake-access-acc-a"), "slot a untouched");
+    let orphans: Vec<_> = fs::read_dir(env.clean_home_path.join("orphaned")).unwrap().flatten().collect();
+    assert_eq!(orphans.len(), 1, "the API-key login must be preserved before the swap replaces it");
+    assert_eq!(fs::read_to_string(orphans[0].path()).unwrap(), api_key_blob);
+}
+
+#[test]
+fn all_cooling_mid_run_returns_75() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+
+    env.write_seat("a", "acc-a");
+    env.write_seat("b", "acc-b");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a"), ("b", "acc-b")]));
+    env.save_state(&SeatState::default());
+
+    let codex_home = env.codex_home_path.clone();
+    let attempt = mock_attempt(&codex_home, |_| rate_limit_attempt());
+    let exit = runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap();
+    assert_eq!(exit, 75, "both seats rate-limited within one run is EX_TEMPFAIL");
+
+    let st = env.load_state();
+    assert!(st.get("a").cooldown_until.is_some());
+    assert!(st.get("b").cooldown_until.is_some());
+    assert_eq!(st.get("a").cooldown_reason.as_deref(), Some("rate_limit"));
+}
+
+#[test]
+fn zero_cooldown_still_returns_75_mid_run() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+
+    env.write_seat("a", "acc-a");
+    env.write_seat("b", "acc-b");
+    // min cooldown 0 and no parseable recovery time → cooldowns could be
+    // effectively expired by the time the loop ends. The tried-seats rule
+    // must still yield 75.
+    let mut cfg = cfg_with_seats_min_cooldown(&[("a", "acc-a"), ("b", "acc-b")], 0);
+    cfg.rotation.default_cooldown_seconds = 0;
+    cfg.rotation.cooldown_max_seconds = 0;
+    env.save_config(&cfg);
+    env.save_state(&SeatState::default());
+
+    let codex_home = env.codex_home_path.clone();
+    let attempt = mock_attempt(&codex_home, |_| {
+        let mut a = rate_limit_attempt();
+        a.output.errors = vec!["You've hit your usage limit. Try again later.".to_string()];
+        a
+    });
+    let exit = runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap();
+    assert_eq!(exit, 75);
+}
+
+#[test]
+fn three_seats_two_rate_limited_returns_child_exit() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+
+    env.write_seat("a", "acc-a");
+    env.write_seat("b", "acc-b");
+    env.write_seat("c", "acc-c");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a"), ("b", "acc-b"), ("c", "acc-c")]));
+    env.save_state(&SeatState::default());
+
+    let codex_home = env.codex_home_path.clone();
+    // max_retries = 1 → only two attempts; c is never tried and stays eligible.
+    let attempt = mock_attempt(&codex_home, |aid| match aid {
+        "acc-c" => panic!("c must not be tried with max_retries = 1"),
+        _ => rate_limit_attempt(),
+    });
+    let exit = runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap();
+    assert_eq!(exit, 1, "an eligible seat remains, so this is not EX_TEMPFAIL");
+    assert!(env.load_state().get("c").cooldown_until.is_none());
+}
+
+#[test]
+fn all_needs_login_up_front_returns_1_not_75() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+
+    env.write_seat("a", "acc-a");
+    env.write_seat("b", "acc-b");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a"), ("b", "acc-b")]));
+    let mut state = SeatState::default();
+    state.entry_mut("a").needs_login = true;
+    state.entry_mut("b").needs_login = true;
+    env.save_state(&state);
+
+    let attempt = |_args: &[String], _prompt: &str, _mode: &Mode, _scrub: bool| -> anyhow::Result<AttemptResult> {
+        panic!("attempt must NOT be called")
+    };
+    let exit = runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap();
+    assert_eq!(exit, 1, "user action required is not a transient failure");
+}
+
+#[test]
+fn mixed_cooling_and_needs_login_up_front_returns_75() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+
+    env.write_seat("a", "acc-a");
+    env.write_seat("b", "acc-b");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a"), ("b", "acc-b")]));
+    let mut state = SeatState::default();
+    state.entry_mut("a").needs_login = true;
+    state.entry_mut("b").cooldown_until = Some(chrono::Utc::now() + chrono::Duration::minutes(30));
+    env.save_state(&state);
+
+    let attempt = |_args: &[String], _prompt: &str, _mode: &Mode, _scrub: bool| -> anyhow::Result<AttemptResult> {
+        panic!("attempt must NOT be called")
+    };
+    let exit = runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap();
+    assert_eq!(exit, 75, "one seat will come back on its own");
+}
+
+#[test]
+fn credits_prose_cools_for_default_and_only_the_same_workspace() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+
+    // a and b are different workspaces here, so a credits failure on a must
+    // not touch b, and b gets tried and succeeds.
+    env.write_seat("a", "acc-a");
+    env.write_seat("b", "acc-b");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a"), ("b", "acc-b")]));
+    env.save_state(&SeatState::default());
+
+    let codex_home = env.codex_home_path.clone();
+    let before = chrono::Utc::now();
+    let attempt = mock_attempt(&codex_home, |aid| match aid {
+        "acc-a" => {
+            let mut a = rate_limit_attempt();
+            a.output.errors = vec![
+                "Your workspace is out of credits. Ask your workspace owner to refill in order to continue."
+                    .to_string(),
+            ];
+            a
+        }
+        _ => ok_attempt(),
+    });
+    let exit = runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap();
+    assert_eq!(exit, 0, "b should have been tried and succeeded");
+
+    let st = env.load_state();
+    let a = st.get("a");
+    assert_eq!(a.cooldown_reason.as_deref(), Some("credits"));
+    // Credits cool for the *default* (3600s in the test cfg): the user can top
+    // up and carry on, so a day-long lockout would be wrong.
+    let secs = (a.cooldown_until.unwrap() - before).num_seconds();
+    assert!((3500..=3660).contains(&secs), "expected ~3600s, got {}", secs);
+    assert!(st.get("b").cooldown_until.is_none(), "different workspace untouched");
+
+    // The event log recorded it.
+    let log = fs::read_to_string(env.clean_home_path.join("seat-events.log")).unwrap();
+    assert!(log.contains("rate_limit seat=a reason=credits"), "{}", log);
+    assert!(log.contains("out of credits"), "{}", log);
+}
+
+#[test]
+fn exhaustion_in_final_agent_message_is_detected_and_cools_whole_workspace() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+
+    // Same Team workspace, two users — exactly the real layout. Codex 0.153
+    // delivers "out of credits" as the final agent message, not an error.
+    let mut cfg = cfg_with_seats(&[("main", "ws-1"), ("backup1", "ws-1")]);
+    cfg.seats[0].user_id = Some("user-alice".into());
+    cfg.seats[1].user_id = Some("user-bob".into());
+    env.save_config(&cfg);
+    let seat_dir = env.clean_home_path.join("seats");
+    fs::create_dir_all(seat_dir.join("main")).unwrap();
+    fs::create_dir_all(seat_dir.join("backup1")).unwrap();
+    fs::write(seat_dir.join("main/auth.json"), seat::fake_auth_json_for_tests("ws-1", "user-alice", "a")).unwrap();
+    fs::write(seat_dir.join("backup1/auth.json"), seat::fake_auth_json_for_tests("ws-1", "user-bob", "b")).unwrap();
+    env.save_state(&SeatState::default());
+
+    let calls = std::rc::Rc::new(RefCell::new(0usize));
+    let calls2 = calls.clone();
+    let attempt = move |_args: &[String], _prompt: &str, _mode: &Mode, _scrub: bool| -> anyhow::Result<AttemptResult> {
+        *calls2.borrow_mut() += 1;
+        let mut output = CodexOutput::default();
+        output.messages.push("Your workspace is out of credits. Add credits to continue.".to_string());
+        Ok(AttemptResult {
+            output,
+            stderr_buffer: b"Reading additional input from stdin...\n".to_vec(),
+            stderr_truncated: false,
+            stderr_error: None,
+            exit_code: 1,
+            status_success: false,
+            child_exit: 1,
+        })
+    };
+    let exit = runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap();
+
+    assert_eq!(*calls.borrow(), 1, "the second seat shares the workspace; do not burn an attempt on it");
+    assert_eq!(exit, 75, "both seats now cooling → EX_TEMPFAIL");
+    let st = env.load_state();
+    for name in ["main", "backup1"] {
+        let e = st.get(name);
+        assert!(e.cooldown_until.is_some(), "{} should be cooling", name);
+        assert_eq!(e.cooldown_reason.as_deref(), Some("credits"), "{}", name);
+    }
+    assert_eq!(st.get("main").consecutive_failures, 1);
+    assert_eq!(st.get("backup1").consecutive_failures, 0, "only the seat that ran counts a failure");
+    let log = fs::read_to_string(env.clean_home_path.join("seat-events.log")).unwrap();
+    assert!(log.contains("affected=main,backup1"), "{}", log);
+}
+
+#[test]
+fn successful_run_does_not_classify_prose_about_credits() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    env.write_seat("a", "acc-a");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a")]));
+    env.save_state(&SeatState::default());
+
+    let attempt = |_args: &[String], _prompt: &str, _mode: &Mode, _scrub: bool| -> anyhow::Result<AttemptResult> {
+        let mut ok = ok_attempt();
+        ok.output.messages.push("If your workspace is out of credits, the wrapper cools every seat.".to_string());
+        Ok(ok)
+    };
+    let exit = runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap();
+    assert_eq!(exit, 0);
+    assert!(env.load_state().get("a").cooldown_until.is_none());
+}
+
+#[test]
+fn auth_error_is_logged_to_events_and_unmatched_log_records_messages() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    env.write_seat("a", "acc-a");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a")]));
+    env.save_state(&SeatState::default());
+
+    let codex_home = env.codex_home_path.clone();
+    let attempt = mock_attempt(&codex_home, |_| auth_error_attempt());
+    let exit = runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap();
+    assert_eq!(exit, 1);
+    let log = fs::read_to_string(env.clean_home_path.join("seat-events.log")).unwrap();
+    assert!(log.contains("auth_error seat=a marked needs_login"), "{}", log);
+
+    // An unclassified failure records the parsed errors and last message,
+    // not just stderr, so it can actually be diagnosed later.
+    let mut st = SeatState::default();
+    st.entry_mut("a").needs_login = false;
+    env.save_state(&st);
+    let attempt = |_args: &[String], _prompt: &str, _mode: &Mode, _scrub: bool| -> anyhow::Result<AttemptResult> {
+        let mut output = CodexOutput::default();
+        output.errors.push("invalid_request_error: bad reasoning effort".to_string());
+        output.messages.push("Some final agent text".to_string());
+        Ok(AttemptResult {
+            output,
+            stderr_buffer: b"stderr tail line\n".to_vec(),
+            stderr_truncated: false,
+            stderr_error: None,
+            exit_code: 1,
+            status_success: false,
+            child_exit: 1,
+        })
+    };
+    let exit = runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap();
+    assert_eq!(exit, 1);
+    let unmatched = fs::read_to_string(env.clean_home_path.join("unmatched.log")).unwrap();
+    assert!(unmatched.contains("invalid_request_error: bad reasoning effort"), "{}", unmatched);
+    assert!(unmatched.contains("Some final agent text"), "{}", unmatched);
+    assert!(unmatched.contains("stderr tail line"), "{}", unmatched);
+}
+
+// ===========================================================================
+// seat status
+// ===========================================================================
+
+use codex_clean::seat::{SeatEntry as SE, UsageSnapshot};
+use codex_clean::usage::{self, UsageClient, UsageFetchError};
+
+fn snapshot(used_5h: u32, used_weekly: u32) -> UsageSnapshot {
+    let now = chrono::Utc::now();
+    UsageSnapshot {
+        fetched_at: now,
+        plan_type: Some("team".into()),
+        buckets: vec![seat::UsageBucket {
+            limit_id: Some("codex".into()),
+            limit_name: None,
+            windows: vec![
+                seat::UsageWindow {
+                    window_minutes: Some(300),
+                    used_percent: used_5h,
+                    resets_at: Some(now + chrono::Duration::hours(2)),
+                },
+                seat::UsageWindow {
+                    window_minutes: Some(10080),
+                    used_percent: used_weekly,
+                    resets_at: Some(now + chrono::Duration::days(3)),
+                },
+            ],
+            rate_limit_reached_type: None,
+        }],
+        credits: Some(seat::UsageCredits { has_credits: false, unlimited: false }),
+        spend_control_reached: Some(false),
+    }
+}
+
+type FetchFn = Box<dyn Fn(&SE) -> Result<UsageSnapshot, UsageFetchError> + Sync>;
+
+/// Fake client: returns a canned result per seat and optionally rewrites the
+/// seat's slot (what a real fetch's refresh-back does when the app-server
+/// rotates the token).
+struct FakeClient {
+    by_seat: FetchFn,
+    rewrite_slot_tag: Option<String>,
+}
+
+impl UsageClient for FakeClient {
+    fn fetch(&self, seat_entry: &SE) -> Result<UsageSnapshot, UsageFetchError> {
+        if let Some(tag) = &self.rewrite_slot_tag {
+            let aid = seat_entry.account_id.clone().unwrap();
+            let path = seat::seat_auth_path(&seat_entry.name).unwrap();
+            fs::write(&path, fake_auth_json_refreshed(&aid, tag)).unwrap();
+        }
+        (self.by_seat)(seat_entry)
+    }
+}
+
+#[test]
+fn status_records_snapshot_sets_cooldown_and_syncs_active_global_auth() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+
+    env.write_seat("a", "acc-a");
+    env.write_seat("b", "acc-b");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a"), ("b", "acc-b")]));
+    let state = SeatState { active_seat: Some("a".to_string()), ..Default::default() };
+    env.save_state(&state);
+    // Global blob is a's (stale copy).
+    fs::write(env.codex_home_path.join("auth.json"), fake_auth_json("acc-a")).unwrap();
+
+    let client = FakeClient {
+        by_seat: Box::new(|s| {
+            Ok(match s.name.as_str() {
+                "a" => snapshot(42, 88),
+                _ => snapshot(100, 60), // b: 5h window exhausted
+            })
+        }),
+        rewrite_slot_tag: Some("rotated".into()),
+    };
+    let code = codex_clean::seat_cmd::status_with(&client, None, false, None).unwrap();
+    assert_eq!(code, 0);
+
+    let st = env.load_state();
+    let a = st.get("a");
+    let b = st.get("b");
+    assert_eq!(a.usage.as_ref().unwrap().plan_type.as_deref(), Some("team"));
+    assert!(a.cooldown_until.is_none(), "healthy seat not cooled");
+    assert!(b.cooldown_until.is_some(), "exhausted seat cooled");
+    assert_eq!(b.cooldown_reason.as_deref(), Some("rate_limit"));
+
+    // The active seat's rotated token must have been pushed into ~/.codex/auth.json.
+    let global = fs::read_to_string(env.codex_home_path.join("auth.json")).unwrap();
+    assert!(global.contains("fake-access-rotated"), "global auth must follow the active slot");
+    // Non-active seat's slot was rewritten too, but the global blob still belongs to 'a'.
+    assert_eq!(env.active_auth_account_id().as_deref(), Some("acc-a"));
+}
+
+#[test]
+fn status_syncs_plain_codex_refresh_into_active_slot_first() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+
+    env.write_seat("a", "acc-a");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a")]));
+    let state = SeatState { active_seat: Some("a".to_string()), ..Default::default() };
+    env.save_state(&state);
+    // Plain codex refreshed the global blob since the last run.
+    fs::write(
+        env.codex_home_path.join("auth.json"),
+        fake_auth_json_refreshed("acc-a", "plain-codex"),
+    )
+    .unwrap();
+
+    let client = FakeClient {
+        by_seat: Box::new(|_| Ok(snapshot(1, 2))),
+        rewrite_slot_tag: None,
+    };
+    let code = codex_clean::seat_cmd::status_with(&client, None, true, None).unwrap();
+    assert_eq!(code, 0);
+    assert!(slot_contents(&env, "a").contains("fake-access-plain-codex"));
+}
+
+#[test]
+fn status_clear_cooldown_and_never_clears_implicitly() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+
+    env.write_seat("a", "acc-a");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a")]));
+    let mut state = SeatState::default();
+    let until = chrono::Utc::now() + chrono::Duration::hours(1);
+    state.entry_mut("a").cooldown_until = Some(until);
+    state.entry_mut("a").needs_login = true;
+    env.save_state(&state);
+
+    let client = FakeClient {
+        by_seat: Box::new(|_| Ok(snapshot(3, 4))),
+        rewrite_slot_tag: None,
+    };
+    codex_clean::seat_cmd::status_with(&client, None, false, None).unwrap();
+    let a = env.load_state().get("a");
+    assert_eq!(a.cooldown_until, Some(until), "healthy read must not clear a cooldown");
+    assert!(a.needs_login, "healthy read must not clear needs_login");
+
+    codex_clean::seat_cmd::status_with(&client, None, false, Some("a")).unwrap();
+    let a = env.load_state().get("a");
+    assert!(a.cooldown_until.is_none(), "--clear-cooldown clears it");
+    assert!(a.needs_login, "but never needs_login");
+}
+
+#[test]
+fn status_all_failed_exits_1_and_busy_lock_errors() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+
+    env.write_seat("a", "acc-a");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a")]));
+    env.save_state(&SeatState::default());
+
+    let client = FakeClient {
+        by_seat: Box::new(|_| Err(UsageFetchError::AuthRequired)),
+        rewrite_slot_tag: None,
+    };
+    let code = codex_clean::seat_cmd::status_with(&client, None, false, None).unwrap();
+    assert_eq!(code, 1);
+
+    let _held = seat::CodexLock::acquire().unwrap();
+    let err = codex_clean::seat_cmd::status_with(&client, None, false, None).unwrap_err();
+    assert!(err.to_string().contains("in progress"), "{}", err);
+}
+
+#[test]
+fn fetch_usage_with_refreshes_back_scratch_auth_and_cleans_up() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+
+    env.write_seat("a", "acc-a");
+    let cfg = cfg_with_seats(&[("a", "acc-a")]);
+    env.save_config(&cfg);
+
+    let now = chrono::Utc::now();
+    let seen_home = std::cell::Cell::new(None::<PathBuf>);
+    let snap = usage::fetch_usage_with(&cfg.seats[0], now, |home| {
+        seen_home.set(Some(home.to_path_buf()));
+        assert!(home.join("auth.json").exists(), "slot blob staged into scratch home");
+        assert!(
+            fs::read_to_string(home.join("config.toml"))
+                .unwrap()
+                .contains("cli_auth_credentials_store = \"file\""),
+            "scratch home must force the file credential store"
+        );
+        // Simulate the app-server rotating the token.
+        fs::write(home.join("auth.json"), fake_auth_json_refreshed("acc-a", "app-server")).unwrap();
+        Ok(serde_json::json!({"rateLimits": {"planType": "team",
+            "primary": {"usedPercent": 7, "windowDurationMins": 300}}}))
+    })
+    .unwrap();
+    assert_eq!(snap.plan_type.as_deref(), Some("team"));
+    assert!(slot_contents(&env, "a").contains("fake-access-app-server"));
+    assert!(!seen_home.take().unwrap().exists(), "scratch home removed");
+
+    // A rotated blob with a DIFFERENT identity must not be filed into the slot.
+    let _ = usage::fetch_usage_with(&cfg.seats[0], now, |home| {
+        fs::write(home.join("auth.json"), seat::fake_auth_json_for_tests("acc-a", "user-someone-else", "x")).unwrap();
+        Ok(serde_json::json!({"rateLimits": {}}))
+    })
+    .unwrap();
+    assert!(slot_contents(&env, "a").contains("fake-access-app-server"), "slot unchanged");
+}
+
+#[test]
+fn scavenge_removes_stale_scratch_dirs_only() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    env.write_seat("a", "acc-a");
+    let seats = env.clean_home_path.join("seats");
+    let stale = seats.join("a.status-1234");
+    let fresh = seats.join("a.partial-5678");
+    fs::create_dir_all(&stale).unwrap();
+    fs::create_dir_all(&fresh).unwrap();
+    // Backdate the stale one by two hours.
+    let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
+    let f = fs::File::open(&stale).unwrap();
+    f.set_modified(two_hours_ago).unwrap();
+
+    // A legacy hand-made dotted seat dir is not scratch, however old.
+    let dotted = seats.join("work.uk");
+    fs::create_dir_all(&dotted).unwrap();
+    fs::File::open(&dotted).unwrap().set_modified(two_hours_ago).unwrap();
+
+    let removed = seat::scavenge_scratch_dirs().unwrap();
+    assert_eq!(removed, vec![stale.clone()]);
+    assert!(!stale.exists());
+    assert!(fresh.exists(), "recent scratch dirs (possibly live) are left alone");
+    assert!(seats.join("a").exists(), "real seat dirs are never touched");
+    assert!(dotted.exists(), "only the exact scratch grammar is swept");
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end against a fake `codex` script on PATH (unix only)
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+struct PathGuard {
+    old: Option<std::ffi::OsString>,
+}
+
+#[cfg(unix)]
+impl PathGuard {
+    fn prepend(dir: &Path) -> Self {
+        let old = std::env::var_os("PATH");
+        let mut new = dir.as_os_str().to_os_string();
+        if let Some(o) = &old {
+            new.push(":");
+            new.push(o);
+        }
+        std::env::set_var("PATH", new);
+        Self { old }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PathGuard {
+    fn drop(&mut self) {
+        match &self.old {
+            Some(o) => std::env::set_var("PATH", o),
+            None => std::env::remove_var("PATH"),
+        }
+    }
+}
+
+#[cfg(unix)]
+const CANNED_RATE_LIMITS: &str = r#"{"id":2,"result":{"rateLimits":{"limitId":"codex","planType":"team","primary":{"usedPercent":42,"windowDurationMins":300,"resetsAt":4102444800},"secondary":{"usedPercent":100,"windowDurationMins":10080,"resetsAt":4102448400},"credits":{"hasCredits":false,"unlimited":false},"rateLimitReachedType":null,"spendControlReached":false}}}"#;
+
+/// Write an executable fake `codex` whose `app-server` mode is `preamble` +
+/// a JSON-RPC loop with `on_read` as the body for `account/rateLimits/read`.
+#[cfg(unix)]
+fn install_fake_codex(dir: &Path, preamble: &str, on_read: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let script = format!(
+        r#"#!/bin/bash
+if [ "$1" != "app-server" ]; then echo "fake codex: unexpected args: $*" >&2; exit 2; fi
+{preamble}
+while IFS= read -r line; do
+  case "$line" in
+    *'"initialize"'*) echo '{{"id":1,"result":{{"userAgent":"fake"}}}}' ;;
+    *'"initialized"'*) echo '{{"method":"account/rateLimits/updated","params":{{}}}}' ;;
+    *'rateLimits/read'*) {on_read} ;;
+  esac
+done
+"#
+    );
+    let path = dir.join("codex");
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+fn quick_client() -> usage::AppServerClient {
+    usage::AppServerClient { timeout: std::time::Duration::from_secs(3) }
+}
+
+#[cfg(unix)]
+#[test]
+fn status_end_to_end_with_fake_codex() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    env.write_seat("a", "acc-a");
+    let cfg = cfg_with_seats(&[("a", "acc-a")]);
+    env.save_config(&cfg);
+
+    let bin = tempfile::tempdir().unwrap();
+    let refreshed = bin.path().join("refreshed.json");
+    fs::write(&refreshed, fake_auth_json_refreshed("acc-a", "from-app-server")).unwrap();
+    // The fake writes the rotated token only AFTER answering (and after a
+    // pause), so the slot can only pick it up if the client really waits for
+    // the child to exit before reading the scratch auth.json.
+    install_fake_codex(
+        bin.path(),
+        "",
+        &format!(
+            "echo '{}'; sleep 0.3; cp '{}' \"$CODEX_HOME/auth.json\"",
+            CANNED_RATE_LIMITS,
+            refreshed.display()
+        ),
+    );
+    let _path = PathGuard::prepend(bin.path());
+
+    let snap = quick_client().fetch(&cfg.seats[0]).unwrap();
+    assert_eq!(snap.plan_type.as_deref(), Some("team"));
+    let b = usage::primary_bucket(&snap).unwrap();
+    assert_eq!(usage::find_window(b, 300).unwrap().used_percent, 42);
+    assert_eq!(usage::find_window(b, 10080).unwrap().used_percent, 100);
+    assert!(
+        slot_contents(&env, "a").contains("fake-access-from-app-server"),
+        "token rotated by the app-server lands in the slot"
+    );
+    assert!(
+        matches!(usage::verdict(&snap), usage::UsageVerdict::Exhausted { .. }),
+        "weekly window at 100% is exhaustion"
+    );
+    // No scratch dirs left behind.
+    let leftovers: Vec<_> = fs::read_dir(env.clean_home_path.join("seats"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains('.'))
+        .collect();
+    assert!(leftovers.is_empty(), "scratch dirs must be removed: {:?}", leftovers);
+}
+
+#[cfg(unix)]
+#[test]
+fn fake_codex_error_variants() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    env.write_seat("a", "acc-a");
+    let cfg = cfg_with_seats(&[("a", "acc-a")]);
+    env.save_config(&cfg);
+    let bin = tempfile::tempdir().unwrap();
+    let _path = PathGuard::prepend(bin.path());
+
+    // Auth required.
+    install_fake_codex(
+        bin.path(),
+        "",
+        r#"echo '{"id":2,"error":{"code":-32600,"message":"chatgpt authentication required to read rate limits"}}'"#,
+    );
+    assert!(matches!(
+        quick_client().fetch(&cfg.seats[0]),
+        Err(UsageFetchError::AuthRequired)
+    ));
+
+    // Method not found (old codex).
+    install_fake_codex(
+        bin.path(),
+        "",
+        r#"echo '{"id":2,"error":{"code":-32601,"message":"Method not found"}}'"#,
+    );
+    assert!(matches!(
+        quick_client().fetch(&cfg.seats[0]),
+        Err(UsageFetchError::MethodNotFound)
+    ));
+
+    // Stdout closed early.
+    install_fake_codex(bin.path(), "echo 'fake codex: giving up' >&2; exit 0", "true");
+    match quick_client().fetch(&cfg.seats[0]) {
+        Err(UsageFetchError::Protocol(m)) => {
+            assert!(m.contains("closed its output"), "{}", m);
+            assert!(!m.contains("giving up"), "child stderr must not leak into the error string: {}", m);
+        }
+        other => panic!("expected Protocol, got {:?}", other),
+    }
+
+    // A giant unterminated stdout frame is rejected promptly, not buffered.
+    install_fake_codex(bin.path(), "head -c 3000000 /dev/zero | tr '\\0' 'x'; exec sleep 30", "true");
+    let started = std::time::Instant::now();
+    let res = quick_client().fetch(&cfg.seats[0]);
+    assert!(matches!(res, Err(UsageFetchError::Protocol(_))), "{:?}", res);
+    assert!(started.elapsed() < std::time::Duration::from_secs(8));
+
+    // Stderr flood beyond the tail cap must not deadlock the client.
+    install_fake_codex(
+        bin.path(),
+        "head -c 200000 /dev/zero | tr '\\0' 'e' >&2; echo >&2",
+        &format!("echo '{}'", CANNED_RATE_LIMITS),
+    );
+    assert!(quick_client().fetch(&cfg.seats[0]).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn fake_codex_hang_times_out_and_child_is_reaped() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    env.write_seat("a", "acc-a");
+    let cfg = cfg_with_seats(&[("a", "acc-a")]);
+    env.save_config(&cfg);
+    let bin = tempfile::tempdir().unwrap();
+    let pidfile = bin.path().join("pid");
+    install_fake_codex(
+        bin.path(),
+        &format!("echo $$ > '{}'; exec sleep 60", pidfile.display()),
+        "true",
+    );
+    let _path = PathGuard::prepend(bin.path());
+
+    let started = std::time::Instant::now();
+    let client = usage::AppServerClient { timeout: std::time::Duration::from_millis(500) };
+    let res = client.fetch(&cfg.seats[0]);
+    assert!(matches!(res, Err(UsageFetchError::Timeout(_))), "{:?}", res);
+    // 500 ms request budget + at most SHUTDOWN_GRACE-bounded teardown.
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(4),
+        "teardown must stay within the budget, took {:?}",
+        started.elapsed()
+    );
+
+    let pid = fs::read_to_string(&pidfile).unwrap().trim().to_string();
+    let alive = std::process::Command::new("kill")
+        .args(["-0", &pid])
+        .status()
+        .unwrap()
+        .success();
+    assert!(!alive, "hung app-server child must be killed and reaped");
+}
+
+
+#[test]
+fn real_turn_failed_frames_classify_with_reason() {
+    use codex_clean::ratelimit::{self, CooldownReason, FailureKind};
+    use std::io::BufReader;
+    // Frame shapes as codex exec --json emits them: prose `message` only.
+    let cases = [
+        (
+            r#"{"type":"turn.failed","error":{"message":"You've hit your usage limit. To get more access now, send a request to your admin or try again at 5:32 PM."}}"#,
+            CooldownReason::RateLimit,
+        ),
+        (
+            r#"{"type":"turn.failed","error":{"message":"Your workspace is out of credits. Ask your workspace owner to refill in order to continue."}}"#,
+            CooldownReason::Credits,
+        ),
+        (
+            r#"{"type":"error","message":"You hit your spend cap set in your workspace. Increase your spend cap to continue."}"#,
+            CooldownReason::SpendControl,
+        ),
+    ];
+    for (frame, expected) in cases {
+        let stream = format!("{{\"type\":\"thread.started\",\"thread_id\":\"t\"}}\n{}\n", frame);
+        let out = runner::parse_codex_stream(BufReader::new(stream.as_bytes())).unwrap();
+        assert_eq!(out.errors.len(), 1, "{}", frame);
+        match ratelimit::classify(&out.errors) {
+            FailureKind::RateLimit { reason, .. } => assert_eq!(reason, expected, "{}", frame),
+            other => panic!("{} → {:?}", frame, other),
+        }
+    }
+}
+
+#[test]
+fn verify_login_identity_requires_recorded_claims() {
+    use codex_clean::seat_cmd::{verify_login_identity, LoginIdentityCheck};
+    let id = |a: Option<&str>, u: Option<&str>| seat::SeatIdentity {
+        account_id: a.map(String::from),
+        user_id: u.map(String::from),
+    };
+    let full = id(Some("ws"), Some("alice"));
+    assert_eq!(verify_login_identity(&full, &full), LoginIdentityCheck::Ok);
+    // Same workspace, different colleague.
+    assert_eq!(
+        verify_login_identity(&full, &id(Some("ws"), Some("bob"))),
+        LoginIdentityCheck::Mismatch
+    );
+    // Recorded user claim missing from the new blob → refused, not waved through.
+    assert_eq!(
+        verify_login_identity(&full, &id(Some("ws"), None)),
+        LoginIdentityCheck::MissingClaims
+    );
+    // Mismatch outranks missing.
+    assert_eq!(
+        verify_login_identity(&full, &id(Some("other"), None)),
+        LoginIdentityCheck::Mismatch
+    );
+    // Legacy seat that never recorded a user id adopts whatever comes.
+    assert_eq!(
+        verify_login_identity(&id(Some("ws"), None), &id(Some("ws"), Some("alice"))),
+        LoginIdentityCheck::Ok
+    );
+    assert_eq!(verify_login_identity(&id(None, None), &id(None, None)), LoginIdentityCheck::Ok);
+}
+
+#[cfg(unix)]
+#[test]
+fn relogin_of_active_seat_updates_global_auth_and_survives_next_run() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+
+    env.write_seat("a", "acc-a");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a")]));
+    let state = SeatState { active_seat: Some("a".to_string()), ..Default::default() };
+    env.save_state(&state);
+    fs::write(env.codex_home_path.join("auth.json"), fake_auth_json("acc-a")).unwrap();
+
+    // Fake `codex login --device-auth` that writes a fresh blob for the same user.
+    let bin = tempfile::tempdir().unwrap();
+    let fresh = bin.path().join("fresh.json");
+    fs::write(&fresh, fake_auth_json_refreshed("acc-a", "relogin")).unwrap();
+    let script = format!(
+        "#!/bin/bash\nif [ \"$1\" = login ]; then cp '{}' \"$CODEX_HOME/auth.json\"; exit 0; fi\necho unexpected >&2; exit 2\n",
+        fresh.display()
+    );
+    let path = bin.path().join("codex");
+    fs::write(&path, script).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let _path = PathGuard::prepend(bin.path());
+
+    codex_clean::seat_cmd::login("a", false).unwrap();
+    assert!(slot_contents(&env, "a").contains("fake-access-relogin"));
+    let global = fs::read_to_string(env.codex_home_path.join("auth.json")).unwrap();
+    assert!(
+        global.contains("fake-access-relogin"),
+        "re-login of the active seat must also update ~/.codex/auth.json"
+    );
+
+    // The next run must not roll the slot back to the pre-login tokens.
+    let codex_home = env.codex_home_path.clone();
+    let seen = std::rc::Rc::new(RefCell::new(String::new()));
+    let seen2 = seen.clone();
+    let attempt = move |_args: &[String], _prompt: &str, _mode: &Mode, _scrub: bool| -> anyhow::Result<AttemptResult> {
+        *seen2.borrow_mut() = fs::read_to_string(codex_home.join("auth.json"))?;
+        Ok(ok_attempt())
+    };
+    let exit = runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap();
+    assert_eq!(exit, 0);
+    assert!(seen.borrow().contains("fake-access-relogin"));
+    assert!(slot_contents(&env, "a").contains("fake-access-relogin"));
+}
+
+#[test]
+fn status_clear_cooldown_works_when_fetching_a_different_seat() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+
+    env.write_seat("a", "acc-a");
+    env.write_seat("b", "acc-b");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a"), ("b", "acc-b")]));
+    let mut state = SeatState::default();
+    state.entry_mut("a").cooldown_until = Some(chrono::Utc::now() + chrono::Duration::hours(1));
+    env.save_state(&state);
+
+    let client = FakeClient {
+        by_seat: Box::new(|_| Ok(snapshot(1, 1))),
+        rewrite_slot_tag: None,
+    };
+    codex_clean::seat_cmd::status_with(&client, Some("b"), false, Some("a")).unwrap();
+    assert!(env.load_state().get("a").cooldown_until.is_none());
+}
+
+
+#[test]
+fn credits_mention_in_earlier_message_does_not_classify_unrelated_failure() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    env.write_seat("a", "acc-a");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a")]));
+    env.save_state(&SeatState::default());
+
+    let attempt = |_args: &[String], _prompt: &str, _mode: &Mode, _scrub: bool| -> anyhow::Result<AttemptResult> {
+        let mut output = CodexOutput::default();
+        output.messages.push("If your workspace is out of credits, rotation cannot help.".to_string());
+        output.messages.push("Now applying the patch…".to_string());
+        output.errors.push("invalid_request_error: something unrelated".to_string());
+        Ok(AttemptResult {
+            output,
+            stderr_buffer: Vec::new(),
+            stderr_truncated: false,
+            stderr_error: None,
+            exit_code: 1,
+            status_success: false,
+            child_exit: 1,
+        })
+    };
+    let exit = runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap();
+    assert_eq!(exit, 1);
+    assert!(env.load_state().get("a").cooldown_until.is_none(), "earlier prose must not cool the seat");
+
+    // A long final message that merely mentions credits deep inside is also ignored.
+    let attempt = |_args: &[String], _prompt: &str, _mode: &Mode, _scrub: bool| -> anyhow::Result<AttemptResult> {
+        let mut output = CodexOutput::default();
+        output.messages.push(format!(
+            "{} Your workspace is out of credits was the message seen earlier.",
+            "Long analysis. ".repeat(30)
+        ));
+        Ok(AttemptResult {
+            output,
+            stderr_buffer: Vec::new(),
+            stderr_truncated: false,
+            stderr_error: None,
+            exit_code: 1,
+            status_success: false,
+            child_exit: 1,
+        })
+    };
+    let exit = runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap();
+    assert_eq!(exit, 1);
+    assert!(env.load_state().get("a").cooldown_until.is_none());
+}
+
+#[test]
+fn incident_jsonl_stream_out_of_credits_as_final_message_is_detected() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    env.write_seat("a", "acc-a");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a")]));
+    env.save_state(&SeatState::default());
+
+    // Shape of the 2026-09-06 incident as `codex exec --json` presents it: the
+    // provider notice arrives as the final agent message; exit code 1.
+    let stream = concat!(
+        "{\"type\":\"thread.started\",\"thread_id\":\"01a07804\"}\n",
+        "{\"type\":\"turn.started\"}\n",
+        "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"Your workspace is out of credits. Add credits to continue.\"}}\n",
+        "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":0,\"cached_input_tokens\":0,\"output_tokens\":0}}\n"
+    );
+    let attempt = move |_args: &[String], _prompt: &str, _mode: &Mode, _scrub: bool| -> anyhow::Result<AttemptResult> {
+        let output = runner::parse_codex_stream(std::io::BufReader::new(stream.as_bytes()))?;
+        Ok(AttemptResult {
+            output,
+            stderr_buffer: b"Reading additional input from stdin...\n".to_vec(),
+            stderr_truncated: false,
+            stderr_error: None,
+            exit_code: 1,
+            status_success: false,
+            child_exit: 1,
+        })
+    };
+    let exit = runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap();
+    assert_eq!(exit, 75, "single seat, now cooling");
+    let a = env.load_state().get("a");
+    assert_eq!(a.cooldown_reason.as_deref(), Some("credits"));
+}
+
+#[test]
+fn workspace_cooldown_never_shortens_a_siblings_longer_cooldown() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    let mut cfg = cfg_with_seats(&[("main", "ws-1"), ("backup1", "ws-1")]);
+    cfg.seats[0].user_id = Some("user-alice".into());
+    cfg.seats[1].user_id = Some("user-bob".into());
+    env.save_config(&cfg);
+    let seat_dir = env.clean_home_path.join("seats");
+    fs::create_dir_all(seat_dir.join("main")).unwrap();
+    fs::create_dir_all(seat_dir.join("backup1")).unwrap();
+    fs::write(seat_dir.join("main/auth.json"), seat::fake_auth_json_for_tests("ws-1", "user-alice", "a")).unwrap();
+    fs::write(seat_dir.join("backup1/auth.json"), seat::fake_auth_json_for_tests("ws-1", "user-bob", "b")).unwrap();
+    let mut state = SeatState::default();
+    let long = chrono::Utc::now() + chrono::Duration::hours(1) + chrono::Duration::minutes(59);
+    state.entry_mut("backup1").cooldown_until = Some(long);
+    state.entry_mut("backup1").cooldown_reason = Some("rate_limit".into());
+    env.save_state(&state);
+
+    let attempt = |_args: &[String], _prompt: &str, _mode: &Mode, _scrub: bool| -> anyhow::Result<AttemptResult> {
+        let mut a = rate_limit_attempt();
+        a.output.errors = vec!["Your workspace is out of credits. Add credits to continue.".to_string()];
+        Ok(a)
+    };
+    let exit = runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap();
+    assert_eq!(exit, 75);
+    let st = env.load_state();
+    assert_eq!(st.get("backup1").cooldown_until, Some(long), "longer sibling cooldown kept");
+    assert_eq!(st.get("backup1").cooldown_reason.as_deref(), Some("rate_limit"));
+    assert_eq!(st.get("main").cooldown_reason.as_deref(), Some("credits"));
+}
+
+#[test]
+fn status_propagates_workspace_wide_exhaustion_to_siblings() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    let mut cfg = cfg_with_seats(&[("main", "ws-1"), ("backup1", "ws-1"), ("other", "ws-2")]);
+    cfg.seats[0].user_id = Some("user-alice".into());
+    cfg.seats[1].user_id = Some("user-bob".into());
+    env.save_config(&cfg);
+    for (n, u) in [("main", "user-alice"), ("backup1", "user-bob"), ("other", "user-other")] {
+        let d = env.clean_home_path.join("seats").join(n);
+        fs::create_dir_all(&d).unwrap();
+        let aid = if n == "other" { "ws-2" } else { "ws-1" };
+        fs::write(d.join("auth.json"), seat::fake_auth_json_for_tests(aid, u, n)).unwrap();
+    }
+    env.save_state(&SeatState::default());
+
+    let client = FakeClient {
+        by_seat: Box::new(|_| {
+            let mut snap = snapshot(10, 10);
+            snap.buckets[0].rate_limit_reached_type = Some("workspace_owner_credits_depleted".into());
+            Ok(snap)
+        }),
+        rewrite_slot_tag: None,
+    };
+    // Only `main` is queried, yet backup1 shares the workspace.
+    codex_clean::seat_cmd::status_with(&client, Some("main"), false, None).unwrap();
+    let st = env.load_state();
+    assert_eq!(st.get("main").cooldown_reason.as_deref(), Some("credits"));
+    assert_eq!(st.get("backup1").cooldown_reason.as_deref(), Some("credits"), "sibling cooled");
+    assert!(st.get("other").cooldown_until.is_none(), "different workspace untouched");
+}
+
+#[cfg(unix)]
+#[test]
+fn private_log_refuses_loose_file_it_cannot_tighten_and_rotates_when_large() {
+    use std::os::unix::fs::PermissionsExt;
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    let path = env.clean_home_path.join("seat-events.log");
+
+    // Normal: created 0600.
+    seat::append_private_log(&path, "one\n").unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+
+    // Loosened by someone else: tightened on next write (we own it, so it succeeds).
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    seat::append_private_log(&path, "two\n").unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+
+    // Symlink in place of the log: refused.
+    let decoy = env.clean_home_path.join("decoy.log");
+    fs::write(&decoy, "").unwrap();
+    let link = env.clean_home_path.join("linked.log");
+    std::os::unix::fs::symlink(&decoy, &link).unwrap();
+    assert!(seat::append_private_log(&link, "x\n").is_err());
+    assert_eq!(fs::read_to_string(&decoy).unwrap(), "");
+
+    // Rotation: a file at the cap is moved aside before the next append,
+    // replacing any earlier rotated file.
+    let rotated = env.clean_home_path.join("seat-events.log.1");
+    fs::write(&rotated, "stale").unwrap();
+    let big = vec![b'z'; seat::PRIVATE_LOG_ROTATE_BYTES as usize];
+    fs::write(&path, &big).unwrap();
+    seat::append_private_log(&path, "after\n").unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "after\n");
+    assert_eq!(fs::metadata(&rotated).unwrap().len(), big.len() as u64);
+
+    // If rotation cannot happen, the write is refused rather than growing the log.
+    fs::write(&path, &big).unwrap();
+    fs::remove_file(&rotated).unwrap();
+    fs::create_dir(&rotated).unwrap(); // a directory in the way: remove_file fails
+    assert!(seat::append_private_log(&path, "nope\n").is_err());
+    assert_eq!(fs::metadata(&path).unwrap().len(), big.len() as u64, "log not appended to");
+    fs::remove_dir(&rotated).unwrap();
 }

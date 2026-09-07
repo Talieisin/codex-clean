@@ -1,7 +1,8 @@
 [package]
 name = "codex-clean"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
+rust-version = "1.82"
 
 [dependencies]
 anyhow = "1.0.102"

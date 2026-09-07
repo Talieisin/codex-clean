@@ -1,5 +1,4 @@
 use std::env;
-use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
@@ -11,23 +10,15 @@ use crate::events::{extract_event, Event};
 use crate::output::CodexOutput;
 use crate::ratelimit::{self, FailureKind};
 use crate::seat::{
-    self, refresh_back, swap_active_auth, unmatched_log_path, CodexLock, SeatConfig,
-    SeatPickError, SeatState,
+    self, cool_seats, log_event, log_excerpt, refresh_back_guarded, seat_notice,
+    swap_active_auth, unmatched_log_path, warn_refresh_back, workspace_siblings, CodexLock,
+    SeatConfig, SeatPickError, SeatState, SCRUB_ENV_VARS,
 };
 
 const STDERR_CAP_BYTES: usize = 10 * 1024 * 1024;
 
-/// Env vars we strip from the codex child process so the active seat's
-/// auth.json is the only thing in scope. `CODEX_HOME` is *not* on this list:
-/// we honour the user's setting and use it as the swap target.
-const SCRUB_ENV_VARS: &[&str] = &[
-    "CODEX_SQLITE_HOME",
-    "OPENAI_API_KEY",
-    "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
-    "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
-    "CODEX_SANDBOX",
-    "CODEX_CLEAN_SEAT",
-];
+/// `EX_TEMPFAIL`: every seat is cooling; try again later.
+pub const EXIT_ALL_SEATS_COOLING: i32 = 75;
 
 /// Target for resume command
 pub enum ResumeTarget {
@@ -110,25 +101,24 @@ where
         let now = Utc::now();
         let chosen = match seat::pick_seat(&cfg, &state, override_seat.as_deref(), now) {
             Ok(name) => name,
-            Err(SeatPickError::AllSeatsBlocked { soonest_name, soonest_until }) => {
-                let when = soonest_until
-                    .map(|u| u.with_timezone(&Local).format("%-I:%M %p").to_string())
-                    .unwrap_or_else(|| "later".to_string());
-                let who = soonest_name
-                    .map(|n| format!(" (seat '{}')", n))
-                    .unwrap_or_default();
-                eprintln!("All seats cooling; soonest available at {}{}.", when, who);
+            Err(blocked @ SeatPickError::AllSeatsBlocked { .. }) => {
+                let code = report_all_blocked(&blocked);
                 if let Some(prev) = last_failure {
                     print_attempt(&prev);
                 }
-                return Ok(75);
+                print_seat_notice(&cfg, &state);
+                return Ok(code);
             }
             Err(e) => {
                 if let Some(prev) = last_failure {
                     eprintln!("{}", e);
                     print_attempt(&prev);
+                    print_seat_notice(&cfg, &state);
                     return Ok(prev.exit_code);
                 }
+                // A pinned seat that is cooling / needs login: still tell a
+                // stdout-only caller why nothing ran.
+                print_seat_notice(&cfg, &state);
                 anyhow::bail!("{}", e);
             }
         };
@@ -143,23 +133,27 @@ where
         // pick (after retry) doesn't reselect the same seat by accident.
         state.entry_mut(&chosen).last_used = Some(now);
         state.save()?;
+
+        // Before overwriting ~/.codex/auth.json, stash any token refresh the
+        // previously active seat received (from plain `codex`, or from our
+        // own last attempt). This runs even when prev == chosen: otherwise a
+        // single-seat / pinned / re-picked run would clobber a fresher global
+        // blob with the stale slot copy. Guarded by identity so a foreign
+        // login is never filed under the wrong seat. Never fatal.
+        if let Some(prev) = state.active_seat.clone() {
+            persist_refresh(&cfg, &prev);
+        }
+
         swap_active_auth(&chosen)
             .with_context(|| format!("swapping active auth to seat '{}'", chosen))?;
         state.active_seat = Some(chosen.clone());
         state.save()?;
 
         let attempt = attempt(args, prompt, &mode, true)?;
-        if let Err(e) = refresh_back(&chosen) {
-            // Codex may have refreshed the OAuth token during the run. If we
-            // can't persist that refresh into the side store, the next swap
-            // would install stale credentials. Surface it so the user knows
-            // why a future run might fail with an auth error.
-            eprintln!(
-                "Warning: failed to persist refreshed token for seat '{}' to its side store: {:#}. \
-                 If subsequent runs fail with auth errors, run `codex-clean seat login {}`.",
-                chosen, e, chosen
-            );
-        }
+        // Codex may have refreshed the OAuth token during the run; persist
+        // it into the side store so the next swap doesn't install stale
+        // credentials.
+        persist_refresh(&cfg, &chosen);
 
         let kind = classify_attempt(&attempt);
         match kind {
@@ -167,38 +161,75 @@ where
                 let entry = state.entry_mut(&chosen);
                 entry.consecutive_failures = 0;
                 entry.cooldown_until = None;
+                entry.cooldown_reason = None;
                 state.save()?;
                 print_attempt(&attempt);
+                print_seat_notice(&cfg, &state);
                 return Ok(attempt.exit_code);
             }
             FailureKind::AuthError => {
                 let entry = state.entry_mut(&chosen);
                 entry.needs_login = true;
                 state.save()?;
+                log_event(
+                    "auth_error",
+                    &chosen,
+                    &format!("marked needs_login; {}", failure_excerpt(&attempt)),
+                );
                 eprintln!(
                     "Seat '{}' has invalid credentials. Run: codex-clean seat login {}",
                     chosen, chosen
                 );
                 print_attempt(&attempt);
+                print_seat_notice(&cfg, &state);
                 return Ok(attempt.exit_code);
             }
-            FailureKind::RateLimit { recovery } => {
+            FailureKind::RateLimit { recovery, reason } => {
                 let cd = ratelimit::apply_recovery_window(
                     recovery,
                     Utc::now(),
-                    cfg.rotation.default_cooldown_seconds,
+                    ratelimit::default_cooldown_for(
+                        reason,
+                        cfg.rotation.default_cooldown_seconds,
+                        cfg.rotation.cooldown_max_seconds,
+                    ),
                     cfg.rotation.cooldown_min_seconds,
                     cfg.rotation.cooldown_max_seconds,
                     cfg.rotation.cooldown_jitter_seconds,
                 );
+                // Personal windows are per user: cool this seat only. Credits
+                // and spend caps are per *workspace*: every seat sharing this
+                // seat's account_id is equally blocked, so cool them together
+                // rather than burning an attempt discovering it.
+                let affected = affected_seats(&cfg, &chosen, reason);
+                // Extend-only: a sibling already cooling for longer keeps its
+                // later deadline (and its own reason).
+                let _changed = cool_seats(&mut state, &affected, cd, reason.as_str(), Utc::now());
                 let entry = state.entry_mut(&chosen);
-                entry.cooldown_until = Some(cd);
                 entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
                 state.save()?;
-                eprintln!(
-                    "Seat '{}' rate-limited; cooling until {}.",
-                    chosen,
-                    cd.with_timezone(&Local).format("%-I:%M %p")
+                let until = cd.with_timezone(&Local).format("%a %H:%M").to_string();
+                if affected.len() > 1 {
+                    eprintln!(
+                        "Seat '{}' exhausted ({}); this applies to the whole workspace, so seats {} are all cooling until {}.",
+                        chosen,
+                        reason,
+                        affected.join(", "),
+                        until
+                    );
+                } else {
+                    eprintln!("Seat '{}' exhausted ({}); cooling until {}.", chosen, reason, until);
+                }
+                log_event(
+                    "rate_limit",
+                    &chosen,
+                    &format!(
+                        "reason={} until={} affected={} {}",
+                        reason,
+                        cd.to_rfc3339(),
+                        affected.join(","),
+                        failure_excerpt(&attempt)
+                    ),
                 );
                 last_failure = Some(attempt);
                 if override_seat.is_some() {
@@ -209,16 +240,101 @@ where
             FailureKind::Other => {
                 let _ = log_unmatched(&chosen, &attempt);
                 print_attempt(&attempt);
+                print_seat_notice(&cfg, &state);
                 return Ok(attempt.exit_code);
             }
         }
     }
 
-    if let Some(prev) = last_failure {
-        print_attempt(&prev);
-        Ok(prev.exit_code)
+    // Rotation ran out of seats to try. If we are not pinned and every
+    // configured seat was either rate-limited in this run or is otherwise
+    // ineligible right now, that is EX_TEMPFAIL — the same situation the
+    // up-front check reports — regardless of how short the cooldowns are.
+    // A pinned seat keeps the child's exit code (README contract).
+    match last_failure {
+        Some(prev) => {
+            let now = Utc::now();
+            let all_blocked = override_seat.is_none()
+                && cfg.seats.iter().all(|s| {
+                    tried_seats.contains(&s.name) || !state.get(&s.name).is_eligible(now)
+                });
+            if all_blocked {
+                let code = report_all_blocked(&seat::all_blocked_error(&cfg, &state));
+                print_attempt(&prev);
+                print_seat_notice(&cfg, &state);
+                return Ok(code);
+            }
+            print_attempt(&prev);
+            print_seat_notice(&cfg, &state);
+            Ok(prev.exit_code)
+        }
+        None => Ok(1),
+    }
+}
+
+/// Seats to cool for a failure on `chosen`: just it for a personal window
+/// limit; every seat in the same workspace for credits / spend caps.
+fn affected_seats(cfg: &SeatConfig, chosen: &str, reason: ratelimit::CooldownReason) -> Vec<String> {
+    if reason.is_window_based() {
+        vec![chosen.to_string()]
     } else {
-        Ok(1)
+        workspace_siblings(cfg, chosen)
+    }
+}
+
+/// The degraded-pool summary goes on **stdout**, after the normal output, on
+/// every multi-seat run. Background callers read stdout; stderr is discarded.
+fn print_seat_notice(cfg: &SeatConfig, state: &SeatState) {
+    if let Some(n) = seat_notice(cfg, state, Utc::now()) {
+        println!();
+        println!("{}", n);
+    }
+}
+
+/// Short, single-line description of why an attempt failed, for the events log.
+fn failure_excerpt(attempt: &AttemptResult) -> String {
+    let text = if !attempt.output.errors.is_empty() {
+        attempt.output.errors.join(" | ")
+    } else if let Some(m) = attempt.output.messages.last() {
+        m.clone()
+    } else {
+        String::from_utf8_lossy(&attempt.stderr_buffer)
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .to_string()
+    };
+    let text: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let mut out: String = text.trim().chars().take(300).collect();
+    if text.trim().chars().count() > 300 {
+        out.push('…');
+    }
+    format!("exit={} msg={:?}", attempt.exit_code, out)
+}
+
+/// Persist the active `~/.codex/auth.json` into `seat`'s slot if it belongs
+/// to that seat. Warns (never fails) on skip or error.
+fn persist_refresh(cfg: &SeatConfig, seat_name: &str) {
+    let expected = cfg.identity_for(seat_name);
+    match refresh_back_guarded(seat_name, &expected) {
+        Ok(outcome) => warn_refresh_back(seat_name, &outcome),
+        Err(e) => eprintln!(
+            "Warning: failed to persist refreshed token for seat '{}' to its side store: {:#}. \
+             If subsequent runs fail with auth errors, run `codex-clean seat login {}`.",
+            seat_name, e, seat_name
+        ),
+    }
+}
+
+/// Print the "nothing eligible" message and return the exit code: 75 when at
+/// least one seat is merely cooling (retry later), 1 when every seat needs a
+/// login (user action required, so a retry loop would spin for nothing).
+fn report_all_blocked(err: &SeatPickError) -> i32 {
+    eprintln!("{}.", err);
+    match err {
+        SeatPickError::AllSeatsBlocked { cooling, .. } if *cooling > 0 => EXIT_ALL_SEATS_COOLING,
+        _ => 1,
     }
 }
 
@@ -233,63 +349,58 @@ fn classify_attempt(attempt: &AttemptResult) -> FailureKind {
         }
     }
     if !attempt.status_success || attempt.exit_code != 0 {
-        let stderr = String::from_utf8_lossy(&attempt.stderr_buffer);
-        return ratelimit::classify_text(&stderr);
+        // Codex sometimes surfaces exhaustion as the *final agent message*
+        // rather than an error event ("Your workspace is out of credits. Add
+        // credits to continue." arrives as task_complete). Only the LAST
+        // message is consulted, only its opening (provider notices are one
+        // short sentence, whereas agent prose that merely mentions credits is
+        // long), and only when the run failed.
+        let mut blob = String::from_utf8_lossy(&attempt.stderr_buffer).into_owned();
+        if let Some(last) = attempt.output.messages.last() {
+            blob.push('\n');
+            blob.extend(last.chars().take(FINAL_MESSAGE_CLASSIFY_CHARS));
+        }
+        return ratelimit::classify_text(&blob);
     }
     FailureKind::Other
 }
 
+/// How much of a failed run's final agent message is examined for an
+/// exhaustion notice. Codex's own notices lead with the sentence.
+const FINAL_MESSAGE_CLASSIFY_CHARS: usize = 200;
+
+/// Record an unclassified failure for offline pattern tuning. The log is
+/// 0600 (via `append_private_log`): the captured text can include model
+/// output and error payloads, so it is treated like a credential file. The
+/// parsed error events and the final agent message are included — they are
+/// where codex puts the sentence we failed to match, and stderr alone has
+/// proven useless for diagnosis.
 fn log_unmatched(seat: &str, attempt: &AttemptResult) -> Result<()> {
     let path = unmatched_log_path()?;
-    if let Some(p) = path.parent() {
-        // 0700 on the parent dir; 0600 on the file itself. The captured
-        // stderr tail can include sensitive context (model output, partial
-        // tokens, error payloads) so we treat this log like a credential
-        // file rather than a default-perms application log.
-        seat::secure_create_dir_all(p)?;
-    }
     let stderr = String::from_utf8_lossy(&attempt.stderr_buffer);
     let tail: Vec<&str> = stderr.lines().rev().take(20).collect();
-    let tail = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
+    let tail = log_excerpt(&tail.into_iter().rev().collect::<Vec<_>>().join("\n"), 4000);
+    let errors = if attempt.output.errors.is_empty() {
+        "(none)".to_string()
+    } else {
+        log_excerpt(&attempt.output.errors.join("\n  "), 2000)
+    };
+    let last_message = attempt
+        .output
+        .messages
+        .last()
+        .map(|m| log_excerpt(m, 500))
+        .unwrap_or_else(|| "(none)".to_string());
     let entry = format!(
-        "{} seat={} exit={} stderr_tail<<<\n{}\n>>>\n",
+        "{} seat={} exit={} errors<<<\n  {}\n>>> last_message<<<\n{}\n>>> stderr_tail<<<\n{}\n>>>\n",
         Utc::now().to_rfc3339(),
         seat,
         attempt.exit_code,
+        errors,
+        last_message,
         tail
     );
-    let mut opts = OpenOptions::new();
-    opts.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts
-        .open(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
-
-    // Tighten perms via the open file descriptor (fchmod) before writing.
-    // Path-based set_permissions would race with another process replacing
-    // the path between our open and the chmod; using the fd we can't be
-    // pointed at a different file. Mode is only applied on creation, so for
-    // a pre-existing log file (created by an older build at the umask
-    // default) this is the only path that tightens it.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = f.metadata() {
-            let mut perms = meta.permissions();
-            if perms.mode() & 0o777 != 0o600 {
-                perms.set_mode(0o600);
-                let _ = f.set_permissions(perms);
-            }
-        }
-    }
-
-    f.write_all(entry.as_bytes())
-        .with_context(|| format!("writing to {}", path.display()))?;
-    Ok(())
+    seat::append_private_log(&path, &entry)
 }
 
 /// Print captured stderr (when failure) and the formatted output. Mirrors

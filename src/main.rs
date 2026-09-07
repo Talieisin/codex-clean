@@ -62,8 +62,25 @@ enum SeatAction {
         #[arg(long)]
         browser: bool,
     },
-    /// List configured seats and their current state
+    /// List configured seats and their current state (offline; shows the last recorded usage)
     List,
+    /// Query live usage for each seat via `codex app-server` and record it in state.json
+    Status {
+        /// Only this seat
+        name: Option<String>,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+        /// Clear the recorded cooldown for this seat (the only way `status` removes one)
+        #[arg(long, value_name = "NAME")]
+        clear_cooldown: Option<String>,
+    },
+    /// Show the seat event log (limits hit, auth failures, cooldowns, orphaned blobs, logins)
+    Events {
+        /// Number of most recent entries to show
+        #[arg(long, default_value_t = 20)]
+        tail: usize,
+    },
     /// Re-authenticate an existing seat
     Login {
         /// Name of the seat to re-authenticate
@@ -97,7 +114,7 @@ fn main() -> ExitCode {
             prompt,
         }) => run_resume(last, session_id, prompt),
         Some(Commands::Review { args }) => run_review(args),
-        Some(Commands::Seat { action }) => run_seat(action).map(|()| 0),
+        Some(Commands::Seat { action }) => run_seat(action),
         None => run_exec(cli.args),
     };
 
@@ -110,18 +127,24 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_seat(action: SeatAction) -> anyhow::Result<()> {
+fn run_seat(action: SeatAction) -> anyhow::Result<i32> {
     match action {
         SeatAction::Add {
             name,
             label,
             import,
             browser,
-        } => seat_cmd::add(&name, label.as_deref(), import, browser),
-        SeatAction::List => seat_cmd::list(),
-        SeatAction::Login { name, browser } => seat_cmd::login(&name, browser),
-        SeatAction::Use { name } => seat_cmd::use_seat(&name),
-        SeatAction::Remove { name, yes } => seat_cmd::remove(&name, yes),
+        } => seat_cmd::add(&name, label.as_deref(), import, browser).map(|()| 0),
+        SeatAction::List => seat_cmd::list().map(|()| 0),
+        SeatAction::Status {
+            name,
+            json,
+            clear_cooldown,
+        } => seat_cmd::status(name.as_deref(), json, clear_cooldown.as_deref()),
+        SeatAction::Events { tail } => seat_cmd::events(tail).map(|()| 0),
+        SeatAction::Login { name, browser } => seat_cmd::login(&name, browser).map(|()| 0),
+        SeatAction::Use { name } => seat_cmd::use_seat(&name).map(|()| 0),
+        SeatAction::Remove { name, yes } => seat_cmd::remove(&name, yes).map(|()| 0),
     }
 }
 

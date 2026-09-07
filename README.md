@@ -184,9 +184,13 @@ Session: 0199a213-81c0-7800-8aa1-bbab2a035a53
 The repository contains three main components...
 
 Tokens: 15228 input (14208 cached), 249 output
+Seat: backup1 (balanced; usage 5h 48% wk 14%, as of 2m ago)
 ```
 
+(The `Seat:` line appears only when seats are configured.)
+
 - **Session ID** is displayed first for easy copying/resuming
+- **`Seat:` line** (multi-seat only) — after `Tokens:`, names the seat that ran, the strategy (or `pinned via CODEX_CLEAN_SEAT`), that seat's last recorded usage and its age, any seats exhausted earlier in the same run, and the outcome if the run failed, e.g. `Seat: backup1 (balanced; usage 5h 48% wk 14%, as of 2m ago)`
 - **`Seats:` trailer** (multi-seat only) — one extra paragraph after `Tokens:` whenever a seat needs login or is cooling; absent when every seat is usable. Parsers should treat any trailing paragraph beginning `Seats:` as status, not agent output
 - **Stderr is suppressed** on success (no thinking tokens cluttering output)
 - **Stderr is shown** on failure to aid debugging

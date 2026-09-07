@@ -21,6 +21,12 @@ const STDERR_CAP_BYTES: usize = 10 * 1024 * 1024;
 /// `EX_TEMPFAIL`: every seat is cooling; try again later.
 pub const EXIT_ALL_SEATS_COOLING: i32 = 75;
 
+/// `(seat, reason)` pairs for seats exhausted earlier in a run.
+type Exhausted = Vec<(String, String)>;
+/// Seat of the last failed attempt, why it was cooled, and what was
+/// exhausted before it.
+type FailureCtx = Option<(String, String, Exhausted)>;
+
 /// Target for resume command
 pub enum ResumeTarget {
     /// Resume a specific session by ID
@@ -111,7 +117,11 @@ where
     let mut state = SeatState::load()?;
     let max_attempts = cfg.rotation.max_retries.saturating_add(1);
     let mut last_failure: Option<AttemptResult> = None;
+    // Seat of `last_failure`, why it was cooled, and which seats had already
+    // been exhausted before it in this run — for the `Seat:` line.
+    let mut last_failure_ctx: FailureCtx = None;
     let mut tried_seats: Vec<String> = Vec::new();
+    let mut exhausted_so_far: Exhausted = Vec::new();
 
     for attempt_index in 0..max_attempts {
         // Before anything touches the slots, stash any token refresh the
@@ -137,6 +147,7 @@ where
                 let code = report_all_blocked(&blocked);
                 if let Some(prev) = last_failure {
                     print_attempt(&prev);
+                    print_failed_seat_line(&cfg, &state, override_seat.as_deref(), &last_failure_ctx);
                 }
                 print_seat_notice(&cfg, &state);
                 return Ok(code);
@@ -145,6 +156,7 @@ where
                 if let Some(prev) = last_failure {
                     eprintln!("{}", e);
                     print_attempt(&prev);
+                    print_failed_seat_line(&cfg, &state, override_seat.as_deref(), &last_failure_ctx);
                     print_seat_notice(&cfg, &state);
                     return Ok(prev.exit_code);
                 }
@@ -186,6 +198,7 @@ where
                 entry.cooldown_reason = None;
                 state.save()?;
                 print_attempt(&attempt);
+                print_seat_line(&cfg, &state, &chosen, override_seat.as_deref(), &exhausted_so_far, None);
                 print_seat_notice(&cfg, &state);
                 return Ok(attempt.exit_code);
             }
@@ -203,6 +216,14 @@ where
                     chosen, chosen
                 );
                 print_attempt(&attempt);
+                print_seat_line(
+                    &cfg,
+                    &state,
+                    &chosen,
+                    override_seat.as_deref(),
+                    &exhausted_so_far,
+                    Some("auth failed; needs login"),
+                );
                 print_seat_notice(&cfg, &state);
                 return Ok(attempt.exit_code);
             }
@@ -254,6 +275,8 @@ where
                     ),
                 );
                 last_failure = Some(attempt);
+                last_failure_ctx = Some((chosen.clone(), reason.to_string(), exhausted_so_far.clone()));
+                exhausted_so_far.push((chosen.clone(), reason.to_string()));
                 if override_seat.is_some() {
                     break;
                 }
@@ -262,6 +285,14 @@ where
             FailureKind::Other => {
                 let _ = log_unmatched(&chosen, &attempt);
                 print_attempt(&attempt);
+                print_seat_line(
+                    &cfg,
+                    &state,
+                    &chosen,
+                    override_seat.as_deref(),
+                    &exhausted_so_far,
+                    Some("run failed"),
+                );
                 print_seat_notice(&cfg, &state);
                 return Ok(attempt.exit_code);
             }
@@ -283,10 +314,12 @@ where
             if all_blocked {
                 let code = report_all_blocked(&seat::all_blocked_error(&cfg, &state));
                 print_attempt(&prev);
+                print_failed_seat_line(&cfg, &state, override_seat.as_deref(), &last_failure_ctx);
                 print_seat_notice(&cfg, &state);
                 return Ok(code);
             }
             print_attempt(&prev);
+            print_failed_seat_line(&cfg, &state, override_seat.as_deref(), &last_failure_ctx);
             print_seat_notice(&cfg, &state);
             Ok(prev.exit_code)
         }
@@ -389,6 +422,85 @@ fn affected_seats(cfg: &SeatConfig, chosen: &str, reason: ratelimit::CooldownRea
         vec![chosen.to_string()]
     } else {
         workspace_siblings(cfg, chosen)
+    }
+}
+
+/// Compose the `Seat:` line: which seat ran, under which strategy (or pin),
+/// its recorded usage and how old that reading is, which seats were
+/// exhausted earlier in this run, and the outcome if the run failed.
+///
+///   Seat: backup1 (balanced; usage 5h 48% wk 14%, as of 2m ago)
+///   Seat: backup1 (balanced; usage unknown; after main exhausted: rate_limit)
+///   Seat: main (pinned via CODEX_CLEAN_SEAT; usage 5h 18% wk 90%, as of 1m ago; exhausted: credits)
+pub fn seat_line(
+    seat_name: &str,
+    strategy: Strategy,
+    pinned: bool,
+    usage_snapshot: Option<&seat::UsageSnapshot>,
+    exhausted_before: &[(String, String)],
+    outcome: Option<&str>,
+    now: chrono::DateTime<Utc>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(if pinned {
+        "pinned via CODEX_CLEAN_SEAT".to_string()
+    } else {
+        strategy.to_string()
+    });
+    match usage_snapshot {
+        Some(u) => parts.push(format!(
+            "usage {}, as of {} ago",
+            usage::summarize_usage_short(u),
+            usage::format_duration_short(now - u.fetched_at)
+        )),
+        None => parts.push("usage unknown".to_string()),
+    }
+    if !exhausted_before.is_empty() {
+        let list: Vec<String> = exhausted_before
+            .iter()
+            .map(|(s, r)| format!("{} exhausted: {}", s, r))
+            .collect();
+        parts.push(format!("after {}", list.join(", ")));
+    }
+    if let Some(o) = outcome {
+        parts.push(o.to_string());
+    }
+    format!("Seat: {} ({})", seat_name, parts.join("; "))
+}
+
+fn print_seat_line(
+    cfg: &SeatConfig,
+    state: &SeatState,
+    seat_name: &str,
+    override_seat: Option<&str>,
+    exhausted_before: &[(String, String)],
+    outcome: Option<&str>,
+) {
+    let st = state.get(seat_name);
+    println!(
+        "{}",
+        seat_line(
+            seat_name,
+            cfg.rotation.strategy,
+            override_seat.is_some(),
+            st.usage.as_ref(),
+            exhausted_before,
+            outcome,
+            Utc::now(),
+        )
+    );
+}
+
+/// `Seat:` line for the attempt held in `last_failure`.
+fn print_failed_seat_line(
+    cfg: &SeatConfig,
+    state: &SeatState,
+    override_seat: Option<&str>,
+    ctx: &FailureCtx,
+) {
+    if let Some((seat_name, reason, before)) = ctx {
+        let outcome = format!("exhausted: {}", reason);
+        print_seat_line(cfg, state, seat_name, override_seat, before, Some(&outcome));
     }
 }
 
@@ -735,6 +847,39 @@ fn capture_stderr(stderr: impl Read) -> (Vec<u8>, bool, Option<io::Error>) {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn seat_line_formats_each_case() {
+        let now = Utc::now();
+        let snap = seat::UsageSnapshot {
+            fetched_at: now - chrono::Duration::minutes(2),
+            plan_type: Some("team".into()),
+            buckets: vec![seat::UsageBucket {
+                limit_id: Some("codex".into()),
+                limit_name: None,
+                windows: vec![
+                    seat::UsageWindow { window_minutes: Some(300), used_percent: 48, resets_at: None },
+                    seat::UsageWindow { window_minutes: Some(10080), used_percent: 14, resets_at: None },
+                ],
+                rate_limit_reached_type: None,
+            }],
+            credits: None,
+            spend_control_reached: None,
+        };
+        assert_eq!(
+            seat_line("backup1", Strategy::Balanced, false, Some(&snap), &[], None, now),
+            "Seat: backup1 (balanced; usage 5h 48% wk 14%, as of 2m ago)"
+        );
+        let before = vec![("main".to_string(), "rate_limit".to_string())];
+        assert_eq!(
+            seat_line("backup1", Strategy::LeastRecentlyUsed, false, None, &before, None, now),
+            "Seat: backup1 (least-recently-used; usage unknown; after main exhausted: rate_limit)"
+        );
+        assert_eq!(
+            seat_line("main", Strategy::Balanced, true, Some(&snap), &[], Some("exhausted: credits"), now),
+            "Seat: main (pinned via CODEX_CLEAN_SEAT; usage 5h 48% wk 14%, as of 2m ago; exhausted: credits)"
+        );
+    }
 
     #[test]
     fn parse_codex_stream_extracts_events() {

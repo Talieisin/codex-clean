@@ -1911,3 +1911,113 @@ fn removing_the_fixed_seat_resets_the_strategy_and_config_stays_loadable() {
     assert!(bad.save().is_err());
     assert!(SeatConfig::load().is_ok());
 }
+
+
+// ---------------------------------------------------------------------------
+// Process-level stdout contract (unix only: fake `codex exec` on PATH)
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+fn install_fake_codex_exec(dir: &Path, jsonl: &str, exit_code: i32) {
+    use std::os::unix::fs::PermissionsExt;
+    let script = format!(
+        "#!/bin/bash\nif [ \"$1\" != exec ]; then echo \"fake codex: unexpected args: $*\" >&2; exit 2; fi\ncat <<'JSONL'\n{jsonl}\nJSONL\nexit {exit_code}\n"
+    );
+    let path = dir.join("codex");
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+fn run_binary(env: &TestEnv, bin_dir: &Path, extra_env: &[(&str, &str)]) -> (i32, String) {
+    let mut path = bin_dir.as_os_str().to_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_codex-clean"));
+    cmd.arg("say hi")
+        .env("PATH", path)
+        .env("CODEX_CLEAN_HOME", &env.clean_home_path)
+        .env("CODEX_HOME", &env.codex_home_path)
+        .env_remove("CODEX_CLEAN_SEAT")
+        .env_remove("CODEX_CLEAN_NO_SEAT_LINE");
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(unix)]
+#[test]
+fn stdout_contract_seat_line_position_and_opt_out() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    env.write_seat("a", "acc-a");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a")]));
+    let mut state = SeatState::default();
+    state.entry_mut("a").usage = Some(snapshot(48, 14));
+    env.save_state(&state);
+    let bin = tempfile::tempdir().unwrap();
+
+    // Full run: Session → message → Tokens → Seat, and nothing after.
+    install_fake_codex_exec(
+        bin.path(),
+        concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"t-1\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"Hi!\"}}\n",
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10,\"cached_input_tokens\":2,\"output_tokens\":3}}"
+        ),
+        0,
+    );
+    let (code, out) = run_binary(&env, bin.path(), &[]);
+    assert_eq!(code, 0, "{}", out);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines[0], "Session: t-1");
+    let tokens = lines.iter().position(|l| l.starts_with("Tokens: ")).expect("Tokens line");
+    let seat = lines.iter().position(|l| l.starts_with("Seat: ")).expect("Seat line");
+    assert_eq!(seat, tokens + 1, "Seat follows Tokens: {:?}", lines);
+    assert_eq!(seat, lines.len() - 1, "Seat is last (healthy pool → no Seats trailer): {:?}", lines);
+    assert_eq!(out.matches("Seat: ").count(), 1, "exactly once");
+    assert!(lines[seat].starts_with("Seat: a (least-recently-used; usage 5h 48% wk 14%, as of "), "{}", lines[seat]);
+
+    // Failure before usage is reported: no Tokens line; Seat still present, last, once.
+    install_fake_codex_exec(
+        bin.path(),
+        concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"t-2\"}\n",
+            "{\"type\":\"turn.failed\",\"error\":{\"message\":\"invalid_request_error: nope\"}}"
+        ),
+        1,
+    );
+    let (code, out) = run_binary(&env, bin.path(), &[]);
+    assert_eq!(code, 1);
+    assert!(!out.contains("Tokens: "), "{}", out);
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(lines.last().unwrap().starts_with("Seat: a ("), "{:?}", lines);
+    assert!(lines.last().unwrap().contains("run failed"), "{:?}", lines);
+    assert_eq!(out.matches("Seat: ").count(), 1);
+
+    // Opt-out suppresses the line.
+    let (_, out) = run_binary(&env, bin.path(), &[("CODEX_CLEAN_NO_SEAT_LINE", "1")]);
+    assert!(!out.contains("Seat: "), "{}", out);
+
+    // Degraded pool: Seat line, blank line, then the Seats trailer.
+    let mut st = env.load_state();
+    st.entry_mut("a").needs_login = false;
+    env.save_state(&st);
+    env.write_seat("b", "acc-b");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a"), ("b", "acc-b")]));
+    let mut st = env.load_state();
+    st.entry_mut("b").needs_login = true;
+    env.save_state(&st);
+    let (_, out) = run_binary(&env, bin.path(), &[]);
+    let lines: Vec<&str> = out.lines().collect();
+    let seat = lines.iter().position(|l| l.starts_with("Seat: ")).unwrap();
+    assert_eq!(lines[seat + 1], "", "{:?}", lines);
+    assert!(lines[seat + 2].starts_with("Seats: b needs login"), "{:?}", lines);
+
+    // No seats configured: passthrough prints neither line.
+    fs::remove_file(env.clean_home_path.join("seats.toml")).unwrap();
+    let (_, out) = run_binary(&env, bin.path(), &[]);
+    assert!(!out.contains("Seat: ") && !out.contains("Seats: "), "{}", out);
+}

@@ -275,8 +275,9 @@ where
                     ),
                 );
                 last_failure = Some(attempt);
-                last_failure_ctx = Some((chosen.clone(), reason.to_string(), exhausted_so_far.clone()));
-                exhausted_so_far.push((chosen.clone(), reason.to_string()));
+                let reason_str = reason.to_string();
+                last_failure_ctx = Some((chosen.clone(), reason_str.clone(), exhausted_so_far.clone()));
+                exhausted_so_far.push((chosen.clone(), reason_str));
                 if override_seat.is_some() {
                     break;
                 }
@@ -468,6 +469,10 @@ pub fn seat_line(
     format!("Seat: {} ({})", seat_name, parts.join("; "))
 }
 
+/// Set to any non-empty value to suppress the `Seat:` line (for logs that
+/// are shared or retained where seat names should not appear).
+pub const NO_SEAT_LINE_ENV: &str = "CODEX_CLEAN_NO_SEAT_LINE";
+
 fn print_seat_line(
     cfg: &SeatConfig,
     state: &SeatState,
@@ -476,6 +481,9 @@ fn print_seat_line(
     exhausted_before: &[(String, String)],
     outcome: Option<&str>,
 ) {
+    if env::var_os(NO_SEAT_LINE_ENV).is_some_and(|v| !v.is_empty()) {
+        return;
+    }
     let st = state.get(seat_name);
     println!(
         "{}",

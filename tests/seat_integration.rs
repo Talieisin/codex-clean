@@ -1656,3 +1656,258 @@ fn private_log_refuses_loose_file_it_cannot_tighten_and_rotates_when_large() {
     assert_eq!(fs::metadata(&path).unwrap().len(), big.len() as u64, "log not appended to");
     fs::remove_dir(&rotated).unwrap();
 }
+
+// ===========================================================================
+// Strategies: fixed and balanced
+// ===========================================================================
+
+#[test]
+fn fixed_strategy_uses_preferred_seat_and_overflows_when_it_is_cooling() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    env.write_seat("main", "acc-main");
+    env.write_seat("backup1", "acc-backup1");
+    let mut cfg = cfg_with_seats(&[("main", "acc-main"), ("backup1", "acc-backup1")]);
+    cfg.rotation.strategy = Strategy::Fixed;
+    cfg.rotation.fixed_seat = Some("main".into());
+    env.save_config(&cfg);
+    // main used a second ago: LRU would pick backup1; fixed picks main.
+    let mut state = SeatState::default();
+    state.entry_mut("main").last_used = Some(chrono::Utc::now());
+    env.save_state(&state);
+
+    let codex_home = env.codex_home_path.clone();
+    let attempt = mock_attempt(&codex_home, |aid| {
+        assert_eq!(aid, "acc-main");
+        ok_attempt()
+    });
+    assert_eq!(runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap(), 0);
+
+    // main rate-limits → overflow to backup1 within the same run.
+    env.save_state(&SeatState::default());
+    let attempt = mock_attempt(&codex_home, |aid| match aid {
+        "acc-main" => rate_limit_attempt(),
+        _ => ok_attempt(),
+    });
+    assert_eq!(runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap(), 0);
+    assert_eq!(env.load_state().active_seat.as_deref(), Some("backup1"));
+}
+
+#[test]
+fn balanced_strategy_refreshes_stale_snapshots_and_picks_most_headroom() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    env.write_seat("main", "acc-main");
+    env.write_seat("backup1", "acc-backup1");
+    let mut cfg = cfg_with_seats(&[("main", "acc-main"), ("backup1", "acc-backup1")]);
+    cfg.rotation.strategy = Strategy::Balanced;
+    cfg.rotation.balance_refresh_seconds = 600;
+    env.save_config(&cfg);
+
+    // main has a fresh snapshot (weekly 86%); backup1 has none → stale.
+    let mut state = SeatState::default();
+    state.entry_mut("main").usage = Some(snapshot(20, 86));
+    state.entry_mut("main").last_used = Some(chrono::Utc::now() - chrono::Duration::hours(3));
+    state.entry_mut("backup1").last_used = Some(chrono::Utc::now());
+    env.save_state(&state);
+
+    let fetched = std::sync::Mutex::new(Vec::<String>::new());
+    struct CountingClient<'a> {
+        fetched: &'a std::sync::Mutex<Vec<String>>,
+    }
+    impl UsageClient for CountingClient<'_> {
+        fn fetch(&self, s: &SE) -> Result<UsageSnapshot, UsageFetchError> {
+            self.fetched.lock().unwrap().push(s.name.clone());
+            Ok(match s.name.as_str() {
+                "backup1" => snapshot(60, 4), // tightest window 60 < main's 86
+                _ => snapshot(20, 86),
+            })
+        }
+    }
+    let client = CountingClient { fetched: &fetched };
+
+    let codex_home = env.codex_home_path.clone();
+    let attempt = mock_attempt(&codex_home, |aid| {
+        assert_eq!(aid, "acc-backup1", "seat with the most headroom must be picked");
+        ok_attempt()
+    });
+    let exit = runner::run_codex_with_client(&[], "hi", Mode::Exec, attempt, &client).unwrap();
+    assert_eq!(exit, 0);
+    assert_eq!(*fetched.lock().unwrap(), vec!["backup1".to_string()], "only the stale seat is refreshed");
+    let st = env.load_state();
+    assert!(st.get("backup1").usage.is_some(), "refreshed snapshot recorded");
+
+    // Second run: both snapshots fresh → no fetch at all; still backup1 (60 < 86).
+    fetched.lock().unwrap().clear();
+    let attempt = mock_attempt(&codex_home, |aid| {
+        assert_eq!(aid, "acc-backup1");
+        ok_attempt()
+    });
+    runner::run_codex_with_client(&[], "hi", Mode::Exec, attempt, &client).unwrap();
+    assert!(fetched.lock().unwrap().is_empty(), "fresh snapshots are not refetched");
+
+    // Once backup1 has caught up past main, main is picked.
+    let mut st = env.load_state();
+    st.entry_mut("backup1").usage = Some(snapshot(90, 40));
+    env.save_state(&st);
+    let attempt = mock_attempt(&codex_home, |aid| {
+        assert_eq!(aid, "acc-main");
+        ok_attempt()
+    });
+    runner::run_codex_with_client(&[], "hi", Mode::Exec, attempt, &client).unwrap();
+
+    // A refresh that shows a seat exhausted cools it before it is picked.
+    struct ExhaustedClient;
+    impl UsageClient for ExhaustedClient {
+        fn fetch(&self, s: &SE) -> Result<UsageSnapshot, UsageFetchError> {
+            Ok(if s.name == "main" { snapshot(100, 50) } else { snapshot(10, 10) })
+        }
+    }
+    let mut st = env.load_state();
+    st.entry_mut("main").usage = None;
+    st.entry_mut("backup1").usage = None;
+    env.save_state(&st);
+    let attempt = mock_attempt(&codex_home, |aid| {
+        assert_eq!(aid, "acc-backup1", "main is exhausted per the fresh snapshot");
+        ok_attempt()
+    });
+    runner::run_codex_with_client(&[], "hi", Mode::Exec, attempt, &ExhaustedClient).unwrap();
+    assert!(env.load_state().get("main").cooldown_until.is_some());
+
+    // A failing refresh never blocks the run.
+    struct FailingClient;
+    impl UsageClient for FailingClient {
+        fn fetch(&self, _: &SE) -> Result<UsageSnapshot, UsageFetchError> {
+            Err(UsageFetchError::CodexMissing)
+        }
+    }
+    let mut st = env.load_state();
+    st.entry_mut("backup1").usage = None;
+    env.save_state(&st);
+    let attempt = mock_attempt(&codex_home, |_| ok_attempt());
+    assert_eq!(runner::run_codex_with_client(&[], "hi", Mode::Exec, attempt, &FailingClient).unwrap(), 0);
+}
+
+#[test]
+fn balanced_refresh_syncs_rotated_active_token_even_when_run_is_blocked() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    env.write_seat("a", "acc-a");
+    let mut cfg = cfg_with_seats(&[("a", "acc-a")]);
+    cfg.rotation.strategy = Strategy::Balanced;
+    env.save_config(&cfg);
+    let state = SeatState { active_seat: Some("a".to_string()), ..Default::default() };
+    env.save_state(&state);
+    fs::write(env.codex_home_path.join("auth.json"), fake_auth_json("acc-a")).unwrap();
+
+    // The app-server rotates a's token in its slot and reports it exhausted.
+    let client = FakeClient {
+        by_seat: Box::new(|_| Ok(snapshot(100, 50))),
+        rewrite_slot_tag: Some("rotated-during-refresh".into()),
+    };
+    let attempt = |_args: &[String], _prompt: &str, _mode: &Mode, _scrub: bool| -> anyhow::Result<AttemptResult> {
+        panic!("seat is exhausted; must not run")
+    };
+    let exit = runner::run_codex_with_client(&[], "hi", Mode::Exec, attempt, &client).unwrap();
+    assert_eq!(exit, 75);
+    let global = fs::read_to_string(env.codex_home_path.join("auth.json")).unwrap();
+    assert!(global.contains("fake-access-rotated-during-refresh"), "global auth must follow the rotated slot");
+
+    // And the following run must not roll the slot back.
+    let mut st = env.load_state();
+    st.entry_mut("a").cooldown_until = None;
+    st.entry_mut("a").usage = Some(snapshot(1, 1));
+    env.save_state(&st);
+    let attempt = |_args: &[String], _prompt: &str, _mode: &Mode, _scrub: bool| Ok(ok_attempt());
+    runner::run_codex_with_client(&[], "hi", Mode::Exec, attempt, &client).unwrap();
+    assert!(slot_contents(&env, "a").contains("fake-access-rotated-during-refresh"));
+}
+
+#[test]
+fn balanced_refresh_auth_failure_marks_needs_login_and_picks_other_seat() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    env.write_seat("dead", "acc-dead");
+    env.write_seat("live", "acc-live");
+    let mut cfg = cfg_with_seats(&[("dead", "acc-dead"), ("live", "acc-live")]);
+    cfg.rotation.strategy = Strategy::Balanced;
+    env.save_config(&cfg);
+    let mut state = SeatState::default();
+    state.entry_mut("live").usage = Some(snapshot(70, 70)); // known, fairly used
+    env.save_state(&state);
+
+    let client = FakeClient {
+        by_seat: Box::new(|s| {
+            if s.name == "dead" { Err(UsageFetchError::AuthRequired) } else { Ok(snapshot(70, 70)) }
+        }),
+        rewrite_slot_tag: None,
+    };
+    let codex_home = env.codex_home_path.clone();
+    let attempt = mock_attempt(&codex_home, |aid| {
+        assert_eq!(aid, "acc-live", "a seat whose tokens were rejected must not be picked");
+        ok_attempt()
+    });
+    assert_eq!(runner::run_codex_with_client(&[], "hi", Mode::Exec, attempt, &client).unwrap(), 0);
+    let st = env.load_state();
+    assert!(st.get("dead").needs_login);
+    let log = fs::read_to_string(env.clean_home_path.join("seat-events.log")).unwrap();
+    assert!(log.contains("auth_error seat=dead"), "{}", log);
+}
+
+#[test]
+fn zero_cooldown_fixed_and_balanced_still_try_the_other_seat() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for strategy in [Strategy::Fixed, Strategy::Balanced] {
+        let env = TestEnv::new();
+        env.write_seat("a", "acc-a");
+        env.write_seat("b", "acc-b");
+        let mut cfg = cfg_with_seats_min_cooldown(&[("a", "acc-a"), ("b", "acc-b")], 0);
+        cfg.rotation.default_cooldown_seconds = 0;
+        cfg.rotation.cooldown_max_seconds = 0;
+        cfg.rotation.strategy = strategy;
+        cfg.rotation.fixed_seat = Some("a".into());
+        env.save_config(&cfg);
+        let mut state = SeatState::default();
+        state.entry_mut("a").usage = Some(snapshot(1, 1));
+        state.entry_mut("b").usage = Some(snapshot(50, 50));
+        env.save_state(&state);
+
+        let codex_home = env.codex_home_path.clone();
+        let attempt = mock_attempt(&codex_home, |aid| match aid {
+            "acc-a" => {
+                let mut r = rate_limit_attempt();
+                r.output.errors = vec!["You've hit your usage limit. Try again later.".to_string()];
+                r
+            }
+            _ => ok_attempt(),
+        });
+        let exit = runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap();
+        assert_eq!(exit, 0, "{:?}: after a fails with an instantly-expired cooldown, b must be tried", strategy);
+        assert_eq!(env.load_state().active_seat.as_deref(), Some("b"));
+    }
+}
+
+#[test]
+fn removing_the_fixed_seat_resets_the_strategy_and_config_stays_loadable() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    env.write_seat("a", "acc-a");
+    env.write_seat("b", "acc-b");
+    let mut cfg = cfg_with_seats(&[("a", "acc-a"), ("b", "acc-b")]);
+    cfg.rotation.strategy = Strategy::Fixed;
+    cfg.rotation.fixed_seat = Some("a".into());
+    env.save_config(&cfg);
+
+    codex_clean::seat_cmd::remove("a", true).unwrap();
+    let cfg = SeatConfig::load().unwrap().unwrap();
+    assert_eq!(cfg.rotation.strategy, Strategy::LeastRecentlyUsed);
+    assert!(cfg.rotation.fixed_seat.is_none());
+    assert_eq!(cfg.seats.len(), 1);
+
+    // Saving an invalid config is refused rather than written.
+    let mut bad = cfg.clone();
+    bad.rotation.strategy = Strategy::Fixed;
+    bad.rotation.fixed_seat = Some("gone".into());
+    assert!(bad.save().is_err());
+    assert!(SeatConfig::load().is_ok());
+}

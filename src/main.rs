@@ -75,6 +75,13 @@ enum SeatAction {
         #[arg(long, value_name = "NAME")]
         clear_cooldown: Option<String>,
     },
+    /// Show or set the rotation strategy: least-recently-used (lru), round-robin (rr), fixed <seat>, balanced
+    Strategy {
+        /// Strategy name; omit to show the current one
+        name: Option<String>,
+        /// Seat to prefer (only for `fixed`)
+        seat: Option<String>,
+    },
     /// Show the seat event log (limits hit, auth failures, cooldowns, orphaned blobs, logins)
     Events {
         /// Number of most recent entries to show
@@ -141,6 +148,9 @@ fn run_seat(action: SeatAction) -> anyhow::Result<i32> {
             json,
             clear_cooldown,
         } => seat_cmd::status(name.as_deref(), json, clear_cooldown.as_deref()),
+        SeatAction::Strategy { name, seat } => {
+            seat_cmd::strategy(name.as_deref(), seat.as_deref()).map(|()| 0)
+        }
         SeatAction::Events { tail } => seat_cmd::events(tail).map(|()| 0),
         SeatAction::Login { name, browser } => seat_cmd::login(&name, browser).map(|()| 0),
         SeatAction::Use { name } => seat_cmd::use_seat(&name).map(|()| 0),

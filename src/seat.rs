@@ -366,6 +366,13 @@ impl SeatEntry {
 pub struct RotationConfig {
     #[serde(default)]
     pub strategy: Strategy,
+    /// Seat preferred by the `fixed` strategy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_seat: Option<String>,
+    /// For the `balanced` strategy: a seat whose recorded usage snapshot is
+    /// older than this is refreshed (via `codex app-server`) before picking.
+    #[serde(default = "default_balance_refresh")]
+    pub balance_refresh_seconds: u64,
     #[serde(default = "default_default_cooldown")]
     pub default_cooldown_seconds: u64,
     #[serde(default = "default_max_retries")]
@@ -381,11 +388,53 @@ pub struct RotationConfig {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum Strategy {
+    /// The eligible seat used longest ago. With healthy seats this
+    /// alternates like round-robin.
     #[default]
     LeastRecentlyUsed,
+    /// The eligible seat after the active one, in declaration order.
     RoundRobin,
+    /// Always `fixed_seat` while it is eligible; otherwise the
+    /// least-recently-used eligible seat. (Strict pinning with no fallback
+    /// is `CODEX_CLEAN_SEAT`.)
+    Fixed,
+    /// The eligible seat with the most headroom on its tightest usage
+    /// window, so usage stays level across seats. Uses the snapshot recorded
+    /// by `seat status`, refreshed automatically when older than
+    /// `balance_refresh_seconds`; a seat with no snapshot counts as unused.
+    Balanced,
 }
 
+impl Strategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LeastRecentlyUsed => "least-recently-used",
+            Self::RoundRobin => "round-robin",
+            Self::Fixed => "fixed",
+            Self::Balanced => "balanced",
+        }
+    }
+
+    /// Parse a user-supplied name; accepts the kebab-case names plus the
+    /// short aliases `lru` and `rr`.
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "least-recently-used" | "lru" => Self::LeastRecentlyUsed,
+            "round-robin" | "rr" => Self::RoundRobin,
+            "fixed" => Self::Fixed,
+            "balanced" | "balance" => Self::Balanced,
+            _ => return None,
+        })
+    }
+}
+
+impl std::fmt::Display for Strategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+fn default_balance_refresh() -> u64 { 1800 }
 fn default_default_cooldown() -> u64 { 3600 }
 fn default_max_retries() -> u32 { 1 }
 fn default_min_cooldown() -> u64 { 300 }
@@ -396,6 +445,8 @@ impl Default for RotationConfig {
     fn default() -> Self {
         Self {
             strategy: Strategy::LeastRecentlyUsed,
+            fixed_seat: None,
+            balance_refresh_seconds: default_balance_refresh(),
             default_cooldown_seconds: default_default_cooldown(),
             max_retries: default_max_retries(),
             cooldown_min_seconds: default_min_cooldown(),
@@ -461,6 +512,19 @@ impl SeatConfig {
                 );
             }
         }
+        if self.rotation.strategy == Strategy::Fixed {
+            match &self.rotation.fixed_seat {
+                None => anyhow::bail!(
+                    "rotation.strategy = \"fixed\" requires rotation.fixed_seat = \"<name>\" \
+                     (run `codex-clean seat strategy fixed <name>`)"
+                ),
+                Some(f) if self.find(f).is_none() => anyhow::bail!(
+                    "rotation.fixed_seat = \"{}\" is not a configured seat",
+                    f
+                ),
+                _ => {}
+            }
+        }
         Ok(())
     }
 
@@ -495,6 +559,9 @@ impl SeatConfig {
     }
 
     pub fn save(&self) -> Result<()> {
+        // Never persist something `load` would refuse: that would lock every
+        // subcommand out, including the one needed to repair it.
+        self.validate().context("refusing to save an invalid seats.toml")?;
         let path = seats_toml_path()?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -543,6 +610,30 @@ impl SeatRuntimeState {
     /// Eligible for rotation: logged in and not cooling.
     pub fn is_eligible(&self, now: DateTime<Utc>) -> bool {
         !self.needs_login && self.cooldown_until.is_none_or(|u| u <= now)
+    }
+
+    /// Used-percent of the seat's tightest window on its enforced limit,
+    /// from the recorded snapshot. `None` when no snapshot has been taken.
+    /// The `balanced` strategy prefers the smallest value.
+    pub fn usage_score(&self) -> Option<u32> {
+        let snap = self.usage.as_ref()?;
+        // Only the enforced limit counts (mirrors usage::enforcement_bucket);
+        // a model-specific bucket such as `premium` says nothing about the
+        // seat's general headroom.
+        let bucket = snap
+            .buckets
+            .iter()
+            .find(|b| b.limit_id.as_deref() == Some("codex"))
+            .or_else(|| snap.buckets.iter().find(|b| b.limit_id.is_none()))?;
+        bucket.windows.iter().map(|w| w.used_percent).max()
+    }
+
+    /// True when the snapshot is missing or older than `max_age`.
+    pub fn usage_is_stale(&self, now: DateTime<Utc>, max_age: chrono::Duration) -> bool {
+        match &self.usage {
+            None => true,
+            Some(u) => now - u.fetched_at > max_age,
+        }
     }
 }
 
@@ -890,6 +981,20 @@ pub fn pick_seat(
     override_seat: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<String, SeatPickError> {
+    pick_seat_excluding(config, state, override_seat, now, &[])
+}
+
+/// `pick_seat`, but seats named in `exclude` (already tried in this run) are
+/// passed over while any other eligible seat remains. If every eligible seat
+/// is excluded the exclusion is ignored, so the caller's "already tried"
+/// guard still fires and the pool-exhausted logic runs as before.
+pub fn pick_seat_excluding(
+    config: &SeatConfig,
+    state: &SeatState,
+    override_seat: Option<&str>,
+    now: DateTime<Utc>,
+    exclude: &[String],
+) -> Result<String, SeatPickError> {
     if config.seats.is_empty() {
         return Err(SeatPickError::NoSeatsConfigured);
     }
@@ -911,23 +1016,54 @@ pub fn pick_seat(
     }
 
     // Eligible = not needs_login, and either no cooldown or cooldown elapsed.
-    let eligible: Vec<&SeatEntry> = config
+    let all_eligible: Vec<&SeatEntry> = config
         .seats
         .iter()
         .filter(|s| state.get(&s.name).is_eligible(now))
         .collect();
 
-    if eligible.is_empty() {
+    if all_eligible.is_empty() {
         return Err(all_blocked_error(config, state));
     }
+    let excluded: std::collections::HashSet<&str> = exclude.iter().map(String::as_str).collect();
+    let untried: Vec<&SeatEntry> = all_eligible
+        .iter()
+        .copied()
+        .filter(|s| !excluded.contains(s.name.as_str()))
+        .collect();
+    let eligible = if untried.is_empty() { all_eligible } else { untried };
+
+    let lru = |pool: &[&SeatEntry]| -> String {
+        // Smallest last_used (None sorts as oldest).
+        pool.iter()
+            .min_by_key(|s| state.get(&s.name).last_used)
+            .expect("eligible non-empty")
+            .name
+            .clone()
+    };
 
     let chosen = match config.rotation.strategy {
-        Strategy::LeastRecentlyUsed => {
-            // Smallest last_used (None sorts as oldest).
-            eligible
-                .into_iter()
-                .min_by_key(|s| state.get(&s.name).last_used)
-                .expect("eligible non-empty")
+        Strategy::LeastRecentlyUsed => return Ok(lru(&eligible)),
+        Strategy::Fixed => {
+            let fixed = config.rotation.fixed_seat.as_deref().unwrap_or_default();
+            if let Some(s) = eligible.iter().find(|s| s.name == fixed) {
+                return Ok(s.name.clone());
+            }
+            // Preferred seat is cooling / needs login: fall back to LRU
+            // among the rest so work still gets done.
+            return Ok(lru(&eligible));
+        }
+        Strategy::Balanced => {
+            // Most headroom on the tightest window wins; unknown usage counts
+            // as 0 (the run's outcome corrects it); ties go to LRU.
+            let best = eligible
+                .iter()
+                .min_by_key(|s| {
+                    let st = state.get(&s.name);
+                    (st.usage_score().unwrap_or(0), st.last_used)
+                })
+                .expect("eligible non-empty");
+            return Ok(best.name.clone());
         }
         Strategy::RoundRobin => {
             // Pick the seat after the active seat in declaration order.
@@ -1667,6 +1803,135 @@ mod tests {
         assert!(c.validate().is_ok());
     }
 
+    fn snapshot_with(used: &[(u64, u32)], age_secs: i64) -> UsageSnapshot {
+        UsageSnapshot {
+            fetched_at: now() - chrono::Duration::seconds(age_secs),
+            plan_type: Some("team".into()),
+            buckets: vec![UsageBucket {
+                limit_id: Some("codex".into()),
+                limit_name: None,
+                windows: used
+                    .iter()
+                    .map(|(m, p)| UsageWindow { window_minutes: Some(*m), used_percent: *p, resets_at: None })
+                    .collect(),
+                rate_limit_reached_type: None,
+            }],
+            credits: None,
+            spend_control_reached: None,
+        }
+    }
+
+    #[test]
+    fn pick_seat_fixed_prefers_named_seat_and_falls_back_when_ineligible() {
+        let mut c = cfg(&["main", "backup1"], Strategy::Fixed);
+        c.rotation.fixed_seat = Some("backup1".into());
+        let mut s = SeatState::default();
+        // backup1 was used more recently than main; LRU would say main.
+        s.entry_mut("backup1").last_used = Some(now() - chrono::Duration::minutes(1));
+        s.entry_mut("main").last_used = Some(now() - chrono::Duration::hours(5));
+        assert_eq!(pick_seat(&c, &s, None, now()).unwrap(), "backup1");
+        // Preferred seat cooling → falls back to the other.
+        s.entry_mut("backup1").cooldown_until = Some(now() + chrono::Duration::hours(1));
+        assert_eq!(pick_seat(&c, &s, None, now()).unwrap(), "main");
+        // Preferred seat needs login → same.
+        s.entry_mut("backup1").cooldown_until = None;
+        s.entry_mut("backup1").needs_login = true;
+        assert_eq!(pick_seat(&c, &s, None, now()).unwrap(), "main");
+    }
+
+    #[test]
+    fn fixed_strategy_requires_a_configured_fixed_seat() {
+        let mut c = cfg(&["a", "b"], Strategy::Fixed);
+        assert!(c.validate().unwrap_err().to_string().contains("requires rotation.fixed_seat"));
+        c.rotation.fixed_seat = Some("nope".into());
+        assert!(c.validate().unwrap_err().to_string().contains("not a configured seat"));
+        c.rotation.fixed_seat = Some("b".into());
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn pick_seat_balanced_prefers_most_headroom_on_tightest_window() {
+        let c = cfg(&["main", "backup1"], Strategy::Balanced);
+        let mut s = SeatState::default();
+        // main: 5h 20% but weekly 86% → score 86. backup1: 5h 60%, weekly 4% → 60.
+        s.entry_mut("main").usage = Some(snapshot_with(&[(300, 20), (10080, 86)], 60));
+        s.entry_mut("backup1").usage = Some(snapshot_with(&[(300, 60), (10080, 4)], 60));
+        // main was used longer ago; LRU would pick main. Balanced picks backup1.
+        s.entry_mut("main").last_used = Some(now() - chrono::Duration::hours(3));
+        s.entry_mut("backup1").last_used = Some(now() - chrono::Duration::minutes(1));
+        assert_eq!(pick_seat(&c, &s, None, now()).unwrap(), "backup1");
+
+        // Once backup1 catches up past main, main is picked again.
+        s.entry_mut("backup1").usage = Some(snapshot_with(&[(300, 90), (10080, 40)], 60));
+        assert_eq!(pick_seat(&c, &s, None, now()).unwrap(), "main");
+
+        // Equal scores → LRU tie-break (main is older).
+        s.entry_mut("backup1").usage = Some(snapshot_with(&[(300, 86)], 60));
+        assert_eq!(pick_seat(&c, &s, None, now()).unwrap(), "main");
+
+        // A seat with no snapshot counts as unused and is preferred.
+        s.entry_mut("backup1").usage = None;
+        assert_eq!(pick_seat(&c, &s, None, now()).unwrap(), "backup1");
+        assert!(s.get("backup1").usage_is_stale(now(), chrono::Duration::seconds(1800)));
+        assert!(!s.get("main").usage_is_stale(now(), chrono::Duration::seconds(1800)));
+        assert!(s.get("main").usage_is_stale(now(), chrono::Duration::seconds(30)));
+    }
+
+    #[test]
+    fn usage_score_ignores_non_enforced_buckets() {
+        let mut st = SeatRuntimeState::default();
+        let mut snap = snapshot_with(&[(300, 30), (10080, 70)], 0);
+        snap.buckets[0].limit_id = Some("premium".into());
+        st.usage = Some(snap);
+        assert_eq!(st.usage_score(), None, "premium-only snapshot says nothing about headroom");
+        let mut snap = snapshot_with(&[(300, 30), (10080, 70)], 0);
+        snap.buckets[0].limit_id = None;
+        st.usage = Some(snap);
+        assert_eq!(st.usage_score(), Some(70), "legacy single view is enforced");
+    }
+
+    #[test]
+    fn pick_seat_excluding_skips_tried_seats_for_every_strategy() {
+        for strategy in [Strategy::LeastRecentlyUsed, Strategy::RoundRobin, Strategy::Fixed, Strategy::Balanced] {
+            let mut c = cfg(&["a", "b"], strategy);
+            c.rotation.fixed_seat = Some("a".into());
+            let mut s = SeatState { active_seat: Some("b".into()), ..Default::default() };
+            s.entry_mut("a").usage = Some(snapshot_with(&[(300, 1)], 0));
+            s.entry_mut("b").usage = Some(snapshot_with(&[(300, 50)], 0));
+            s.entry_mut("b").last_used = Some(now());
+            // Every strategy would pick "a" first…
+            assert_eq!(pick_seat(&c, &s, None, now()).unwrap(), "a", "{:?}", strategy);
+            // …and "b" once "a" has been tried this run.
+            assert_eq!(
+                pick_seat_excluding(&c, &s, None, now(), &["a".to_string()]).unwrap(),
+                "b",
+                "{:?}",
+                strategy
+            );
+            // With everything tried, exclusion is ignored (caller's guard handles it).
+            assert_eq!(
+                pick_seat_excluding(&c, &s, None, now(), &["a".to_string(), "b".to_string()]).unwrap(),
+                "a",
+                "{:?}",
+                strategy
+            );
+        }
+    }
+
+    #[test]
+    fn strategy_names_round_trip() {
+        for s in [Strategy::LeastRecentlyUsed, Strategy::RoundRobin, Strategy::Fixed, Strategy::Balanced] {
+            assert_eq!(Strategy::parse(s.as_str()), Some(s));
+        }
+        assert_eq!(Strategy::parse("LRU"), Some(Strategy::LeastRecentlyUsed));
+        assert_eq!(Strategy::parse("rr"), Some(Strategy::RoundRobin));
+        assert_eq!(Strategy::parse("weighted"), None);
+        let raw = "[[seat]]\nname = \"a\"\n[rotation]\nstrategy = \"balanced\"\n";
+        let c: SeatConfig = toml::from_str(raw).unwrap();
+        assert_eq!(c.rotation.strategy, Strategy::Balanced);
+        assert_eq!(c.rotation.balance_refresh_seconds, 1800);
+    }
+
     #[test]
     fn seat_notice_summarises_degraded_pool_only() {
         let c = cfg(&["main", "backup1"], Strategy::LeastRecentlyUsed);
@@ -1901,6 +2166,8 @@ mod tests {
             ],
             rotation: RotationConfig {
                 strategy: Strategy::RoundRobin,
+                fixed_seat: None,
+                balance_refresh_seconds: 600,
                 default_cooldown_seconds: 1800,
                 max_retries: 2,
                 cooldown_min_seconds: 60,

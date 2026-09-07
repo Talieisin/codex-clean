@@ -10,10 +10,11 @@ use crate::events::{extract_event, Event};
 use crate::output::CodexOutput;
 use crate::ratelimit::{self, FailureKind};
 use crate::seat::{
-    self, cool_seats, log_event, log_excerpt, refresh_back_guarded, seat_notice,
-    swap_active_auth, unmatched_log_path, warn_refresh_back, workspace_siblings, CodexLock,
-    SeatConfig, SeatPickError, SeatState, SCRUB_ENV_VARS,
+    self, cool_seats, log_event, log_excerpt, refresh_back_guarded, seat_notice, swap_active_auth,
+    unmatched_log_path, warn_refresh_back, workspace_siblings, CodexLock, SeatConfig,
+    SeatPickError, SeatState, Strategy, SCRUB_ENV_VARS,
 };
+use crate::usage::{self, AppServerClient, UsageClient};
 
 const STDERR_CAP_BYTES: usize = 10 * 1024 * 1024;
 
@@ -57,10 +58,25 @@ pub fn run_codex(args: &[String], prompt: &str, mode: Mode) -> Result<i32> {
     run_codex_with(args, prompt, mode, attempt_codex)
 }
 
+/// `run_codex_with_client` with the production app-server usage client.
+pub fn run_codex_with<F>(args: &[String], prompt: &str, mode: Mode, attempt: F) -> Result<i32>
+where
+    F: Fn(&[String], &str, &Mode, bool) -> Result<AttemptResult>,
+{
+    run_codex_with_client(args, prompt, mode, attempt, &AppServerClient::default())
+}
+
 /// Internal orchestration that drives the lock/swap/spawn/classify state
 /// machine. Generic over the codex attempt callback so tests can inject a
-/// fake spawner without touching real auth.json or running real codex.
-pub fn run_codex_with<F>(args: &[String], prompt: &str, mode: Mode, attempt: F) -> Result<i32>
+/// fake spawner without touching real auth.json or running real codex, and
+/// over the usage client the `balanced` strategy uses to refresh snapshots.
+pub fn run_codex_with_client<F>(
+    args: &[String],
+    prompt: &str,
+    mode: Mode,
+    attempt: F,
+    usage_client: &dyn UsageClient,
+) -> Result<i32>
 where
     F: Fn(&[String], &str, &Mode, bool) -> Result<AttemptResult>,
 {
@@ -97,9 +113,25 @@ where
     let mut last_failure: Option<AttemptResult> = None;
     let mut tried_seats: Vec<String> = Vec::new();
 
-    for _ in 0..max_attempts {
+    for attempt_index in 0..max_attempts {
+        // Before anything touches the slots, stash any token refresh the
+        // previously active seat received (from plain `codex`, or from our
+        // own last attempt). This must precede a balanced-strategy snapshot
+        // refresh too: that stages the slot blob into a scratch home, and a
+        // stale refresh token there would be rejected as reused. Runs even
+        // when the same seat is about to be re-picked, so a single-seat /
+        // pinned run never clobbers a fresher global blob with the stale
+        // slot copy. Guarded by identity; never fatal.
+        if let Some(prev) = state.active_seat.clone() {
+            persist_refresh(&cfg, &prev);
+        }
+
+        if attempt_index == 0 && cfg.rotation.strategy == Strategy::Balanced && override_seat.is_none() {
+            refresh_stale_usage(&cfg, &mut state, usage_client);
+        }
+
         let now = Utc::now();
-        let chosen = match seat::pick_seat(&cfg, &state, override_seat.as_deref(), now) {
+        let chosen = match seat::pick_seat_excluding(&cfg, &state, override_seat.as_deref(), now, &tried_seats) {
             Ok(name) => name,
             Err(blocked @ SeatPickError::AllSeatsBlocked { .. }) => {
                 let code = report_all_blocked(&blocked);
@@ -133,16 +165,6 @@ where
         // pick (after retry) doesn't reselect the same seat by accident.
         state.entry_mut(&chosen).last_used = Some(now);
         state.save()?;
-
-        // Before overwriting ~/.codex/auth.json, stash any token refresh the
-        // previously active seat received (from plain `codex`, or from our
-        // own last attempt). This runs even when prev == chosen: otherwise a
-        // single-seat / pinned / re-picked run would clobber a fresher global
-        // blob with the stale slot copy. Guarded by identity so a foreign
-        // login is never filed under the wrong seat. Never fatal.
-        if let Some(prev) = state.active_seat.clone() {
-            persist_refresh(&cfg, &prev);
-        }
 
         swap_active_auth(&chosen)
             .with_context(|| format!("swapping active auth to seat '{}'", chosen))?;
@@ -269,6 +291,94 @@ where
             Ok(prev.exit_code)
         }
         None => Ok(1),
+    }
+}
+
+/// For the `balanced` strategy: refresh the usage snapshot of every eligible
+/// seat whose snapshot is missing or older than `balance_refresh_seconds`,
+/// so the pick reflects real headroom. Costs one app-server round-trip per
+/// stale seat, so most runs pay nothing. Never fails the run: a seat whose
+/// fetch fails keeps its old snapshot (or none, which counts as unused).
+fn refresh_stale_usage(cfg: &SeatConfig, state: &mut SeatState, client: &dyn UsageClient) {
+    let now = Utc::now();
+    let max_age = chrono::Duration::seconds(cfg.rotation.balance_refresh_seconds as i64);
+    let stale: Vec<seat::SeatEntry> = cfg
+        .seats
+        .iter()
+        .filter(|s| {
+            let st = state.get(&s.name);
+            st.is_eligible(now) && st.usage_is_stale(now, max_age)
+        })
+        .cloned()
+        .collect();
+    if stale.is_empty() {
+        return;
+    }
+    let names: Vec<&str> = stale.iter().map(|s| s.name.as_str()).collect();
+    eprintln!("Refreshing usage for seat(s) {} (balanced strategy).", names.join(", "));
+
+    // The fetch may rotate a seat's token in its slot. For the active seat,
+    // ~/.codex/auth.json must follow, or an early exit (all seats cooling)
+    // would leave the old refresh token in place and the next run would copy
+    // it back over the fresh slot.
+    let active = state.active_seat.clone();
+    let active_slot_before = active
+        .as_deref()
+        .and_then(|a| seat::seat_auth_path(a).ok())
+        .and_then(|p| std::fs::read(p).ok());
+
+    for (name, result) in usage::fetch_all(client, &stale) {
+        match result {
+            Ok(snap) => {
+                let verdict = usage::verdict(&snap);
+                let notices = usage::apply_snapshot(&name, state.entry_mut(&name), snap, &cfg.rotation, now);
+                if let usage::UsageVerdict::Exhausted { reason, .. } = verdict {
+                    if !reason.is_window_based() {
+                        if let Some(until) = state.get(&name).cooldown_until {
+                            let siblings: Vec<String> = workspace_siblings(cfg, &name)
+                                .into_iter()
+                                .filter(|n| *n != name)
+                                .collect();
+                            cool_seats(state, &siblings, until, reason.as_str(), now);
+                        }
+                    }
+                }
+                for n in notices {
+                    eprintln!("Note: {}", n);
+                    log_event("status", &name, &n);
+                }
+            }
+            Err(usage::UsageFetchError::AuthRequired) => {
+                // The seat's tokens are dead; do not let a zero score send
+                // the run straight into an auth failure with no fallback.
+                state.entry_mut(&name).needs_login = true;
+                log_event("auth_error", &name, "usage refresh rejected the seat's tokens; marked needs_login");
+                eprintln!(
+                    "Seat '{}' has invalid credentials (found while refreshing usage). Run: codex-clean seat login {}",
+                    name, name
+                );
+            }
+            Err(e) => eprintln!("Warning: could not refresh usage for seat '{}': {}", name, e),
+        }
+    }
+    if let Err(e) = state.save() {
+        eprintln!("Warning: could not save refreshed usage: {:#}", e);
+    }
+
+    if let Some(a) = active.as_deref() {
+        let after = seat::seat_auth_path(a).ok().and_then(|p| std::fs::read(p).ok());
+        if after.is_some() && after != active_slot_before {
+            match swap_active_auth(a) {
+                Ok(()) => eprintln!(
+                    "Note: seat '{}' refreshed its token during the usage check; ~/.codex/auth.json updated.",
+                    a
+                ),
+                Err(e) => eprintln!(
+                    "Warning: could not update ~/.codex/auth.json with seat '{}''s refreshed token: {:#}",
+                    a, e
+                ),
+            }
+        }
     }
 }
 

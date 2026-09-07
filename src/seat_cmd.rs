@@ -858,6 +858,67 @@ pub fn use_seat(name: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// strategy
+// ---------------------------------------------------------------------------
+
+/// `codex-clean seat strategy [NAME [SEAT]]`: show or set the rotation
+/// strategy in seats.toml.
+pub fn strategy(name: Option<&str>, fixed_seat: Option<&str>) -> Result<()> {
+    // Config writers serialise on the lock so a concurrent add/login/remove
+    // cannot be overwritten from a stale in-memory copy.
+    let _lock = if name.is_some() { Some(CodexLock::acquire()?) } else { None };
+    let mut config = SeatConfig::load()?
+        .ok_or_else(|| anyhow!("no seats configured; run `codex-clean seat add <name>` first"))?;
+    let Some(name) = name else {
+        let extra = match config.rotation.strategy {
+            seat::Strategy::Fixed => format!(
+                " (fixed_seat = {})",
+                config.rotation.fixed_seat.as_deref().unwrap_or("?")
+            ),
+            seat::Strategy::Balanced => format!(
+                " (balance_refresh_seconds = {})",
+                config.rotation.balance_refresh_seconds
+            ),
+            _ => String::new(),
+        };
+        println!("{}{}", config.rotation.strategy, extra);
+        println!("Available: least-recently-used (lru), round-robin (rr), fixed <seat>, balanced");
+        return Ok(());
+    };
+    let strategy = seat::Strategy::parse(name).ok_or_else(|| {
+        anyhow!(
+            "unknown strategy '{}'; use least-recently-used (lru), round-robin (rr), fixed <seat>, or balanced",
+            name
+        )
+    })?;
+    if strategy == seat::Strategy::Fixed {
+        let seat_name = fixed_seat.ok_or_else(|| anyhow!("`fixed` needs a seat: codex-clean seat strategy fixed <seat>"))?;
+        if config.find(seat_name).is_none() {
+            bail!("seat '{}' not found; run `codex-clean seat list` to see configured seats", seat_name);
+        }
+        config.rotation.fixed_seat = Some(seat_name.to_string());
+    } else if fixed_seat.is_some() {
+        bail!("a seat argument only applies to the `fixed` strategy");
+    }
+    config.rotation.strategy = strategy;
+    config.validate()?;
+    config.save()?;
+    log_event("strategy", config.rotation.fixed_seat.as_deref().unwrap_or("-"), &format!("set to {}", strategy));
+    eprintln!(
+        "Rotation strategy is now {}{}.",
+        strategy,
+        config
+            .rotation
+            .fixed_seat
+            .as_deref()
+            .filter(|_| strategy == seat::Strategy::Fixed)
+            .map(|s| format!(" (preferring seat '{}')", s))
+            .unwrap_or_default()
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // events
 // ---------------------------------------------------------------------------
 
@@ -913,6 +974,19 @@ pub fn remove(name: &str, yes: bool) -> Result<()> {
     let _lock = CodexLock::acquire()?;
 
     config.seats.retain(|s| s.name != name);
+    if config.rotation.strategy == seat::Strategy::Fixed
+        && config.rotation.fixed_seat.as_deref() == Some(name)
+    {
+        // Otherwise seats.toml would fail validation on every load and the
+        // CLI could not repair itself.
+        config.rotation.strategy = seat::Strategy::LeastRecentlyUsed;
+        config.rotation.fixed_seat = None;
+        eprintln!(
+            "Seat '{}' was the fixed seat; rotation strategy reset to least-recently-used.",
+            name
+        );
+        log_event("strategy", "-", "reset to least-recently-used (fixed seat removed)");
+    }
     config.save()?;
 
     let mut state = SeatState::load()?;

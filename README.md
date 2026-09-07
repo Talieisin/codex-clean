@@ -87,6 +87,13 @@ codex-clean seat status work            # one seat only
 # 4. Use as normal — rotation is automatic (least-recently-used by default)
 codex-clean "say hi"
 
+# 4b. Choose how seats are picked
+codex-clean seat strategy                 # show the current strategy
+codex-clean seat strategy balanced        # keep usage level across seats (see below)
+codex-clean seat strategy fixed main      # always prefer 'main'; others only when it is cooling / logged out
+codex-clean seat strategy round-robin     # take turns in declaration order
+codex-clean seat strategy lru             # back to the default
+
 # 5. Pin a specific seat for one invocation (bypasses rotation)
 CODEX_CLEAN_SEAT=work codex-clean "say hi"
 
@@ -108,7 +115,18 @@ codex-clean seat remove work
 
 > **Pinning vs. switching.** `CODEX_CLEAN_SEAT=<name>` is the only mechanism that bypasses rotation — it applies for as long as the env var is set. `seat use <name>` is a one-shot helper that swaps `~/.codex/auth.json` to that seat's blob right now and updates the recorded active seat; it does not disable rotation, so the *next* `codex-clean` run will re-pick via the rotation policy (LRU by default) as usual. Use `seat use` mainly when you want plain `codex` (not codex-clean) to hit a specific account.
 
-**How rotation works.** Before each codex invocation, `codex-clean` acquires a per-host advisory lock, picks a seat (LRU or round-robin), first copies any token refresh the previously active seat received (from plain `codex`, or from the last run) back into that seat's slot, then atomically copies the chosen seat's auth blob into `~/.codex/auth.json`, runs codex, and copies any token refresh codex performed back into the seat's slot. If the run fails with one of codex's exhaustion messages, the seat is cooled and the next eligible seat is tried. Recognised messages and how long the seat cools:
+**Strategies.** `rotation.strategy` in `seats.toml` (or `codex-clean seat strategy …`):
+
+| Strategy | Picks | When to use |
+|---|---|---|
+| `least-recently-used` (default, alias `lru`) | the eligible seat used longest ago | simple alternation; with two healthy seats it behaves like round-robin |
+| `round-robin` (`rr`) | the eligible seat after the active one, in declaration order | strict turn-taking |
+| `fixed <seat>` | the named seat whenever it is eligible, else the least-recently-used other seat | one primary account with overflow to the others; strict pinning with *no* fallback is `CODEX_CLEAN_SEAT` |
+| `balanced` | the eligible seat with the most headroom on its tightest window (lowest used-% across its 5-hour and weekly windows, ties to LRU) | keep usage level across seats so no single seat hits its weekly cap first |
+
+`balanced` reads the usage snapshot `seat status` records in `state.json`. Before picking, any eligible seat whose snapshot is missing or older than `rotation.balance_refresh_seconds` (default 1800) is refreshed through `codex app-server`, so the pick reflects real headroom. A run pays that cost only when a snapshot has gone stale: typically one to three seconds per stale seat, fetched up to four at a time, with a 20-second timeout per seat as the worst case (the lock is held meanwhile). A seat whose tokens the app-server rejects is marked `needs login` rather than picked. A seat with no snapshot counts as unused and gets picked, and the run's own outcome corrects the picture. A seat that is behind stays preferred until it has caught up, which is what "weighted" rotation amounts to.
+
+**How rotation works.** Before each codex invocation, `codex-clean` acquires a per-host advisory lock, picks a seat by the configured strategy, first copies any token refresh the previously active seat received (from plain `codex`, or from the last run) back into that seat's slot, then atomically copies the chosen seat's auth blob into `~/.codex/auth.json`, runs codex, and copies any token refresh codex performed back into the seat's slot. If the run fails with one of codex's exhaustion messages, the seat is cooled and the next eligible seat is tried. Recognised messages and how long the seat cools:
 
 | Message (codex 0.153.x wording) | Recorded reason | Scope | Cooldown |
 |---|---|---|---|
@@ -147,7 +165,7 @@ Layout on disc:
   sessions/, state_5.sqlite, ...       (shared across seats)
 
 ~/.config/codex-clean/                 (private side store)
-  seats.toml                           (seat list + rotation policy)
+  seats.toml                           (seat list + rotation policy: strategy, fixed_seat, cooldowns)
   state.json                           (per-seat last_used / cooldown_until / cooldown_reason /
                                         needs_login / usage snapshot from `seat status`)
   seats/<name>/auth.json               (per-seat OAuth blob, 0600)
@@ -209,6 +227,7 @@ codex-clean review [OPTIONS...] [prompt]
 codex-clean seat add <NAME> [--label LABEL] [--import] [--browser]
 codex-clean seat list
 codex-clean seat status [NAME] [--json] [--clear-cooldown NAME]
+codex-clean seat strategy [NAME [SEAT]]
 codex-clean seat events [--tail N]
 codex-clean seat login <NAME> [--browser]
 codex-clean seat use <NAME>
@@ -230,6 +249,7 @@ codex-clean seat remove <NAME> [--yes]
 | `seat add <name>` | Register a new seat. `--import` adopts the existing `~/.codex/auth.json`; otherwise runs `codex login --device-auth` (or `--browser`) in an isolated temp `CODEX_HOME` |
 | `seat list` | Table of seats with last-used / last recorded usage / status. Offline |
 | `seat status [name]` | Query live quota per seat via `codex app-server`, print it, record it in `state.json`, and cool any exhausted seat. `--json` for machine-readable output; `--clear-cooldown <name>` removes a recorded cooldown. Exits 1 if every fetch failed or another codex-clean run holds the lock |
+| `seat strategy [name [seat]]` | Show the rotation strategy, or set it: `least-recently-used`/`lru`, `round-robin`/`rr`, `fixed <seat>`, `balanced` |
 | `seat events [--tail N]` | Print the last N entries (default 20) of `seat-events.log` |
 | `seat login <name>` | Re-authenticate a seat. The new login's workspace and user identity are verified against the stored values and a mismatch refuses to overwrite |
 | `seat use <name>` | Pre-position `~/.codex/auth.json` to this seat's blob and record it as active. Does not disable rotation for subsequent `codex-clean` runs (use `CODEX_CLEAN_SEAT` for that) |

@@ -19,7 +19,8 @@ use crate::seat::{
     CodexLock, FileStoreOutcome, ScratchCodexHome, SeatConfig, SeatEntry,
     SeatIdentity, SeatRuntimeState, SeatState, UsageSnapshot,
 };
-use crate::usage::{self, AppServerClient, UsageClient, UsageFetchError};
+use crate::runner::{consent_for, CreditUse};
+use crate::usage::{self, quota_state, AppServerClient, QuotaState, UsageClient, UsageFetchError};
 
 /// Read lines from a child stdio handle and forward them to our own
 /// stdout/stderr, flushing after each line. Solves the case where codex's
@@ -56,6 +57,9 @@ fn spawn_codex_login_in(home: &Path, browser: bool) -> Result<()> {
     let auth_mode = if browser { "browser" } else { "device-auth" };
     let mut cmd = Command::new("codex");
     cmd.env("CODEX_HOME", home);
+    for var in seat::CONSENT_ENV_VARS {
+        cmd.env_remove(var);
+    }
     cmd.arg("login");
     if !browser {
         cmd.arg("--device-auth");
@@ -323,7 +327,7 @@ pub fn list() -> Result<()> {
     let active = state.active_seat.as_deref();
 
     println!(
-        "{:<14} {:<22} {:<17} {:<18} {:<10} {:<22}",
+        "{:<14} {:<22} {:<17} {:<25} {:<10} {:<22}",
         "NAME", "LABEL", "LAST USED", "USAGE", "FETCHED", "STATUS"
     );
     for seat in &config.seats {
@@ -335,18 +339,28 @@ pub fn list() -> Result<()> {
         };
         let (usage_col, fetched_col) = match &st.usage {
             Some(u) => (
-                usage::summarize_usage_short(u),
+                format!(
+                    "{}{}",
+                    usage::summarize_usage_short(u),
+                    if usage::credits_available(u) { " +credits" } else { "" }
+                ),
                 format!("{} ago", usage::format_duration_short(now - u.fetched_at)),
             ),
             None => ("-".to_string(), "-".to_string()),
         };
-        let status = format_status(&st, active.map(|a| a == seat.name).unwrap_or(false), now);
+        let status = format_status(
+            &st,
+            active.map(|a| a == seat.name).unwrap_or(false),
+            now,
+            consent_for(&config, &state, &seat.name, false, now),
+            config.rotation.credits,
+        );
         println!(
-            "{:<14} {:<22} {:<17} {:<18} {:<10} {:<22}",
+            "{:<14} {:<22} {:<17} {:<25} {:<10} {:<22}",
             seat.name,
             truncate(label, 22),
             last_used,
-            truncate(&usage_col, 18),
+            truncate(&usage_col, 25),
             fetched_col,
             status
         );
@@ -354,7 +368,13 @@ pub fn list() -> Result<()> {
     Ok(())
 }
 
-fn format_status(st: &SeatRuntimeState, is_active: bool, now: DateTime<Utc>) -> String {
+fn format_status(
+    st: &SeatRuntimeState,
+    is_active: bool,
+    now: DateTime<Utc>,
+    consent: Option<CreditUse>,
+    policy: seat::CreditPolicy,
+) -> String {
     if st.needs_login {
         return "needs login".to_string();
     }
@@ -372,6 +392,13 @@ fn format_status(st: &SeatRuntimeState, is_active: bool, now: DateTime<Utc>) -> 
                 until.with_timezone(&Local).format("%-I:%M %p")
             );
         }
+    }
+    if let QuotaState::OnCredits { .. } = quota_state(st, now) {
+        return match (consent, is_active) {
+            (Some(_), true) => "ready (active, on credits)".to_string(),
+            (Some(_), false) => "ready (on credits)".to_string(),
+            (None, _) => format!("quota used; credits not in use ({})", policy),
+        };
     }
     if is_active {
         "ready (active)".to_string()
@@ -397,6 +424,9 @@ struct SeatStatusRow {
     state: SeatRuntimeState,
     result: Result<UsageSnapshot, UsageFetchError>,
     notices: Vec<String>,
+    quota: QuotaState,
+    consent: Option<CreditUse>,
+    policy: seat::CreditPolicy,
 }
 
 /// Injectable core of `status`. Returns the process exit code.
@@ -481,58 +511,47 @@ pub fn status_with(
     let results = usage::fetch_all(client, &targets);
 
     let now = Utc::now();
+    // Reconcile the whole batch first (order-independent; blockers dominate),
+    // then build every row from the final state so the table, --json and
+    // state.json always agree.
+    let mut fetched = Vec::new();
+    for (name, result) in &results {
+        state.entry_mut(name).usage_checked_at = Some(now);
+        match result {
+            Ok(snap) => fetched.push((name.clone(), snap.clone())),
+            Err(UsageFetchError::AuthRequired) => {
+                state.entry_mut(name).needs_login = true;
+                log_event("auth_error", name, "usage check rejected the seat's tokens; marked needs_login");
+            }
+            Err(e) => log_event("status_error", name, &e.to_string()),
+        }
+    }
+    let mut per_seat: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for (seat_name, notice) in usage::reconcile_snapshots(&config, &mut state, fetched, now) {
+        log_event("status", &seat_name, &notice);
+        per_seat.entry(seat_name).or_default().push(notice);
+    }
+    state.save()?;
     let mut rows = Vec::with_capacity(results.len());
     for (seat_entry, (_, result)) in targets.iter().zip(results) {
-        let mut notices = Vec::new();
-        if let Ok(snap) = &result {
-            let verdict = usage::verdict(snap);
-            let entry = state.entry_mut(&seat_entry.name);
-            let mut new_notices = usage::apply_snapshot(
-                &seat_entry.name,
-                entry,
-                snap.clone(),
-                &config.rotation,
-                now,
-            );
-            // Workspace-wide reasons cool the siblings too (extend-only), the
-            // same way the runner does — otherwise `seat status main` could
-            // learn the workspace is out of credits and leave backup1 eligible.
-            if let usage::UsageVerdict::Exhausted { reason, .. } = verdict {
-                if !reason.is_window_based() {
-                    if let Some(until) = state.get(&seat_entry.name).cooldown_until {
-                        let siblings: Vec<String> = seat::workspace_siblings(&config, &seat_entry.name)
-                            .into_iter()
-                            .filter(|n| *n != seat_entry.name)
-                            .collect();
-                        let changed = seat::cool_seats(&mut state, &siblings, until, reason.as_str(), now);
-                        if !changed.is_empty() {
-                            new_notices.push(format!(
-                                "{} is workspace-wide; also cooling {} until {}",
-                                reason,
-                                changed.join(", "),
-                                until.with_timezone(&Local).format("%a %H:%M")
-                            ));
-                        }
-                    }
-                }
-            }
-            for n in &new_notices {
-                log_event("status", &seat_entry.name, n);
-            }
-            notices.extend(new_notices);
-        } else if let Err(e) = &result {
-            log_event("status_error", &seat_entry.name, &e.to_string());
-        }
+        let st = state.get(&seat_entry.name);
         rows.push(SeatStatusRow {
             name: seat_entry.name.clone(),
             label: seat_entry.label.clone(),
             active: active.as_deref() == Some(seat_entry.name.as_str()),
-            state: state.get(&seat_entry.name),
+            quota: quota_state(&st, now),
+            consent: consent_for(&config, &state, &seat_entry.name, false, now),
+            policy: config.rotation.credits,
+            state: st,
             result,
-            notices,
+            notices: per_seat.remove(&seat_entry.name).unwrap_or_default(),
         });
     }
-    state.save()?;
+    // Notices about seats that were not fetched (workspace propagation).
+    for (_, v) in per_seat {
+        global_notices.extend(v);
+    }
+    global_notices.insert(0, describe_credit_policy(&config, &state, now));
 
     // Sync 2: if the app-server rotated the active seat's token, push the new
     // blob into ~/.codex/auth.json so plain codex does not keep using an
@@ -556,7 +575,7 @@ pub fn status_with(
 
     let any_ok = rows.iter().any(|r| r.result.is_ok());
     if json_out {
-        print_status_json(&rows, &global_notices)?;
+        print_status_json(&rows, &global_notices, &config, &state, now)?;
     } else {
         print_status_table(&rows, &global_notices, now);
     }
@@ -565,18 +584,21 @@ pub fn status_with(
 
 fn print_status_table(rows: &[SeatStatusRow], global_notices: &[String], now: DateTime<Utc>) {
     const W: (usize, usize, usize, usize, usize) = (14, 18, 8, 28, 28);
+    const WC: usize = 14;
     println!(
-        "{:<w0$} {:<w1$} {:<w2$} {:<w3$} {:<w4$} STATUS",
+        "{:<w0$} {:<w1$} {:<w2$} {:<w3$} {:<w4$} {:<wc$} STATUS",
         "NAME",
         "LABEL",
         "PLAN",
         "5H",
         "WEEKLY",
+        "CREDITS",
         w0 = W.0,
         w1 = W.1,
         w2 = W.2,
         w3 = W.3,
-        w4 = W.4
+        w4 = W.4,
+        wc = WC
     );
     let mut footnotes: Vec<String> = Vec::new();
     for row in rows {
@@ -622,20 +644,26 @@ fn print_status_table(rows: &[SeatStatusRow], global_notices: &[String], now: Da
             }
             Err(_) => ("?".to_string(), "?".to_string(), "?".to_string()),
         };
-        let status = format_status(&row.state, row.active, now);
+        let status = format_status(&row.state, row.active, now, row.consent, row.policy);
+        let credits = match &row.result {
+            Ok(snap) => usage::format_credits(snap),
+            Err(_) => "?".to_string(),
+        };
         println!(
-            "{:<w0$} {:<w1$} {:<w2$} {:<w3$} {:<w4$} {}",
+            "{:<w0$} {:<w1$} {:<w2$} {:<w3$} {:<w4$} {:<wc$} {}",
             row.name,
             truncate(label, W.1),
             truncate(&plan, W.2),
             five_h,
             weekly,
+            truncate(&credits, WC),
             status,
             w0 = W.0,
             w1 = W.1,
             w2 = W.2,
             w3 = W.3,
-            w4 = W.4
+            w4 = W.4,
+            wc = WC
         );
     }
     if !footnotes.is_empty() {
@@ -672,13 +700,23 @@ fn print_status_table(rows: &[SeatStatusRow], global_notices: &[String], now: Da
     }
 }
 
-fn print_status_json(rows: &[SeatStatusRow], global_notices: &[String]) -> Result<()> {
+fn print_status_json(
+    rows: &[SeatStatusRow],
+    global_notices: &[String],
+    config: &SeatConfig,
+    state: &SeatState,
+    now: DateTime<Utc>,
+) -> Result<()> {
     let seats: Vec<serde_json::Value> = rows
         .iter()
         .map(|r| {
             let (usage_v, error_v) = match &r.result {
                 Ok(snap) => (serde_json::to_value(snap).unwrap_or(json!(null)), json!(null)),
                 Err(e) => (json!(null), json!(e.to_string())),
+            };
+            let quota_resets = match r.quota {
+                QuotaState::OnCredits { resets_at } => json!(resets_at),
+                _ => json!(null),
             };
             json!({
                 "name": r.name,
@@ -687,14 +725,161 @@ fn print_status_json(rows: &[SeatStatusRow], global_notices: &[String]) -> Resul
                 "needs_login": r.state.needs_login,
                 "cooldown_until": r.state.cooldown_until,
                 "cooldown_reason": r.state.cooldown_reason,
+                "quota_state": { "state": r.quota.as_str(), "resets_at": quota_resets },
                 "usage": usage_v,
                 "error": error_v,
                 "notices": r.notices,
             })
         })
         .collect();
-    let doc = json!({ "seats": seats, "notices": global_notices });
+    let doc = json!({
+        "credits_mode": config.rotation.credits.as_str(),
+        "credit_grants": active_grants_json(config, state, now),
+        "seats": seats,
+        "notices": global_notices,
+    });
     println!("{}", serde_json::to_string_pretty(&doc)?);
+    Ok(())
+}
+
+/// Active grants, reported by the seat names they cover (account ids stay
+/// out of `--json`). Expired grants are omitted.
+fn active_grants_json(config: &SeatConfig, state: &SeatState, now: DateTime<Utc>) -> serde_json::Value {
+    let grants: Vec<serde_json::Value> = active_grants(config, state, now)
+        .into_iter()
+        .map(|(workspace, seats, until)| json!({ "workspace": workspace, "seats": seats, "until": until }))
+        .collect();
+    json!(grants)
+}
+
+/// Active grants as `(opaque workspace label, seat names, until)`.
+fn active_grants(
+    config: &SeatConfig,
+    state: &SeatState,
+    now: DateTime<Utc>,
+) -> Vec<(String, Vec<String>, DateTime<Utc>)> {
+    state
+        .credit_grants
+        .iter()
+        .filter(|(_, until)| **until > now)
+        .map(|(ws, until)| {
+            let seats: Vec<String> = config
+                .seats
+                .iter()
+                .filter(|s| seat::workspace_key(config, &s.name) == *ws)
+                .map(|s| s.name.clone())
+                .collect();
+            (seat::workspace_label(ws), seats, *until)
+        })
+        .filter(|(_, seats, _)| !seats.is_empty())
+        .collect()
+}
+
+/// "credits: ask (no active grant)" / "credits: ask; granted until Thu 08:09
+/// for main, backup1" / "credits: always".
+fn describe_credit_policy(config: &SeatConfig, state: &SeatState, now: DateTime<Utc>) -> String {
+    let mut s = format!("credits: {}", config.rotation.credits);
+    if config.rotation.credits != seat::CreditPolicy::Always {
+        let grants = active_grants(config, state, now);
+        if grants.is_empty() {
+            s.push_str(" (no active grant)");
+        } else {
+            for (_, seats, until) in grants {
+                s.push_str(&format!(
+                    "; granted until {} for {}",
+                    until.with_timezone(&Local).format("%a %H:%M"),
+                    seats.join(", ")
+                ));
+            }
+        }
+        if seat::env_use_credits() {
+            s.push_str("; CODEX_CLEAN_USE_CREDITS=1 is set");
+        }
+    }
+    s
+}
+
+// ---------------------------------------------------------------------------
+// credits
+// ---------------------------------------------------------------------------
+
+/// `codex-clean seat credits [ask|never|always|allow|revoke]`.
+pub fn credits(action: Option<&str>) -> Result<()> {
+    let Some(action) = action else {
+        let now = Utc::now();
+        let config = SeatConfig::load()?
+            .ok_or_else(|| anyhow!("no seats configured; run `codex-clean seat add <name>` first"))?;
+        let state = SeatState::load()?;
+        println!("{}", describe_credit_policy(&config, &state, now));
+        for s in &config.seats {
+            let st = state.get(&s.name);
+            let credits = st.usage.as_ref().map(usage::format_credits).unwrap_or_else(|| "-".into());
+            let quota = match quota_state(&st, now) {
+                QuotaState::OnCredits { resets_at } => format!(
+                    "included quota used{}",
+                    resets_at
+                        .map(|r| format!(" (resets {})", r.with_timezone(&Local).format("%a %H:%M")))
+                        .unwrap_or_default()
+                ),
+                QuotaState::Within => "within included quota".to_string(),
+                QuotaState::Unknown => "no usage recorded yet".to_string(),
+            };
+            println!("  {}: credits {}; {}", s.name, credits, quota);
+        }
+        println!("Change with: codex-clean seat credits ask|never|always|allow|revoke");
+        return Ok(());
+    };
+
+    let _lock = CodexLock::acquire()?;
+    // Time is read after the lock: waiting for it can cross a quota reset.
+    let now = Utc::now();
+    let mut config = SeatConfig::load()?
+        .ok_or_else(|| anyhow!("no seats configured; run `codex-clean seat add <name>` first"))?;
+    let mut state = SeatState::load()?;
+    match action.trim().to_ascii_lowercase().as_str() {
+        "allow" => {
+            let on_credits: Vec<(String, Option<DateTime<Utc>>)> = config
+                .seats
+                .iter()
+                .filter_map(|s| match quota_state(&state.get(&s.name), now) {
+                    QuotaState::OnCredits { resets_at } => Some((s.name.clone(), resets_at)),
+                    _ => None,
+                })
+                .collect();
+            if on_credits.is_empty() {
+                bail!(
+                    "nothing to allow yet: no seat has used up its included quota with credits available \
+                     (according to the last `codex-clean seat status`)"
+                );
+            }
+            let granted = seat::grant_credits_until_reset(&config, &mut state, &on_credits, now)?;
+            state.save()?;
+            for (seats, until) in granted {
+                log_event("credits_grant", &seats.join(","), &format!("until {}", until.to_rfc3339()));
+                eprintln!(
+                    "Credits allowed for {} until {} (when included quota resets).",
+                    seats.join(", "),
+                    until.with_timezone(&Local).format("%a %H:%M")
+                );
+            }
+        }
+        "revoke" => {
+            let n = state.credit_grants.len();
+            state.credit_grants.clear();
+            state.save()?;
+            log_event("credits_grant", "-", "revoked all grants");
+            eprintln!("Revoked {} credit grant(s).", n);
+        }
+        other => {
+            let policy = seat::CreditPolicy::parse(other).ok_or_else(|| {
+                anyhow!("unknown credits action '{}'; use ask, never, always, allow or revoke", other)
+            })?;
+            config.rotation.credits = policy;
+            config.save()?;
+            log_event("credits_mode", "-", &format!("set to {}", policy));
+            eprintln!("Credits mode is now {}.", policy);
+        }
+    }
     Ok(())
 }
 

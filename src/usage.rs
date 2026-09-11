@@ -22,8 +22,9 @@ use serde_json::{json, Value};
 
 use crate::ratelimit::{self, CooldownReason};
 use crate::seat::{
-    self, RotationConfig, ScratchCodexHome, SeatEntry, SeatIdentity, SeatRuntimeState,
-    UsageBucket, UsageCredits, UsageSnapshot, UsageWindow,
+    self, merge_cooldown, workspace_key, RotationConfig, ScratchCodexHome, SeatConfig, SeatEntry,
+    SeatIdentity, SeatRuntimeState, SeatState, UsageBucket, UsageCredits, UsageSnapshot,
+    UsageWindow,
 };
 
 /// Wall-clock budget for one seat: spawn, handshake, read, teardown.
@@ -99,6 +100,16 @@ impl From<anyhow::Error> for UsageFetchError {
 /// UsageClient` so tests can feed canned snapshots without a process.
 pub trait UsageClient: Sync {
     fn fetch(&self, seat: &SeatEntry) -> Result<UsageSnapshot, UsageFetchError>;
+}
+
+/// A client that never fetches (every call fails). Used where automatic
+/// usage checks must not spawn codex, e.g. the test-facing entry points.
+pub struct NoUsageClient;
+
+impl UsageClient for NoUsageClient {
+    fn fetch(&self, _seat: &SeatEntry) -> Result<UsageSnapshot, UsageFetchError> {
+        Err(UsageFetchError::Protocol("usage fetching disabled".to_string()))
+    }
 }
 
 /// Production client: one `codex app-server` child per call.
@@ -519,7 +530,10 @@ fn classify_rpc_error(err: &Value) -> UsageFetchError {
         return UsageFetchError::MethodNotFound;
     }
     let lower = message.to_lowercase();
-    if lower.contains("authentication required") || lower.contains("not logged in") {
+    if lower.contains("authentication required")
+        || lower.contains("not logged in")
+        || ratelimit::is_auth_error(message)
+    {
         return UsageFetchError::AuthRequired;
     }
     UsageFetchError::Rpc(sanitize_text(message, 200))
@@ -600,6 +614,11 @@ pub fn parse_rate_limits_result(result: &Value, fetched_at: DateTime<Utc>) -> Re
         .map(|c| UsageCredits {
             has_credits: c.get("hasCredits").and_then(|b| b.as_bool()).unwrap_or(false),
             unlimited: c.get("unlimited").and_then(|b| b.as_bool()).unwrap_or(false),
+            balance: match c.get("balance") {
+                Some(Value::String(b)) if !b.trim().is_empty() => Some(sanitize_text(b, 32)),
+                Some(Value::Number(n)) => Some(n.to_string()),
+                _ => None,
+            },
         });
 
     Ok(UsageSnapshot {
@@ -663,6 +682,14 @@ fn parse_window(w: &Value) -> Option<UsageWindow> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UsageVerdict {
     Healthy,
+    /// Included quota is used up (an enforced window is at 100% and has not
+    /// reset yet) but the workspace has credits or is unlimited: runs would
+    /// be billed to credits. Not a cooldown — whether such a seat may run is
+    /// decided by the credit policy when picking.
+    OnCredits {
+        /// When the exhausted window(s) reset (the latest of them).
+        resets_at: Option<DateTime<Utc>>,
+    },
     Exhausted {
         reason: CooldownReason,
         /// Latest reset among exhausted windows; `None` for credits / spend
@@ -671,17 +698,29 @@ pub enum UsageVerdict {
     },
 }
 
-/// Decide whether a snapshot means the seat is unusable right now.
+/// True when the workspace can pay for usage past the included quota.
+pub fn credits_available(snap: &UsageSnapshot) -> bool {
+    snap.credits
+        .as_ref()
+        .is_some_and(|c| c.has_credits || c.unlimited)
+}
+
+/// Decide what a snapshot means for the seat at `now`.
 ///
-/// A window at 100% in any bucket wins (it carries a reset time). Otherwise a
-/// backend `spendControlReached` flag counts, or a `rateLimitReachedType` on
-/// the **primary** (`codex`) bucket, mapped to a reason by its wording. A
-/// reached flag on another bucket (e.g. `premium` credits) only affects that
-/// bucket's models, so it is reported by [`apply_snapshot`] as a notice
-/// rather than cooling the seat. `credits.hasCredits == false` on its own is
-/// *not* exhaustion: Team plans that never bought credits report exactly
-/// that while perfectly usable.
-pub fn verdict(snap: &UsageSnapshot) -> UsageVerdict {
+/// 1. `spendControlReached` → `Exhausted(SpendControl)`.
+/// 2. A `rateLimitReachedType` on the enforced (`codex`) bucket → `Exhausted`,
+///    mapped by wording. The backend's own flag is authoritative, so it is
+///    checked before the windows.
+/// 3. An enforced window at 100% whose reset is still ahead (or unknown) →
+///    `OnCredits` when credits are available, else `Exhausted(RateLimit)`.
+///    A window whose reset time has passed is treated as reset, so a stale
+///    100% never blocks.
+/// 4. Otherwise `Healthy`.
+///
+/// Flags and windows on other buckets (e.g. `premium`) only affect those
+/// models and are reported as notices by [`reconcile_snapshots`].
+/// `credits.hasCredits == false` on its own is *not* exhaustion.
+pub fn verdict(snap: &UsageSnapshot, now: DateTime<Utc>) -> UsageVerdict {
     if snap.spend_control_reached == Some(true) {
         return UsageVerdict::Exhausted {
             reason: CooldownReason::SpendControl,
@@ -691,10 +730,16 @@ pub fn verdict(snap: &UsageSnapshot) -> UsageVerdict {
     let Some(bucket) = enforcement_bucket(snap) else {
         return UsageVerdict::Healthy;
     };
+    if let Some(kind) = bucket.rate_limit_reached_type.as_deref() {
+        return UsageVerdict::Exhausted {
+            reason: reason_for_reached_type(kind),
+            resets_at: None,
+        };
+    }
     let mut any_window = false;
     let mut latest: Option<DateTime<Utc>> = None;
     for w in &bucket.windows {
-        if w.used_percent >= 100 {
+        if w.used_percent >= 100 && w.resets_at.is_none_or(|r| r > now) {
             any_window = true;
             if let Some(r) = w.resets_at {
                 latest = Some(latest.map_or(r, |cur| cur.max(r)));
@@ -702,15 +747,12 @@ pub fn verdict(snap: &UsageSnapshot) -> UsageVerdict {
         }
     }
     if any_window {
+        if credits_available(snap) {
+            return UsageVerdict::OnCredits { resets_at: latest };
+        }
         return UsageVerdict::Exhausted {
             reason: CooldownReason::RateLimit,
             resets_at: latest,
-        };
-    }
-    if let Some(kind) = bucket.rate_limit_reached_type.as_deref() {
-        return UsageVerdict::Exhausted {
-            reason: reason_for_reached_type(kind),
-            resets_at: None,
         };
     }
     UsageVerdict::Healthy
@@ -727,96 +769,276 @@ pub fn enforcement_bucket(snap: &UsageSnapshot) -> Option<&UsageBucket> {
         .or_else(|| snap.buckets.iter().find(|b| b.limit_id.is_none()))
 }
 
+/// Map a backend `rateLimitReachedType` to a cooldown reason.
+///
+/// - `workspace_*_credits_depleted` → `Credits` (workspace-wide, lifted by
+///   buying credits);
+/// - `workspace_owner/member_usage_limit_reached` → `SpendControl`: an
+///   admin-set workspace limit ("increase your limits"), workspace-wide and
+///   not lifted by credits;
+/// - anything else (`rate_limit_reached`, unknown) → `RateLimit` (personal).
 fn reason_for_reached_type(kind: &str) -> CooldownReason {
     if kind.contains("credits") {
         CooldownReason::Credits
+    } else if kind.starts_with("workspace_") && kind.contains("usage_limit") {
+        CooldownReason::SpendControl
     } else {
         CooldownReason::RateLimit
     }
 }
 
-/// Record a snapshot into a seat's runtime state and apply the verdict.
-///
-/// Exhaustion sets (or extends, never shortens) `cooldown_until` with the
-/// configured clamp and jitter. A healthy read **never** clears an existing
-/// cooldown or `needs_login`: the runner set those from a real failure and
-/// a quota read is weaker evidence. Returns human notices for the caller.
-pub fn apply_snapshot(
-    name: &str,
-    entry: &mut SeatRuntimeState,
-    snap: UsageSnapshot,
+/// Where a seat stands on its included quota, from its recorded snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaState {
+    /// Inside the included quota (or exhausted without credits — that case is
+    /// represented by a cooldown, which the picker checks separately).
+    Within,
+    /// Included quota used up; only workspace credits remain.
+    OnCredits { resets_at: Option<DateTime<Utc>> },
+    /// No snapshot recorded yet.
+    Unknown,
+}
+
+impl QuotaState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Within => "within",
+            Self::OnCredits { .. } => "on_credits",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+pub fn quota_state(st: &SeatRuntimeState, now: DateTime<Utc>) -> QuotaState {
+    match &st.usage {
+        None => QuotaState::Unknown,
+        Some(snap) => match verdict(snap, now) {
+            UsageVerdict::OnCredits { resets_at } => QuotaState::OnCredits { resets_at },
+            _ => QuotaState::Within,
+        },
+    }
+}
+
+fn cooldown_until_for(
+    reason: CooldownReason,
+    resets_at: Option<DateTime<Utc>>,
     rotation: &RotationConfig,
     now: DateTime<Utc>,
+) -> DateTime<Utc> {
+    ratelimit::apply_recovery_window(
+        resets_at,
+        now,
+        ratelimit::default_cooldown_for(
+            reason,
+            rotation.default_cooldown_seconds,
+            rotation.cooldown_max_seconds,
+        ),
+        rotation.cooldown_min_seconds,
+        rotation.cooldown_max_seconds,
+        rotation.cooldown_jitter_seconds,
+    )
+}
+
+/// Re-establish cooldowns from **cached** readings: a seat with no active
+/// cooldown whose recorded snapshot still shows an enforced window at 100%
+/// (reset still ahead) with no credits is exhausted, whatever the cooldown
+/// clock says. Without this, a seat whose clamped cooldown expired just after
+/// a fresh "still exhausted" reading would run immediately. Returns the seats
+/// re-cooled. (A stale reading on a cooling seat is later re-checked by the
+/// blocked-run probe, which is how purchased credits are still discovered.)
+pub fn reapply_cached_exhaustion(
+    cfg: &SeatConfig,
+    state: &mut SeatState,
+    now: DateTime<Utc>,
 ) -> Vec<String> {
-    let mut notices = Vec::new();
-    match verdict(&snap) {
-        UsageVerdict::Exhausted { reason, resets_at } => {
-            let cd = ratelimit::apply_recovery_window(
-                resets_at,
-                now,
-                ratelimit::default_cooldown_for(
-                    reason,
-                    rotation.default_cooldown_seconds,
-                    rotation.cooldown_max_seconds,
-                ),
-                rotation.cooldown_min_seconds,
-                rotation.cooldown_max_seconds,
-                rotation.cooldown_jitter_seconds,
-            );
-            let existing = entry.cooldown_until.filter(|u| *u > now);
-            if existing.is_none_or(|u| cd > u) {
-                entry.cooldown_until = Some(cd);
-                entry.cooldown_reason = Some(reason.as_str().to_string());
-                notices.push(format!(
-                    "seat '{}' is exhausted ({}); cooling until {}",
-                    name,
-                    reason,
-                    format_local(cd)
-                ));
-            } else {
-                notices.push(format!(
-                    "seat '{}' is exhausted ({}); already cooling until {}",
-                    name,
-                    reason,
-                    format_local(existing.unwrap_or(cd))
-                ));
+    let mut recooled = Vec::new();
+    for s in &cfg.seats {
+        let st = state.get(&s.name);
+        if st.needs_login || st.cooldown_until.is_some_and(|u| u > now) {
+            continue;
+        }
+        let Some(snap) = st.usage.as_ref() else { continue };
+        if let UsageVerdict::Exhausted { reason, resets_at: Some(r) } = verdict(snap, now) {
+            if reason.is_window_based() && r > now {
+                let until = cooldown_until_for(reason, Some(r), &cfg.rotation, now);
+                if merge_cooldown(state.entry_mut(&s.name), until, reason, now) {
+                    recooled.push(s.name.clone());
+                }
             }
         }
-        UsageVerdict::Healthy => {
-            // Non-enforced buckets (e.g. `premium`) that are exhausted or
-            // flagged: warn, do not cool — only that bucket's models are affected.
-            let enforced = enforcement_bucket(&snap).map(|b| b as *const UsageBucket);
-            for b in &snap.buckets {
-                if enforced == Some(b as *const UsageBucket) {
-                    continue;
-                }
-                let id = b.limit_id.as_deref().unwrap_or("?");
-                if let Some(kind) = &b.rate_limit_reached_type {
-                    notices.push(format!(
+    }
+    recooled
+}
+
+/// Record a batch of freshly fetched snapshots and bring cooldowns in line
+/// with them. The one place snapshot evidence changes seat state (used by
+/// `seat status`, the balanced refresh, and the blocked-run probe).
+///
+/// 1. Every snapshot is recorded.
+/// 2. A seat's own personal exhaustion (a window at 100% with no credits, a
+///    per-seat reached flag) cools that seat, through `merge_cooldown`.
+/// 3. Per workspace, over the fetched members: a workspace-wide blocker
+///    (spend cap, or a credits-depleted flag) cools every member of the
+///    workspace — **blockers dominate regardless of order**; otherwise, if any
+///    member shows credits available, cooldowns that credits make moot
+///    (`rate_limit`, `credits`) are cleared on every member. Clearing never
+///    spends anything: the credit policy still gates `OnCredits` seats.
+/// 4. `needs_login` is never touched.
+///
+/// Returns `(seat, notice)` pairs for display and the events log.
+pub fn reconcile_snapshots(
+    cfg: &SeatConfig,
+    state: &mut SeatState,
+    fetched: Vec<(String, UsageSnapshot)>,
+    now: DateTime<Utc>,
+) -> Vec<(String, String)> {
+    let mut notices: Vec<(String, String)> = Vec::new();
+    let verdicts: Vec<(String, UsageVerdict)> = fetched
+        .iter()
+        .map(|(n, snap)| (n.clone(), verdict(snap, now)))
+        .collect();
+
+    for (name, snap) in &fetched {
+        // Model-specific buckets: warn only.
+        let enforced = enforcement_bucket(snap).map(|b| b as *const UsageBucket);
+        for b in &snap.buckets {
+            if enforced == Some(b as *const UsageBucket) {
+                continue;
+            }
+            let id = b.limit_id.as_deref().unwrap_or("?");
+            if let Some(kind) = &b.rate_limit_reached_type {
+                notices.push((
+                    name.clone(),
+                    format!(
                         "seat '{}': the '{}' limit reports {} ({}) — models metered by that limit are \
                          unavailable for this workspace; regular models are unaffected, so the seat is not cooled",
                         name, id, kind, reason_for_reached_type(kind)
-                    ));
-                }
-                for w in b.windows.iter().filter(|w| w.used_percent >= 100) {
-                    notices.push(format!(
+                    ),
+                ));
+            }
+            for w in b.windows.iter().filter(|w| w.used_percent >= 100) {
+                notices.push((
+                    name.clone(),
+                    format!(
                         "seat '{}': the '{}' limit's {} window is at 100% ({}) — models metered by that limit are unavailable; the seat is not cooled",
                         name, id, window_label(w.window_minutes), format_resets(w.resets_at, now)
+                    ),
+                ));
+            }
+        }
+        state.entry_mut(name).usage = Some(snap.clone());
+    }
+
+    // Personal exhaustion cools just that seat.
+    for (name, v) in &verdicts {
+        if let UsageVerdict::Exhausted { reason, resets_at } = v {
+            if reason.is_window_based() {
+                let until = cooldown_until_for(*reason, *resets_at, &cfg.rotation, now);
+                if merge_cooldown(state.entry_mut(name), until, *reason, now) {
+                    notices.push((
+                        name.clone(),
+                        format!("seat '{}' is exhausted ({}); cooling until {}", name, reason, format_local(until)),
                     ));
                 }
             }
-            if let Some(u) = entry.cooldown_until.filter(|u| *u > now) {
-                notices.push(format!(
-                    "seat '{}' is cooling until {} but reports {}; clear with `codex-clean seat status --clear-cooldown {}`",
-                    name,
-                    format_local(u),
-                    summarize_usage_short(&snap),
-                    name
+        }
+    }
+
+    // Workspace-level reconciliation.
+    let mut workspaces: std::collections::BTreeMap<String, Vec<usize>> = std::collections::BTreeMap::new();
+    for (i, (name, _)) in fetched.iter().enumerate() {
+        workspaces.entry(workspace_key(cfg, name)).or_default().push(i);
+    }
+    for idxs in workspaces.values() {
+        let first = &fetched[idxs[0]].0;
+        let members = seat::workspace_siblings(cfg, first);
+        // Strongest workspace-wide blocker among the fetched members.
+        let blocker = idxs
+            .iter()
+            .filter_map(|&i| match verdicts[i].1 {
+                UsageVerdict::Exhausted { reason, resets_at } if !reason.is_window_based() => {
+                    Some((reason, resets_at))
+                }
+                _ => None,
+            })
+            .max_by_key(|(r, _)| r.strength());
+        if let Some((reason, resets_at)) = blocker {
+            let until = cooldown_until_for(reason, resets_at, &cfg.rotation, now);
+            let changed = seat::cool_seats(state, &members, until, reason, now);
+            if !changed.is_empty() {
+                notices.push((
+                    first.clone(),
+                    format!(
+                        "{} is workspace-wide; cooling {} until {}",
+                        reason,
+                        changed.join(", "),
+                        format_local(until)
+                    ),
+                ));
+            }
+            continue;
+        }
+        let fresh_credits = idxs
+            .iter()
+            .find(|&&i| credits_available(&fetched[i].1))
+            .and_then(|&i| fetched[i].1.credits.clone());
+        let Some(fresh_credits) = fresh_credits else {
+            continue;
+        };
+        for m in &members {
+            // Credits are workspace-wide: carry the fresh credit reading into
+            // members that were not fetched, so a sibling whose cached reading
+            // says "100%, no credits" becomes `OnCredits` (gated by consent)
+            // instead of looking in-quota once its cooldown is cleared.
+            if !fetched.iter().any(|(n, _)| n == m) {
+                if let Some(u) = state.entry_mut(m).usage.as_mut() {
+                    u.credits = Some(fresh_credits.clone());
+                }
+            }
+            // Guard: a member whose own fresh snapshot says it is exhausted
+            // without credits keeps its cooldown (cannot normally happen, as
+            // credits are workspace-wide).
+            let own_exhausted = fetched
+                .iter()
+                .zip(&verdicts)
+                .any(|((n, _), (_, v))| n == m && matches!(v, UsageVerdict::Exhausted { .. }));
+            if own_exhausted {
+                continue;
+            }
+            let entry = state.entry_mut(m);
+            let active = entry.cooldown_until.filter(|u| *u > now);
+            let reason = CooldownReason::parse(entry.cooldown_reason.as_deref().unwrap_or(""));
+            if active.is_some() && reason.is_clearable_by_credits() {
+                entry.cooldown_until = None;
+                entry.cooldown_reason = None;
+                notices.push((
+                    m.clone(),
+                    format!("seat '{}': workspace credits available; cleared its {} cooldown", m, reason),
                 ));
             }
         }
     }
-    entry.usage = Some(snap);
+
+    // Anything still cooling while its fresh snapshot looks usable.
+    for (name, v) in &verdicts {
+        if matches!(v, UsageVerdict::Exhausted { .. }) {
+            continue;
+        }
+        let st = state.get(name);
+        if let Some(u) = st.cooldown_until.filter(|u| *u > now) {
+            notices.push((
+                name.clone(),
+                format!(
+                    "seat '{}' is cooling until {} ({}) but reports {}; clear with `codex-clean seat status --clear-cooldown {}`",
+                    name,
+                    format_local(u),
+                    st.cooldown_reason.as_deref().unwrap_or("rate_limit"),
+                    st.usage.as_ref().map(summarize_usage_short).unwrap_or_else(|| "-".into()),
+                    name
+                ),
+            ));
+        }
+    }
     notices
 }
 
@@ -906,6 +1128,19 @@ pub fn summarize_usage_short(snap: &UsageSnapshot) -> String {
         .join(" ")
 }
 
+/// Credits cell: `yes`, `yes (<balance>)`, `unlimited`, `none`, or `-`.
+pub fn format_credits(snap: &UsageSnapshot) -> String {
+    match &snap.credits {
+        None => "-".to_string(),
+        Some(c) if c.unlimited => "unlimited".to_string(),
+        Some(c) if c.has_credits => match &c.balance {
+            Some(b) => format!("yes ({})", b),
+            None => "yes".to_string(),
+        },
+        Some(_) => "none".to_string(),
+    }
+}
+
 fn format_local(t: DateTime<Utc>) -> String {
     t.with_timezone(&Local).format("%a %H:%M").to_string()
 }
@@ -953,7 +1188,7 @@ mod tests {
         assert_eq!(b.windows[1].window_minutes, Some(10080));
         assert_eq!(
             snap.credits,
-            Some(UsageCredits { has_credits: false, unlimited: false })
+            Some(UsageCredits { has_credits: false, unlimited: false, balance: None })
         );
         assert_eq!(snap.spend_control_reached, Some(false));
     }
@@ -989,10 +1224,10 @@ mod tests {
         let v = json!({"rateLimits": {"primary": {"usedPercent": 99.9, "windowDurationMins": 300}}});
         let snap = parse_rate_limits_result(&v, now()).unwrap();
         assert_eq!(snap.buckets[0].windows[0].used_percent, 99);
-        assert_eq!(verdict(&snap), UsageVerdict::Healthy);
+        assert_eq!(verdict(&snap, now()), UsageVerdict::Healthy);
         let v = json!({"rateLimits": {"primary": {"usedPercent": 100.0}}});
         let snap = parse_rate_limits_result(&v, now()).unwrap();
-        assert!(matches!(verdict(&snap), UsageVerdict::Exhausted { .. }));
+        assert!(matches!(verdict(&snap, now()), UsageVerdict::Exhausted { .. }));
     }
 
     #[test]
@@ -1175,15 +1410,20 @@ mod tests {
                     .collect(),
                 rate_limit_reached_type: None,
             }],
-            credits: Some(UsageCredits { has_credits: false, unlimited: false }),
+            credits: Some(UsageCredits { has_credits: false, unlimited: false, balance: None }),
             spend_control_reached: Some(false),
         }
+    }
+
+    fn with_credits(mut snap: UsageSnapshot) -> UsageSnapshot {
+        snap.credits = Some(UsageCredits { has_credits: true, unlimited: false, balance: Some("42".into()) });
+        snap
     }
 
     #[test]
     fn verdict_healthy_even_without_credits() {
         let snap = snap_with(&[(300, 42, Some(8000)), (10080, 88, Some(300000))]);
-        assert_eq!(verdict(&snap), UsageVerdict::Healthy);
+        assert_eq!(verdict(&snap, now()), UsageVerdict::Healthy);
         assert_eq!(summarize_usage_short(&snap), "5h 42% wk 88%");
     }
 
@@ -1191,7 +1431,7 @@ mod tests {
     fn verdict_window_exhausted_picks_latest_reset() {
         let snap = snap_with(&[(300, 100, Some(8000)), (10080, 100, Some(300000))]);
         assert_eq!(
-            verdict(&snap),
+            verdict(&snap, now()),
             UsageVerdict::Exhausted {
                 reason: CooldownReason::RateLimit,
                 resets_at: Some(now() + chrono::Duration::seconds(300000)),
@@ -1200,54 +1440,98 @@ mod tests {
     }
 
     #[test]
-    fn reached_flag_on_secondary_bucket_warns_but_does_not_cool() {
-        let mut snap = snap_with(&[(300, 38, Some(8000))]);
-        snap.buckets.push(UsageBucket {
-            limit_id: Some("premium".into()),
-            limit_name: None,
-            windows: vec![],
-            rate_limit_reached_type: Some("workspace_owner_credits_depleted".into()),
-        });
-        assert_eq!(verdict(&snap), UsageVerdict::Healthy);
-        let mut entry = SeatRuntimeState::default();
-        let notices = apply_snapshot("a", &mut entry, snap, &rotation(), now());
-        assert!(entry.cooldown_until.is_none());
-        assert_eq!(notices.len(), 1);
-        assert!(notices[0].contains("'premium' limit reports workspace_owner_credits_depleted"), "{}", notices[0]);
+    fn verdict_is_credits_aware() {
+        let snap = with_credits(snap_with(&[(300, 0, Some(8000)), (10080, 100, Some(300000))]));
+        assert_eq!(
+            verdict(&snap, now()),
+            UsageVerdict::OnCredits { resets_at: Some(now() + chrono::Duration::seconds(300000)) }
+        );
+        let mut unlimited = snap_with(&[(10080, 100, Some(60))]);
+        unlimited.credits = Some(UsageCredits { has_credits: false, unlimited: true, balance: None });
+        assert!(matches!(verdict(&unlimited, now()), UsageVerdict::OnCredits { .. }));
+        // Missing credits info counts as no credits.
+        let mut none = snap_with(&[(10080, 100, Some(60))]);
+        none.credits = None;
+        assert!(matches!(verdict(&none, now()), UsageVerdict::Exhausted { .. }));
+        // The backend's reached flag wins over credits.
+        let mut flagged = snap.clone();
+        flagged.buckets[0].rate_limit_reached_type = Some("rate_limit_reached".into());
+        assert!(matches!(verdict(&flagged, now()), UsageVerdict::Exhausted { reason: CooldownReason::RateLimit, .. }));
+        // Spend cap wins over credits.
+        let mut capped = snap.clone();
+        capped.spend_control_reached = Some(true);
+        assert!(matches!(verdict(&capped, now()), UsageVerdict::Exhausted { reason: CooldownReason::SpendControl, .. }));
+        // A 100% window whose reset has passed is treated as reset.
+        let stale = snap_with(&[(10080, 100, Some(-60))]);
+        assert_eq!(verdict(&stale, now()), UsageVerdict::Healthy);
+    }
 
-        // A 100% window on premium is likewise not seat exhaustion.
+    #[test]
+    fn quota_state_and_credits_formatting() {
+        let mut st = SeatRuntimeState::default();
+        assert_eq!(quota_state(&st, now()), QuotaState::Unknown);
+        st.usage = Some(snap_with(&[(10080, 40, Some(60))]));
+        assert_eq!(quota_state(&st, now()), QuotaState::Within);
+        st.usage = Some(with_credits(snap_with(&[(10080, 100, Some(60))])));
+        assert!(matches!(quota_state(&st, now()), QuotaState::OnCredits { .. }));
+        assert_eq!(QuotaState::Unknown.as_str(), "unknown");
+
+        let mut s = snap_with(&[(300, 1, None)]);
+        assert_eq!(format_credits(&s), "none");
+        s.credits = Some(UsageCredits { has_credits: true, unlimited: false, balance: None });
+        assert_eq!(format_credits(&s), "yes");
+        s.credits = Some(UsageCredits { has_credits: true, unlimited: false, balance: Some("12.50".into()) });
+        assert_eq!(format_credits(&s), "yes (12.50)");
+        s.credits = Some(UsageCredits { has_credits: false, unlimited: true, balance: None });
+        assert_eq!(format_credits(&s), "unlimited");
+        s.credits = None;
+        assert_eq!(format_credits(&s), "-");
+    }
+
+    #[test]
+    fn parse_reads_credit_balance_as_string_or_number() {
+        for (raw, expected) in [(json!("12.50"), Some("12.50")), (json!(7), Some("7")), (json!(null), None), (json!(""), None)] {
+            let v = json!({"rateLimits": {"credits": {"hasCredits": true, "unlimited": false, "balance": raw}}});
+            let snap = parse_rate_limits_result(&v, now()).unwrap();
+            assert_eq!(snap.credits.unwrap().balance.as_deref(), expected);
+        }
+    }
+
+    #[test]
+    fn rpc_errors_with_login_wording_are_auth_required() {
+        let rx = channel_with(&[
+            r#"{"id":2,"error":{"code":-32000,"message":"failed to fetch codex rate limits: GET https://chatgpt.com/backend-api/wham/usage failed: 401 Unauthorized; content-type=text/plain; body={ \"error\": { \"message\": \"Encountered invalidated oauth token\" } }"}}"#,
+        ]);
+        assert!(matches!(wait_for_response(&rx, 2, soon()), Err(UsageFetchError::AuthRequired)));
+        // A bare proxy 401 is not a login problem.
+        let rx = channel_with(&[r#"{"id":2,"error":{"code":-32000,"message":"proxy returned 401 Unauthorized"}}"#]);
+        assert!(matches!(wait_for_response(&rx, 2, soon()), Err(UsageFetchError::Rpc(_))));
+    }
+
+    #[test]
+    fn secondary_buckets_never_enforce() {
         let mut snap = snap_with(&[(300, 38, Some(8000))]);
         snap.buckets.push(UsageBucket {
             limit_id: Some("premium".into()),
             limit_name: None,
             windows: vec![UsageWindow { window_minutes: Some(300), used_percent: 100, resets_at: Some(now()) }],
-            rate_limit_reached_type: None,
+            rate_limit_reached_type: Some("workspace_owner_credits_depleted".into()),
         });
-        assert_eq!(verdict(&snap), UsageVerdict::Healthy);
-        let notices = apply_snapshot("a", &mut SeatRuntimeState::default(), snap, &rotation(), now());
-        assert!(notices[0].contains("'premium' limit's 5h window is at 100%"), "{}", notices[0]);
-
-        // Premium-only snapshot (no codex bucket): nothing is enforced, only warned.
-        let snap = UsageSnapshot {
+        assert_eq!(verdict(&snap, now()), UsageVerdict::Healthy);
+        // Premium-only snapshot: nothing enforced.
+        let premium_only = UsageSnapshot {
             fetched_at: now(),
             plan_type: Some("team".into()),
-            buckets: vec![UsageBucket {
-                limit_id: Some("premium".into()),
-                limit_name: None,
-                windows: vec![],
-                rate_limit_reached_type: Some("workspace_owner_credits_depleted".into()),
-            }],
+            buckets: vec![snap.buckets[1].clone()],
             credits: None,
             spend_control_reached: None,
         };
-        assert_eq!(verdict(&snap), UsageVerdict::Healthy);
-        assert!(enforcement_bucket(&snap).is_none());
-        assert_eq!(primary_bucket(&snap).unwrap().limit_id.as_deref(), Some("premium"), "display falls back");
-
+        assert_eq!(verdict(&premium_only, now()), UsageVerdict::Healthy);
+        assert!(enforcement_bucket(&premium_only).is_none());
         // Legacy single view (limitId null) is enforced.
-        let mut snap = snap_with(&[(300, 100, Some(600))]);
-        snap.buckets[0].limit_id = None;
-        assert!(matches!(verdict(&snap), UsageVerdict::Exhausted { .. }));
+        let mut legacy = snap_with(&[(300, 100, Some(600))]);
+        legacy.buckets[0].limit_id = None;
+        assert!(matches!(verdict(&legacy, now()), UsageVerdict::Exhausted { .. }));
     }
 
     #[test]
@@ -1255,91 +1539,157 @@ mod tests {
         let mut snap = snap_with(&[(300, 60, Some(8000))]);
         snap.buckets[0].rate_limit_reached_type = Some("workspace_member_credits_depleted".into());
         assert_eq!(
-            verdict(&snap),
+            verdict(&snap, now()),
             UsageVerdict::Exhausted { reason: CooldownReason::Credits, resets_at: None }
         );
         snap.buckets[0].rate_limit_reached_type = Some("workspace_owner_usage_limit_reached".into());
         assert_eq!(
-            verdict(&snap),
+            verdict(&snap, now()),
+            UsageVerdict::Exhausted { reason: CooldownReason::SpendControl, resets_at: None },
+            "an admin-set workspace limit is workspace-wide and not lifted by credits"
+        );
+        snap.buckets[0].rate_limit_reached_type = Some("rate_limit_reached".into());
+        assert_eq!(
+            verdict(&snap, now()),
             UsageVerdict::Exhausted { reason: CooldownReason::RateLimit, resets_at: None }
         );
         snap.buckets[0].rate_limit_reached_type = None;
         snap.spend_control_reached = Some(true);
         assert_eq!(
-            verdict(&snap),
+            verdict(&snap, now()),
             UsageVerdict::Exhausted { reason: CooldownReason::SpendControl, resets_at: None }
         );
     }
 
-    fn rotation() -> RotationConfig {
-        RotationConfig {
-            cooldown_min_seconds: 60,
-            cooldown_max_seconds: 86_400,
-            cooldown_jitter_seconds: 0,
-            default_cooldown_seconds: 3600,
-            ..Default::default()
+    fn cfg_ws(seats: &[(&str, &str)]) -> SeatConfig {
+        SeatConfig {
+            seats: seats
+                .iter()
+                .map(|(n, a)| SeatEntry {
+                    name: n.to_string(),
+                    label: None,
+                    account_id: Some(a.to_string()),
+                    user_id: Some(format!("u-{}", n)),
+                })
+                .collect(),
+            rotation: RotationConfig {
+                cooldown_min_seconds: 60,
+                cooldown_max_seconds: 86_400,
+                cooldown_jitter_seconds: 0,
+                default_cooldown_seconds: 3600,
+                ..Default::default()
+            },
         }
     }
 
     #[test]
-    fn apply_snapshot_exhausted_sets_cooldown_and_reason() {
-        let mut entry = SeatRuntimeState::default();
-        let snap = snap_with(&[(300, 100, Some(7200))]);
-        let notices = apply_snapshot("a", &mut entry, snap, &rotation(), now());
-        assert_eq!(entry.cooldown_until, Some(now() + chrono::Duration::seconds(7200)));
-        assert_eq!(entry.cooldown_reason.as_deref(), Some("rate_limit"));
-        assert!(entry.usage.is_some());
-        assert!(notices[0].contains("exhausted"));
+    fn reconcile_personal_exhaustion_cools_only_that_seat_and_never_slides() {
+        let cfg = cfg_ws(&[("a", "ws"), ("b", "ws")]);
+        let mut state = SeatState::default();
+        let snap = snap_with(&[(10080, 100, Some(7200))]);
+        let n = reconcile_snapshots(&cfg, &mut state, vec![("a".into(), snap.clone())], now());
+        let first = state.get("a").cooldown_until.unwrap();
+        assert_eq!(first, now() + chrono::Duration::seconds(7200));
+        assert!(n.iter().any(|(_, m)| m.contains("exhausted")));
+        assert!(state.get("b").cooldown_until.is_none(), "personal limit stays personal");
+        // Same observation later: the deadline must not move (the slide bug).
+        for mins in [5, 30, 90] {
+            let later = now() + chrono::Duration::minutes(mins);
+            reconcile_snapshots(&cfg, &mut state, vec![("a".into(), snap.clone())], later);
+            assert_eq!(state.get("a").cooldown_until, Some(first), "after {} min", mins);
+        }
+        // Beyond max clamp: once a reset is past the 24h cap the cooldown is
+        // clamped once and still does not slide.
+        let far = snap_with(&[(10080, 100, Some(5 * 86400))]);
+        let mut st2 = SeatState::default();
+        reconcile_snapshots(&cfg, &mut st2, vec![("a".into(), far.clone())], now());
+        let clamped = st2.get("a").cooldown_until.unwrap();
+        assert_eq!(clamped, now() + chrono::Duration::seconds(86_400));
+        reconcile_snapshots(&cfg, &mut st2, vec![("a".into(), far)], now() + chrono::Duration::hours(3));
+        assert_eq!(st2.get("a").cooldown_until, Some(clamped));
     }
 
     #[test]
-    fn apply_snapshot_credits_uses_default_cooldown_spend_cap_uses_max() {
-        let mut entry = SeatRuntimeState::default();
-        let mut snap = snap_with(&[(300, 10, Some(7200))]);
-        snap.buckets[0].rate_limit_reached_type = Some("workspace_owner_credits_depleted".into());
-        apply_snapshot("a", &mut entry, snap, &rotation(), now());
-        assert_eq!(entry.cooldown_until, Some(now() + chrono::Duration::seconds(3600)));
-        assert_eq!(entry.cooldown_reason.as_deref(), Some("credits"));
-
-        let mut entry = SeatRuntimeState::default();
-        let mut snap = snap_with(&[(300, 10, Some(7200))]);
-        snap.spend_control_reached = Some(true);
-        apply_snapshot("a", &mut entry, snap, &rotation(), now());
-        assert_eq!(entry.cooldown_until, Some(now() + chrono::Duration::seconds(86_400)));
-        assert_eq!(entry.cooldown_reason.as_deref(), Some("spend_control"));
+    fn reconcile_credits_clear_clearable_cooldowns_across_workspace_only() {
+        let cfg = cfg_ws(&[("a", "ws"), ("b", "ws"), ("c", "other")]);
+        let mut state = SeatState::default();
+        let until = now() + chrono::Duration::hours(20);
+        for (n, r) in [("a", "rate_limit"), ("b", "credits"), ("c", "rate_limit")] {
+            state.entry_mut(n).cooldown_until = Some(until);
+            state.entry_mut(n).cooldown_reason = Some(r.into());
+        }
+        state.entry_mut("b").needs_login = true;
+        let snap = with_credits(snap_with(&[(10080, 100, Some(7200))]));
+        let n = reconcile_snapshots(&cfg, &mut state, vec![("a".into(), snap)], now());
+        assert!(state.get("a").cooldown_until.is_none());
+        assert!(state.get("b").cooldown_until.is_none(), "sibling in the same workspace cleared");
+        assert!(state.get("b").needs_login, "needs_login is never touched");
+        assert_eq!(state.get("c").cooldown_until, Some(until), "other workspace untouched");
+        assert!(n.iter().filter(|(_, m)| m.contains("workspace credits available")).count() == 2);
+        assert!(matches!(quota_state(&state.get("a"), now()), QuotaState::OnCredits { .. }));
     }
 
     #[test]
-    fn apply_snapshot_never_shortens_existing_cooldown() {
-        let mut entry = SeatRuntimeState::default();
-        let longer = now() + chrono::Duration::hours(20);
-        entry.cooldown_until = Some(longer);
-        entry.cooldown_reason = Some("credits".into());
-        let snap = snap_with(&[(300, 100, Some(600))]);
-        let notices = apply_snapshot("a", &mut entry, snap, &rotation(), now());
-        assert_eq!(entry.cooldown_until, Some(longer));
-        assert_eq!(entry.cooldown_reason.as_deref(), Some("credits"));
-        assert!(notices[0].contains("already cooling"));
+    fn reconcile_credits_do_not_clear_model_limit_or_spend_control() {
+        let cfg = cfg_ws(&[("a", "ws"), ("b", "ws")]);
+        let mut state = SeatState::default();
+        let until = now() + chrono::Duration::hours(2);
+        state.entry_mut("a").cooldown_until = Some(until);
+        state.entry_mut("a").cooldown_reason = Some("model_limit".into());
+        state.entry_mut("b").cooldown_until = Some(until);
+        state.entry_mut("b").cooldown_reason = Some("spend_control".into());
+        let snap = with_credits(snap_with(&[(10080, 10, Some(60))]));
+        let n = reconcile_snapshots(&cfg, &mut state, vec![("a".into(), snap.clone()), ("b".into(), snap)], now());
+        assert_eq!(state.get("a").cooldown_until, Some(until));
+        assert_eq!(state.get("b").cooldown_until, Some(until));
+        assert!(n.iter().any(|(_, m)| m.contains("--clear-cooldown a")));
     }
 
     #[test]
-    fn apply_snapshot_healthy_never_clears_state() {
-        let mut entry = SeatRuntimeState::default();
-        let until = now() + chrono::Duration::hours(1);
-        entry.cooldown_until = Some(until);
-        entry.needs_login = true;
-        let snap = snap_with(&[(300, 5, Some(600))]);
-        let notices = apply_snapshot("a", &mut entry, snap, &rotation(), now());
-        assert_eq!(entry.cooldown_until, Some(until), "healthy read must not clear a cooldown");
-        assert!(entry.needs_login, "healthy read must not clear needs_login");
-        assert!(notices[0].contains("--clear-cooldown a"));
+    fn reconcile_blocker_dominates_credits_in_either_order() {
+        let cfg = cfg_ws(&[("a", "ws"), ("b", "ws")]);
+        let mut blocked = snap_with(&[(10080, 50, Some(60))]);
+        blocked.buckets[0].rate_limit_reached_type = Some("workspace_member_credits_depleted".into());
+        let credits = with_credits(snap_with(&[(10080, 50, Some(60))]));
+        for order in [
+            vec![("a".to_string(), blocked.clone()), ("b".to_string(), credits.clone())],
+            vec![("b".to_string(), credits.clone()), ("a".to_string(), blocked.clone())],
+        ] {
+            let mut state = SeatState::default();
+            reconcile_snapshots(&cfg, &mut state, order, now());
+            for s in ["a", "b"] {
+                assert!(state.get(s).cooldown_until.is_some(), "{} cooled", s);
+                assert_eq!(state.get(s).cooldown_reason.as_deref(), Some("credits"));
+            }
+        }
+    }
 
-        // Expired cooldown: nothing to say.
-        let mut entry = SeatRuntimeState {
-            cooldown_until: Some(now() - chrono::Duration::hours(1)),
-            ..Default::default()
-        };
-        let notices = apply_snapshot("a", &mut entry, snap_with(&[(300, 5, None)]), &rotation(), now());
-        assert!(notices.is_empty());
+    #[test]
+    fn reconcile_snapshot_is_the_probe_after_expiry() {
+        let cfg = cfg_ws(&[("a", "ws")]);
+        let mut state = SeatState::default();
+        let snap = snap_with(&[(10080, 100, Some(5 * 86400))]);
+        reconcile_snapshots(&cfg, &mut state, vec![("a".into(), snap.clone())], now());
+        let expiry = state.get("a").cooldown_until.unwrap();
+        // Exactly at expiry the cooldown is no longer active; a fresh
+        // snapshot that still shows 100% without credits starts a new one.
+        reconcile_snapshots(&cfg, &mut state, vec![("a".into(), snap)], expiry);
+        assert!(state.get("a").cooldown_until.unwrap() > expiry);
+    }
+
+    #[test]
+    fn reconcile_reports_secondary_bucket_notices() {
+        let cfg = cfg_ws(&[("a", "ws")]);
+        let mut state = SeatState::default();
+        let mut snap = snap_with(&[(300, 38, Some(8000))]);
+        snap.buckets.push(UsageBucket {
+            limit_id: Some("premium".into()),
+            limit_name: None,
+            windows: vec![],
+            rate_limit_reached_type: Some("workspace_owner_credits_depleted".into()),
+        });
+        let n = reconcile_snapshots(&cfg, &mut state, vec![("a".into(), snap)], now());
+        assert!(state.get("a").cooldown_until.is_none());
+        assert!(n.iter().any(|(_, m)| m.contains("'premium' limit reports workspace_owner_credits_depleted")));
     }
 }

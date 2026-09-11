@@ -82,6 +82,11 @@ enum SeatAction {
         /// Seat to prefer (only for `fixed`)
         seat: Option<String>,
     },
+    /// Show or set whether runs may spend workspace credits once included quota is used up
+    Credits {
+        /// ask (default) | never | always | allow (until quota resets) | revoke; omit to show
+        action: Option<String>,
+    },
     /// Show the seat event log (limits hit, auth failures, cooldowns, orphaned blobs, logins)
     Events {
         /// Number of most recent entries to show
@@ -151,6 +156,7 @@ fn run_seat(action: SeatAction) -> anyhow::Result<i32> {
         SeatAction::Strategy { name, seat } => {
             seat_cmd::strategy(name.as_deref(), seat.as_deref()).map(|()| 0)
         }
+        SeatAction::Credits { action } => seat_cmd::credits(action.as_deref()).map(|()| 0),
         SeatAction::Events { tail } => seat_cmd::events(tail).map(|()| 0),
         SeatAction::Login { name, browser } => seat_cmd::login(&name, browser).map(|()| 0),
         SeatAction::Use { name } => seat_cmd::use_seat(&name).map(|()| 0),
@@ -172,7 +178,12 @@ fn run_exec(args: Vec<String>) -> anyhow::Result<i32> {
         anyhow::bail!("Empty prompt provided");
     }
 
-    runner::run_codex(&codex_args.to_vec(), &prompt, runner::Mode::Exec)
+    runner::run_codex(
+        &codex_args.to_vec(),
+        &prompt,
+        runner::Mode::Exec,
+        interactive_session(prompt_arg == "-"),
+    )
 }
 
 fn run_resume(
@@ -193,13 +204,39 @@ fn run_resume(
         (runner::ResumeTarget::SessionId(id), prompt.unwrap_or_default())
     };
 
-    runner::run_codex(&[], &actual_prompt, runner::Mode::Resume(resume_target))
+    runner::run_codex(
+        &[],
+        &actual_prompt,
+        runner::Mode::Resume(resume_target),
+        interactive_session(false),
+    )
 }
 
 fn run_review(args: Vec<String>) -> anyhow::Result<i32> {
     // Pass all args through to codex exec review — it handles its own
     // flag and optional trailing prompt parsing. No heuristic needed.
-    runner::run_codex(&args, "", runner::Mode::Review)
+    runner::run_codex(&args, "", runner::Mode::Review, interactive_session(false))
+}
+
+/// Whether a credits prompt may be shown: stdin and stderr are terminals,
+/// the prompt was not read from stdin, and CODEX_CLEAN_NONINTERACTIVE is not `1`.
+fn interactive_session(prompt_from_stdin: bool) -> bool {
+    use std::io::IsTerminal;
+    interactive_from(
+        prompt_from_stdin,
+        io::stdin().is_terminal(),
+        io::stderr().is_terminal(),
+        std::env::var("CODEX_CLEAN_NONINTERACTIVE").ok().as_deref(),
+    )
+}
+
+fn interactive_from(
+    prompt_from_stdin: bool,
+    stdin_tty: bool,
+    stderr_tty: bool,
+    noninteractive_env: Option<&str>,
+) -> bool {
+    !prompt_from_stdin && stdin_tty && stderr_tty && noninteractive_env != Some("1")
 }
 
 fn read_stdin() -> anyhow::Result<String> {
@@ -361,6 +398,16 @@ mod tests {
             }
             _ => panic!("Expected resume command"),
         }
+    }
+
+    #[test]
+    fn interactive_requires_terminals_and_an_argv_prompt() {
+        assert!(interactive_from(false, true, true, None));
+        assert!(!interactive_from(true, true, true, None), "prompt read from stdin");
+        assert!(!interactive_from(false, false, true, None), "stdin not a terminal");
+        assert!(!interactive_from(false, true, false, None), "stderr not a terminal");
+        assert!(!interactive_from(false, true, true, Some("1")), "explicitly non-interactive");
+        assert!(interactive_from(false, true, true, Some("0")));
     }
 
     #[test]

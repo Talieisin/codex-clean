@@ -37,6 +37,7 @@ impl TestEnv {
         std::env::set_var("CODEX_CLEAN_HOME", clean.path());
         std::env::set_var("CODEX_HOME", codex.path());
         std::env::remove_var("CODEX_CLEAN_SEAT");
+        std::env::remove_var("CODEX_CLEAN_USE_CREDITS");
         // Seed a config.toml so ensure_file_credential_store finds it.
         fs::write(
             codex.path().join("config.toml"),
@@ -81,6 +82,7 @@ impl Drop for TestEnv {
         std::env::remove_var("CODEX_CLEAN_HOME");
         std::env::remove_var("CODEX_HOME");
         std::env::remove_var("CODEX_CLEAN_SEAT");
+        std::env::remove_var("CODEX_CLEAN_USE_CREDITS");
     }
 }
 
@@ -917,7 +919,7 @@ fn snapshot(used_5h: u32, used_weekly: u32) -> UsageSnapshot {
             ],
             rate_limit_reached_type: None,
         }],
-        credits: Some(seat::UsageCredits { has_credits: false, unlimited: false }),
+        credits: Some(seat::UsageCredits { has_credits: false, unlimited: false, balance: None }),
         spend_control_reached: Some(false),
     }
 }
@@ -1224,7 +1226,7 @@ fn status_end_to_end_with_fake_codex() {
         "token rotated by the app-server lands in the slot"
     );
     assert!(
-        matches!(usage::verdict(&snap), usage::UsageVerdict::Exhausted { .. }),
+        matches!(usage::verdict(&snap, chrono::Utc::now()), usage::UsageVerdict::Exhausted { .. }),
         "weekly window at 100% is exhaustion"
     );
     // No scratch dirs left behind.
@@ -1577,7 +1579,11 @@ fn workspace_cooldown_never_shortens_a_siblings_longer_cooldown() {
     assert_eq!(exit, 75);
     let st = env.load_state();
     assert_eq!(st.get("backup1").cooldown_until, Some(long), "longer sibling cooldown kept");
-    assert_eq!(st.get("backup1").cooldown_reason.as_deref(), Some("rate_limit"));
+    assert_eq!(
+        st.get("backup1").cooldown_reason.as_deref(),
+        Some("credits"),
+        "the stronger workspace-wide reason is recorded, not hidden behind rate_limit"
+    );
     assert_eq!(st.get("main").cooldown_reason.as_deref(), Some("credits"));
 }
 
@@ -2020,4 +2026,746 @@ fn stdout_contract_seat_line_position_and_opt_out() {
     fs::remove_file(env.clean_home_path.join("seats.toml")).unwrap();
     let (_, out) = run_binary(&env, bin.path(), &[]);
     assert!(!out.contains("Seat: ") && !out.contains("Seats: "), "{}", out);
+}
+
+
+// ===========================================================================
+// Credit policy: ask / never / always, grants, exit 77, probes
+// ===========================================================================
+
+use codex_clean::runner::{CreditChoice, CreditDecider, EXIT_CREDITS_CONSENT_NEEDED};
+use codex_clean::seat::{CreditPolicy, UsageCredits};
+
+/// Weekly window at 100% (resets in 3 days) with workspace credits available.
+fn on_credits_snapshot() -> UsageSnapshot {
+    let mut s = snapshot(0, 100);
+    s.credits = Some(UsageCredits { has_credits: true, unlimited: false, balance: Some("25".into()) });
+    s
+}
+
+/// Two seats in one Team workspace, both with included quota used up and
+/// credits available — the 2026-09-11 situation.
+fn setup_both_on_credits(env: &TestEnv, policy: CreditPolicy) {
+    let mut cfg = cfg_with_seats(&[("main", "ws-1"), ("backup1", "ws-1")]);
+    cfg.seats[0].user_id = Some("user-alice".into());
+    cfg.seats[1].user_id = Some("user-bob".into());
+    cfg.rotation.credits = policy;
+    env.save_config(&cfg);
+    let dir = env.clean_home_path.join("seats");
+    for (n, u) in [("main", "user-alice"), ("backup1", "user-bob")] {
+        fs::create_dir_all(dir.join(n)).unwrap();
+        fs::write(dir.join(n).join("auth.json"), seat::fake_auth_json_for_tests("ws-1", u, n)).unwrap();
+    }
+    let mut state = SeatState::default();
+    state.entry_mut("main").usage = Some(on_credits_snapshot());
+    state.entry_mut("backup1").usage = Some(on_credits_snapshot());
+    state.entry_mut("main").last_used = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+    env.save_state(&state);
+}
+
+struct FixedDecider {
+    choice: CreditChoice,
+    calls: std::cell::Cell<u32>,
+}
+
+impl CreditDecider for FixedDecider {
+    fn decide(&self, seats: &[(String, Option<chrono::DateTime<chrono::Utc>>)]) -> CreditChoice {
+        self.calls.set(self.calls.get() + 1);
+        assert!(!seats.is_empty());
+        // The lock must be released while deciding.
+        assert!(
+            seat::CodexLock::try_acquire().unwrap().is_some(),
+            "CodexLock must not be held while waiting for a credits decision"
+        );
+        self.choice
+    }
+}
+
+fn decider(choice: CreditChoice) -> FixedDecider {
+    FixedDecider { choice, calls: std::cell::Cell::new(0) }
+}
+
+fn run_deps(
+    attempt: impl Fn(&[String], &str, &Mode, bool) -> anyhow::Result<AttemptResult>,
+    d: &dyn CreditDecider,
+) -> i32 {
+    runner::run_codex_with_deps(&[], "hi", Mode::Exec, attempt, &usage::NoUsageClient, d).unwrap()
+}
+
+#[test]
+fn background_ask_with_quota_used_and_credits_exits_77_without_running() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    setup_both_on_credits(&env, CreditPolicy::Ask);
+    let attempt = |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
+        panic!("must not spend credits without consent")
+    };
+    let exit = runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap();
+    assert_eq!(exit, EXIT_CREDITS_CONSENT_NEEDED);
+    let log = fs::read_to_string(env.clean_home_path.join("seat-events.log")).unwrap();
+    assert!(log.contains("quota_exhausted_credits_available"), "{}", log);
+    assert!(log.contains("choice=wait"), "{}", log);
+}
+
+#[test]
+fn env_consent_must_be_exactly_1() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    setup_both_on_credits(&env, CreditPolicy::Ask);
+    for v in ["0", "yes", "true", ""] {
+        std::env::set_var("CODEX_CLEAN_USE_CREDITS", v);
+        let attempt = |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
+            panic!("CODEX_CLEAN_USE_CREDITS={:?} must not count as consent", v)
+        };
+        assert_eq!(runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap(), EXIT_CREDITS_CONSENT_NEEDED);
+    }
+    std::env::set_var("CODEX_CLEAN_USE_CREDITS", "1");
+    let codex_home = env.codex_home_path.clone();
+    let attempt = mock_attempt(&codex_home, |_| ok_attempt());
+    assert_eq!(runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap(), 0);
+    let log = fs::read_to_string(env.clean_home_path.join("seat-events.log")).unwrap();
+    assert!(log.contains("on_credits seat=") && log.contains("(this run)"), "{}", log);
+    assert!(
+        seat::SCRUB_ENV_VARS_FOR_TESTS.contains(&"CODEX_CLEAN_USE_CREDITS"),
+        "consent must never reach the codex child"
+    );
+}
+
+#[test]
+fn never_mode_needs_explicit_consent_and_always_mode_spends() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    setup_both_on_credits(&env, CreditPolicy::Never);
+    let prompted = decider(CreditChoice::ThisRun);
+    let attempt = |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
+        panic!("never mode must not prompt or spend")
+    };
+    assert_eq!(run_deps(attempt, &prompted), EXIT_CREDITS_CONSENT_NEEDED);
+    assert_eq!(prompted.calls.get(), 0, "never mode does not prompt");
+    std::env::set_var("CODEX_CLEAN_USE_CREDITS", "1");
+    let codex_home = env.codex_home_path.clone();
+    assert_eq!(run_deps(mock_attempt(&codex_home, |_| ok_attempt()), &prompted), 0);
+    std::env::remove_var("CODEX_CLEAN_USE_CREDITS");
+
+    let env2 = TestEnv::new();
+    setup_both_on_credits(&env2, CreditPolicy::Always);
+    let codex_home = env2.codex_home_path.clone();
+    let attempt = mock_attempt(&codex_home, |_| ok_attempt());
+    assert_eq!(runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap(), 0);
+}
+
+#[test]
+fn prompt_answers_this_run_until_reset_always_and_wait() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // this run
+    let env = TestEnv::new();
+    setup_both_on_credits(&env, CreditPolicy::Ask);
+    let d = decider(CreditChoice::ThisRun);
+    let codex_home = env.codex_home_path.clone();
+    assert_eq!(run_deps(mock_attempt(&codex_home, |_| ok_attempt()), &d), 0);
+    assert_eq!(d.calls.get(), 1);
+    assert!(env.load_state().credit_grants.is_empty(), "this-run consent is not persisted");
+
+    // until quota resets → a workspace grant that later runs reuse without asking
+    let env = TestEnv::new();
+    setup_both_on_credits(&env, CreditPolicy::Ask);
+    let d = decider(CreditChoice::UntilReset);
+    let codex_home = env.codex_home_path.clone();
+    assert_eq!(run_deps(mock_attempt(&codex_home, |_| ok_attempt()), &d), 0);
+    let st = env.load_state();
+    assert_eq!(st.credit_grants.len(), 1);
+    let until = *st.credit_grants.values().next().unwrap();
+    assert!(until > chrono::Utc::now() + chrono::Duration::days(2), "until the quota reset");
+    let d2 = decider(CreditChoice::Wait);
+    assert_eq!(run_deps(mock_attempt(&codex_home, |_| ok_attempt()), &d2), 0);
+    assert_eq!(d2.calls.get(), 0, "an active grant needs no prompt");
+    // After the grant expires the prompt/77 comes back.
+    let mut st = env.load_state();
+    st.credit_grants.insert("acct:ws-1".into(), chrono::Utc::now() - chrono::Duration::seconds(1));
+    fs::write(env.clean_home_path.join("state.json"), serde_json::to_string(&st).unwrap()).unwrap();
+    let attempt = |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
+        panic!("expired grant must not authorise")
+    };
+    assert_eq!(runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap(), EXIT_CREDITS_CONSENT_NEEDED);
+
+    // always → persisted mode
+    let env = TestEnv::new();
+    setup_both_on_credits(&env, CreditPolicy::Ask);
+    let d = decider(CreditChoice::Always);
+    let codex_home = env.codex_home_path.clone();
+    assert_eq!(run_deps(mock_attempt(&codex_home, |_| ok_attempt()), &d), 0);
+    assert_eq!(SeatConfig::load().unwrap().unwrap().rotation.credits, CreditPolicy::Always);
+
+    // wait → 77, nothing spent
+    let env = TestEnv::new();
+    setup_both_on_credits(&env, CreditPolicy::Ask);
+    let d = decider(CreditChoice::Wait);
+    let attempt = |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
+        panic!("wait must not spend")
+    };
+    assert_eq!(run_deps(attempt, &d), EXIT_CREDITS_CONSENT_NEEDED);
+    drop(env);
+}
+
+#[test]
+fn in_quota_seat_is_used_before_credits_even_with_consent() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for strategy in [Strategy::LeastRecentlyUsed, Strategy::Balanced, Strategy::Fixed] {
+        let env = TestEnv::new();
+        setup_both_on_credits(&env, CreditPolicy::Always);
+        let mut cfg = SeatConfig::load().unwrap().unwrap();
+        cfg.rotation.strategy = strategy;
+        cfg.rotation.fixed_seat = Some("main".into());
+        env.save_config(&cfg);
+        let mut st = env.load_state();
+        st.entry_mut("backup1").usage = Some(snapshot(10, 40)); // still in quota
+        st.entry_mut("backup1").last_used = Some(chrono::Utc::now());
+        env.save_state(&st);
+        let codex_home = env.codex_home_path.clone();
+        let seen = std::rc::Rc::new(RefCell::new(String::new()));
+        let seen2 = seen.clone();
+        let attempt = move |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
+            *seen2.borrow_mut() = fs::read_to_string(codex_home.join("auth.json"))?;
+            Ok(ok_attempt())
+        };
+        assert_eq!(runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap(), 0);
+        assert!(seen.borrow().contains("fake-access-backup1"), "{:?}: in-quota seat first", strategy);
+    }
+}
+
+#[test]
+fn decision_after_a_failed_attempt_keeps_retry_budget_and_output() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    setup_both_on_credits(&env, CreditPolicy::Ask);
+    // backup1 in quota (tried first), main on credits.
+    let mut st = env.load_state();
+    st.entry_mut("backup1").usage = Some(snapshot(10, 40));
+    env.save_state(&st);
+    let codex_home = env.codex_home_path.clone();
+    let calls = std::rc::Rc::new(RefCell::new(Vec::<String>::new()));
+    let calls2 = calls.clone();
+    let attempt = move |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
+        let auth = fs::read_to_string(codex_home.join("auth.json"))?;
+        let who = if auth.contains("fake-access-backup1") { "backup1" } else { "main" };
+        calls2.borrow_mut().push(who.to_string());
+        Ok(if who == "backup1" { rate_limit_attempt() } else { ok_attempt() })
+    };
+    // max_retries = 1 → two attempts total; the decision must not use one up.
+    let d = decider(CreditChoice::ThisRun);
+    assert_eq!(run_deps(attempt, &d), 0);
+    assert_eq!(*calls.borrow(), vec!["backup1".to_string(), "main".to_string()]);
+    assert_eq!(d.calls.get(), 1);
+
+    // Same with "wait": 77 after the failed attempt, nothing else runs.
+    let env = TestEnv::new();
+    setup_both_on_credits(&env, CreditPolicy::Ask);
+    let mut st = env.load_state();
+    st.entry_mut("backup1").usage = Some(snapshot(10, 40));
+    env.save_state(&st);
+    let codex_home = env.codex_home_path.clone();
+    let attempt = mock_attempt(&codex_home, |aid| {
+        assert_eq!(aid, "ws-1");
+        rate_limit_attempt()
+    });
+    let d = decider(CreditChoice::Wait);
+    assert_eq!(run_deps(attempt, &d), EXIT_CREDITS_CONSENT_NEEDED);
+    assert!(env.load_state().get("backup1").cooldown_until.is_some());
+}
+
+#[test]
+fn decision_reentry_reloads_config_changed_while_unlocked() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    setup_both_on_credits(&env, CreditPolicy::Ask);
+    struct EditingDecider;
+    impl CreditDecider for EditingDecider {
+        fn decide(&self, _: &[(String, Option<chrono::DateTime<chrono::Utc>>)]) -> CreditChoice {
+            // Another process switches the policy to always while we wait.
+            let _lock = seat::CodexLock::try_acquire().unwrap().expect("lock is free");
+            let mut cfg = SeatConfig::load().unwrap().unwrap();
+            cfg.rotation.credits = CreditPolicy::Always;
+            cfg.save().unwrap();
+            CreditChoice::Wait
+        }
+    }
+    let attempt = |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
+        panic!("wait chosen; must not run")
+    };
+    // The user chose wait, so nothing is spent — but consent is no longer the
+    // blocker (always was set meanwhile), so the exit is 75, not 77.
+    assert_eq!(run_deps(attempt, &EditingDecider), 75);
+    // The next invocation sees the edited config and spends.
+    let codex_home = env.codex_home_path.clone();
+    assert_eq!(runner::run_codex_with(&[], "hi", Mode::Exec, mock_attempt(&codex_home, |_| ok_attempt())).unwrap(), 0);
+}
+
+#[test]
+fn pinned_on_credits_seat_needs_consent_and_never_rotates() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    setup_both_on_credits(&env, CreditPolicy::Ask);
+    let mut st = env.load_state();
+    st.entry_mut("backup1").usage = Some(snapshot(10, 40)); // in quota, but not pinned
+    env.save_state(&st);
+    std::env::set_var("CODEX_CLEAN_SEAT", "main");
+    let attempt = |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
+        panic!("pinned on-credits seat must not run without consent, nor rotate")
+    };
+    assert_eq!(runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap(), EXIT_CREDITS_CONSENT_NEEDED);
+    std::env::set_var("CODEX_CLEAN_USE_CREDITS", "1");
+    let codex_home = env.codex_home_path.clone();
+    let seen = std::rc::Rc::new(RefCell::new(String::new()));
+    let seen2 = seen.clone();
+    let attempt = move |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
+        *seen2.borrow_mut() = fs::read_to_string(codex_home.join("auth.json"))?;
+        Ok(ok_attempt())
+    };
+    assert_eq!(runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap(), 0);
+    assert!(seen.borrow().contains("fake-access-main"), "the pinned seat ran");
+}
+
+/// Client that returns a fixed snapshot per call and counts calls.
+struct CountingClient {
+    snap: UsageSnapshot,
+    calls: std::sync::atomic::AtomicUsize,
+    fail: bool,
+}
+
+impl UsageClient for CountingClient {
+    fn fetch(&self, _: &SE) -> Result<UsageSnapshot, UsageFetchError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail {
+            Err(UsageFetchError::Timeout(std::time::Duration::from_secs(1)))
+        } else {
+            let mut s = self.snap.clone();
+            s.fetched_at = chrono::Utc::now();
+            Ok(s)
+        }
+    }
+}
+
+fn counting(snap: UsageSnapshot, fail: bool) -> CountingClient {
+    CountingClient { snap, calls: std::sync::atomic::AtomicUsize::new(0), fail }
+}
+
+#[test]
+fn credits_purchase_unblocks_seats_cooling_from_before_without_a_status_call() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for (strategy, policy, expected) in [
+        (Strategy::LeastRecentlyUsed, CreditPolicy::Always, 0),
+        (Strategy::Balanced, CreditPolicy::Always, 0),
+        (Strategy::LeastRecentlyUsed, CreditPolicy::Ask, EXIT_CREDITS_CONSENT_NEEDED),
+    ] {
+        let env = TestEnv::new();
+        setup_both_on_credits(&env, policy);
+        let mut cfg = SeatConfig::load().unwrap().unwrap();
+        cfg.rotation.strategy = strategy;
+        env.save_config(&cfg);
+        // The pre-fix state: both cooling for rate_limit with stale, no-credits snapshots.
+        let mut st = env.load_state();
+        for n in ["main", "backup1"] {
+            let e = st.entry_mut(n);
+            e.cooldown_until = Some(chrono::Utc::now() + chrono::Duration::hours(20));
+            e.cooldown_reason = Some("rate_limit".into());
+            let mut old = snapshot(0, 100);
+            old.fetched_at = chrono::Utc::now() - chrono::Duration::hours(2);
+            e.usage = Some(old);
+        }
+        env.save_state(&st);
+        let client = counting(on_credits_snapshot(), false);
+        let codex_home = env.codex_home_path.clone();
+        let exit = runner::run_codex_with_client(&[], "hi", Mode::Exec, mock_attempt(&codex_home, |_| ok_attempt()), &client).unwrap();
+        assert_eq!(exit, expected, "{:?}/{:?}", strategy, policy);
+        assert!(client.calls.load(std::sync::atomic::Ordering::SeqCst) >= 1, "cooling seats were probed");
+        let st = env.load_state();
+        assert!(st.get("main").cooldown_until.is_none(), "rate_limit cooldown cleared by credits");
+    }
+}
+
+#[test]
+fn blocked_probe_is_rate_limited_and_failures_do_not_block() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    env.write_seat("a", "acc-a");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a")]));
+    let mut st = SeatState::default();
+    st.entry_mut("a").cooldown_until = Some(chrono::Utc::now() + chrono::Duration::hours(5));
+    st.entry_mut("a").cooldown_reason = Some("rate_limit".into());
+    env.save_state(&st);
+    // Probe returns "still exhausted, no credits".
+    let client = counting(snapshot(0, 100), false);
+    let attempt = |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
+        panic!("still exhausted")
+    };
+    assert_eq!(runner::run_codex_with_client(&[], "hi", Mode::Exec, attempt, &client).unwrap(), 75);
+    assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    // Within blocked_probe_seconds: no second fetch.
+    assert_eq!(runner::run_codex_with_client(&[], "hi", Mode::Exec, attempt, &client).unwrap(), 75);
+    assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 1, "rate-limited");
+
+    // Pre-run check: in-quota seat at 85% with a stale reading is re-checked;
+    // a failing check still lets the run proceed.
+    let env = TestEnv::new();
+    env.write_seat("a", "acc-a");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a")]));
+    let mut st = SeatState::default();
+    let mut old = snapshot(85, 60);
+    old.fetched_at = chrono::Utc::now() - chrono::Duration::hours(1);
+    st.entry_mut("a").usage = Some(old);
+    env.save_state(&st);
+    let failing = counting(snapshot(0, 0), true);
+    let codex_home = env.codex_home_path.clone();
+    let exit = runner::run_codex_with_client(&[], "hi", Mode::Exec, mock_attempt(&codex_home, |_| ok_attempt()), &failing).unwrap();
+    assert_eq!(exit, 0, "a failed pre-run check never blocks work");
+    assert_eq!(failing.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(env.load_state().get("a").usage_checked_at.is_some());
+}
+
+#[test]
+fn prerun_check_catches_a_seat_that_crossed_into_credits() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    setup_both_on_credits(&env, CreditPolicy::Ask);
+    // Last readings say both are at 90% (stale); really they are at 100% on credits.
+    let mut st = env.load_state();
+    for n in ["main", "backup1"] {
+        let mut old = snapshot(0, 90);
+        old.fetched_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        st.entry_mut(n).usage = Some(old);
+    }
+    env.save_state(&st);
+    let client = counting(on_credits_snapshot(), false);
+    let attempt = |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
+        panic!("pre-run check must discover the seats are on credits")
+    };
+    let exit = runner::run_codex_with_client(&[], "hi", Mode::Exec, attempt, &client).unwrap();
+    assert_eq!(exit, EXIT_CREDITS_CONSENT_NEEDED);
+}
+
+#[test]
+fn credits_running_out_after_a_clear_recools_workspace() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    setup_both_on_credits(&env, CreditPolicy::Always);
+    let mut st = env.load_state();
+    st.entry_mut("backup1").needs_login = true;
+    env.save_state(&st);
+    let attempt = |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
+        let mut a = rate_limit_attempt();
+        a.output.errors = vec!["Your workspace is out of credits. Add credits to continue.".into()];
+        Ok(a)
+    };
+    let exit = runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap();
+    assert_eq!(exit, 75);
+    let st = env.load_state();
+    assert_eq!(st.get("main").cooldown_reason.as_deref(), Some("credits"));
+    assert_eq!(st.get("backup1").cooldown_reason.as_deref(), Some("credits"));
+    assert!(st.get("backup1").needs_login, "needs_login preserved");
+}
+
+#[test]
+fn run_failing_with_reused_refresh_token_marks_needs_login() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    env.write_seat("a", "acc-a");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a")]));
+    env.save_state(&SeatState::default());
+    let attempt = |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
+        let mut a = auth_error_attempt();
+        a.output.errors = vec![
+            "Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.".into(),
+        ];
+        Ok(a)
+    };
+    assert_eq!(runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap(), 1);
+    assert!(env.load_state().get("a").needs_login);
+}
+
+#[test]
+fn status_marks_needs_login_on_auth_failure_and_does_not_slide() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    env.write_seat("a", "acc-a");
+    env.write_seat("b", "acc-b");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a"), ("b", "acc-b")]));
+    env.save_state(&SeatState::default());
+    let client = FakeClient {
+        by_seat: Box::new(|s| {
+            if s.name == "a" {
+                Err(UsageFetchError::AuthRequired)
+            } else {
+                let mut snap = snapshot(0, 100);
+                snap.buckets[0].windows[1].resets_at = Some(chrono::Utc::now() + chrono::Duration::days(5));
+                Ok(snap)
+            }
+        }),
+        rewrite_slot_tag: None,
+    };
+    codex_clean::seat_cmd::status_with(&client, None, false, None).unwrap();
+    let st = env.load_state();
+    assert!(st.get("a").needs_login);
+    let first = st.get("b").cooldown_until.expect("b cooling");
+    for _ in 0..3 {
+        codex_clean::seat_cmd::status_with(&client, None, false, None).unwrap();
+    }
+    assert_eq!(env.load_state().get("b").cooldown_until, Some(first), "status must not slide the cooldown");
+}
+
+#[cfg(unix)]
+#[test]
+fn stdout_consent_warning_and_seat_list_credits_marker() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    setup_both_on_credits(&env, CreditPolicy::Ask);
+    let bin = tempfile::tempdir().unwrap();
+    install_fake_codex_exec(bin.path(), "{\"type\":\"thread.started\",\"thread_id\":\"t\"}", 0);
+    let (code, out) = run_binary(&env, bin.path(), &[]);
+    assert_eq!(code, 77, "{}", out);
+    let last = out.lines().last().unwrap_or_default().to_string();
+    assert!(last.starts_with("Seats: included quota used up on main (resets "), "{}", last);
+    assert!(last.contains("needs the user's consent"), "{}", last);
+    assert!(last.contains("CODEX_CLEAN_USE_CREDITS=1"), "{}", last);
+    assert!(!out.contains("Seat: "), "nothing ran, so no Seat line: {}", out);
+
+    // With consent the run happens and the Seat line says so.
+    let (code, out) = run_binary(&env, bin.path(), &[("CODEX_CLEAN_USE_CREDITS", "1")]);
+    assert_eq!(code, 0, "{}", out);
+    assert!(out.contains("on credits (this run)"), "{}", out);
+
+    // seat list shows the marker without truncation at 100%/100%.
+    let mut st = env.load_state();
+    st.entry_mut("main").usage = Some({
+        let mut s = on_credits_snapshot();
+        s.buckets[0].windows[0].used_percent = 100;
+        s
+    });
+    env.save_state(&st);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_codex-clean"))
+        .args(["seat", "list"])
+        .env("CODEX_CLEAN_HOME", &env.clean_home_path)
+        .env("CODEX_HOME", &env.codex_home_path)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("5h 100% wk 100% +credits"), "{}", text);
+    assert!(text.contains("quota used; credits not in use (ask)"), "{}", text);
+}
+
+
+// ---------------------------------------------------------------------------
+// Regressions from the Codex review of the credit policy
+// ---------------------------------------------------------------------------
+
+#[test]
+fn partial_status_with_credits_never_turns_a_stale_exhausted_sibling_into_in_quota() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    setup_both_on_credits(&env, CreditPolicy::Ask);
+    // backup1: cached "100%, no credits" and cooling (checked before the purchase).
+    let mut st = env.load_state();
+    let e = st.entry_mut("backup1");
+    e.usage = Some(snapshot(0, 100));
+    e.cooldown_until = Some(chrono::Utc::now() + chrono::Duration::hours(10));
+    e.cooldown_reason = Some("rate_limit".into());
+    e.usage_checked_at = Some(chrono::Utc::now());
+    env.save_state(&st);
+    // `seat status main` sees the workspace credits.
+    let client = FakeClient { by_seat: Box::new(|_| Ok(on_credits_snapshot())), rewrite_slot_tag: None };
+    codex_clean::seat_cmd::status_with(&client, Some("main"), false, None).unwrap();
+    let st = env.load_state();
+    assert!(st.get("backup1").cooldown_until.is_none(), "credits lift backup1's rate_limit cooldown");
+    assert_eq!(
+        usage::quota_state(&st.get("backup1"), chrono::Utc::now()).as_str(),
+        "on_credits",
+        "backup1's cached reading now carries the workspace credits, so it is gated by consent"
+    );
+    // A background run must not spend on backup1 without consent.
+    let attempt = |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
+        panic!("backup1 must not run on credits without consent")
+    };
+    assert_eq!(runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap(), EXIT_CREDITS_CONSENT_NEEDED);
+}
+
+#[test]
+fn fresh_exhausted_reading_blocks_a_run_after_the_cooldown_clock_expires() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    env.write_seat("a", "acc-a");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a")]));
+    let mut st = SeatState::default();
+    let e = st.entry_mut("a");
+    e.usage = Some(snapshot(0, 100)); // fresh, weekly 100%, reset in 3 days, no credits
+    e.cooldown_until = Some(chrono::Utc::now() - chrono::Duration::seconds(1)); // just expired
+    e.cooldown_reason = Some("rate_limit".into());
+    e.usage_checked_at = Some(chrono::Utc::now());
+    env.save_state(&st);
+    let attempt = |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
+        panic!("the latest reading says the seat is exhausted")
+    };
+    assert_eq!(runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap(), 75);
+    assert!(env.load_state().get("a").cooldown_until.unwrap() > chrono::Utc::now());
+}
+
+#[test]
+fn until_reset_consent_is_not_attached_to_a_workspace_that_changed_meanwhile() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    setup_both_on_credits(&env, CreditPolicy::Ask);
+    struct ReAddingDecider;
+    impl CreditDecider for ReAddingDecider {
+        fn decide(&self, _: &[(String, Option<chrono::DateTime<chrono::Utc>>)]) -> CreditChoice {
+            // While the question is open both seats are re-registered under a
+            // different workspace.
+            let _lock = seat::CodexLock::try_acquire().unwrap().expect("lock is free");
+            let mut cfg = SeatConfig::load().unwrap().unwrap();
+            for s in &mut cfg.seats {
+                s.account_id = Some("ws-OTHER".into());
+            }
+            cfg.save().unwrap();
+            CreditChoice::UntilReset
+        }
+    }
+    let attempt = |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
+        panic!("consent was given for a different workspace")
+    };
+    assert_eq!(run_deps(attempt, &ReAddingDecider), EXIT_CREDITS_CONSENT_NEEDED);
+    assert!(env.load_state().credit_grants.is_empty(), "no grant for the new workspace");
+}
+
+#[test]
+fn concurrent_orphan_parking_keeps_every_distinct_blob_once() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    env.write_seat("a", "acc-a");
+    let expected = seat::SeatIdentity { account_id: Some("acc-a".into()), user_id: Some("user-acc-a".into()) };
+    let srcs: Vec<PathBuf> = (0..8)
+        .map(|i| {
+            let p = env.clean_home_path.join(format!("src-{}.json", i));
+            // Four distinct foreign blobs, each written twice.
+            let who = format!("user-foreign-{}", i % 4);
+            fs::write(&p, seat::fake_auth_json_for_tests("acc-x", &who, &who)).unwrap();
+            p
+        })
+        .collect();
+    std::thread::scope(|sc| {
+        for p in &srcs {
+            let expected = expected.clone();
+            sc.spawn(move || {
+                let out = seat::refresh_back_from_guarded(p, "a", &expected).unwrap();
+                assert!(matches!(out, seat::RefreshBackOutcome::SkippedMismatch { orphaned: Some(_), .. }), "{:?}", out);
+            });
+        }
+    });
+    let parked: Vec<_> = fs::read_dir(env.clean_home_path.join("orphaned")).unwrap().flatten().collect();
+    assert_eq!(parked.len(), 4, "one file per distinct blob, none lost or duplicated");
+    for f in parked {
+        assert!(f.file_name().to_string_lossy().starts_with("auth-"));
+        let body = fs::read_to_string(f.path()).unwrap();
+        assert!(body.contains("fake-access-user-foreign-"), "intact content");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn consent_env_never_reaches_the_codex_child() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use std::os::unix::fs::PermissionsExt;
+    let bin = tempfile::tempdir().unwrap();
+    let script = "#!/bin/bash\n\
+        echo '{\"type\":\"thread.started\",\"thread_id\":\"t\"}'\n\
+        echo \"{\\\"type\\\":\\\"item.completed\\\",\\\"item\\\":{\\\"type\\\":\\\"agent_message\\\",\\\"text\\\":\\\"USE=${CODEX_CLEAN_USE_CREDITS:-unset} NI=${CODEX_CLEAN_NONINTERACTIVE:-unset}\\\"}}\"\n";
+    let path = bin.path().join("codex");
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // No seats configured: the passthrough path.
+    let env = TestEnv::new();
+    let extra = [("CODEX_CLEAN_USE_CREDITS", "1"), ("CODEX_CLEAN_NONINTERACTIVE", "1")];
+    let (code, out) = run_binary(&env, bin.path(), &extra);
+    assert_eq!(code, 0, "{}", out);
+    assert!(out.contains("USE=unset NI=unset"), "passthrough leaked consent: {}", out);
+
+    // Multi-seat path.
+    env.write_seat("a", "acc-a");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a")]));
+    let (code, out) = run_binary(&env, bin.path(), &extra);
+    assert_eq!(code, 0, "{}", out);
+    assert!(out.contains("USE=unset NI=unset"), "multi-seat leaked consent: {}", out);
+}
+
+#[cfg(unix)]
+#[test]
+fn status_json_reports_credits_mode_grants_and_quota_state() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    env.write_seat("a", "acc-a");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a")]));
+    let mut st = SeatState::default();
+    st.credit_grants.insert("acct:acc-a".into(), chrono::Utc::now() + chrono::Duration::hours(5));
+    st.credit_grants.insert("acct:acc-expired".into(), chrono::Utc::now() - chrono::Duration::hours(1));
+    env.save_state(&st);
+    let bin = tempfile::tempdir().unwrap();
+    let canned = r#"{"id":2,"result":{"rateLimits":{"limitId":"codex","planType":"team","primary":{"usedPercent":3,"windowDurationMins":300,"resetsAt":4102444800},"secondary":{"usedPercent":100,"windowDurationMins":10080,"resetsAt":4102448400},"credits":{"hasCredits":true,"unlimited":false,"balance":"12.50"},"rateLimitReachedType":null,"spendControlReached":false}}}"#;
+    install_fake_codex(bin.path(), "", &format!("echo '{}'", canned));
+    let mut path = bin.path().as_os_str().to_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_codex-clean"))
+        .args(["seat", "status", "--json"])
+        .env("PATH", path)
+        .env("CODEX_CLEAN_HOME", &env.clean_home_path)
+        .env("CODEX_HOME", &env.codex_home_path)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {}", e, text));
+    assert_eq!(v["credits_mode"], "ask");
+    let grants = v["credit_grants"].as_array().unwrap();
+    assert_eq!(grants.len(), 1, "expired grants omitted: {}", text);
+    assert_eq!(grants[0]["seats"], serde_json::json!(["a"]));
+    assert!(grants[0]["workspace"].as_str().unwrap().starts_with("ws-"));
+    assert!(!text.contains("acc-a"), "account ids stay out of --json: {}", text);
+    let seat0 = &v["seats"][0];
+    assert_eq!(seat0["quota_state"]["state"], "on_credits");
+    assert!(seat0["quota_state"]["resets_at"].is_string());
+    assert_eq!(seat0["usage"]["credits"]["balance"], "12.50");
+}
+
+
+#[test]
+fn this_run_consent_does_not_cover_a_workspace_changed_while_unlocked() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    setup_both_on_credits(&env, CreditPolicy::Ask);
+    /// Says "this run" to the first question (about ws-1) while re-registering
+    /// the seats under ws-OTHER, then "wait" to the follow-up about ws-OTHER.
+    struct ReAddThisRun {
+        calls: std::cell::Cell<u32>,
+    }
+    impl CreditDecider for ReAddThisRun {
+        fn decide(&self, seats: &[(String, Option<chrono::DateTime<chrono::Utc>>)]) -> CreditChoice {
+            self.calls.set(self.calls.get() + 1);
+            assert!(!seats.is_empty());
+            if self.calls.get() == 1 {
+                let _lock = seat::CodexLock::try_acquire().unwrap().expect("lock is free");
+                let mut cfg = SeatConfig::load().unwrap().unwrap();
+                for s in &mut cfg.seats {
+                    s.account_id = Some("ws-OTHER".into());
+                }
+                cfg.save().unwrap();
+                CreditChoice::ThisRun
+            } else {
+                CreditChoice::Wait
+            }
+        }
+    }
+    let d = ReAddThisRun { calls: std::cell::Cell::new(0) };
+    let attempt = |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
+        panic!("this-run consent was for ws-1, not ws-OTHER")
+    };
+    // Consent for ws-1 does not cover ws-OTHER: the re-entry asks again, the
+    // answer is wait, and the run stops at 77 without spending.
+    assert_eq!(run_deps(attempt, &d), EXIT_CREDITS_CONSENT_NEEDED);
+    assert_eq!(d.calls.get(), 2, "the new workspace was asked about separately");
 }

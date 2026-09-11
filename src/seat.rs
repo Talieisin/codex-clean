@@ -179,6 +179,63 @@ pub fn log_excerpt(s: &str, max: usize) -> String {
     }
 }
 
+/// The workspace key for `seat`: `acct:<account_id>`, or `seat:<name>` when
+/// no account id is recorded (a seat with no account id is its own
+/// workspace). The prefixes keep the two forms in separate key spaces, so a
+/// seat named `main` and a seat whose account id is `main` never share
+/// grants or cooldowns.
+pub fn workspace_key(config: &SeatConfig, seat: &str) -> String {
+    match config.find(seat).and_then(|s| s.account_id.as_deref()) {
+        Some(acct) => format!("acct:{}", acct),
+        None => format!("seat:{}", seat),
+    }
+}
+
+/// Record "use credits until quota resets" grants for the workspaces of
+/// `seats` (seat name, quota reset time). Each workspace is granted until the
+/// earliest known future reset among its listed seats. Workspaces with no
+/// known reset are skipped; if none can be granted this fails, because an
+/// open-ended grant is exactly what the credits policy exists to prevent.
+/// Returns `(seat names in the workspace, until)` for each grant made.
+pub fn grant_credits_until_reset(
+    config: &SeatConfig,
+    state: &mut SeatState,
+    seats: &[(String, Option<DateTime<Utc>>)],
+    now: DateTime<Utc>,
+) -> Result<Vec<(Vec<String>, DateTime<Utc>)>> {
+    let mut earliest: BTreeMap<String, DateTime<Utc>> = BTreeMap::new();
+    for (name, resets_at) in seats {
+        let Some(r) = resets_at.filter(|r| *r > now) else { continue };
+        let ws = workspace_key(config, name);
+        earliest
+            .entry(ws)
+            .and_modify(|cur| {
+                if r < *cur {
+                    *cur = r
+                }
+            })
+            .or_insert(r);
+    }
+    if earliest.is_empty() {
+        anyhow::bail!(
+            "no quota reset time is known for these seats, so there is nothing to grant until; \
+             use CODEX_CLEAN_USE_CREDITS=1 for a single run or `codex-clean seat credits always`"
+        );
+    }
+    let mut granted = Vec::new();
+    for (ws, until) in earliest {
+        state.credit_grants.insert(ws.clone(), until);
+        let members: Vec<String> = config
+            .seats
+            .iter()
+            .filter(|s| workspace_key(config, &s.name) == ws)
+            .map(|s| s.name.clone())
+            .collect();
+        granted.push((members, until));
+    }
+    Ok(granted)
+}
+
 /// Seats that share `seat`'s workspace (`account_id`), including itself. A
 /// seat with no recorded account_id is its own workspace.
 pub fn workspace_siblings(config: &SeatConfig, seat: &str) -> Vec<String> {
@@ -197,27 +254,58 @@ pub fn workspace_siblings(config: &SeatConfig, seat: &str) -> Vec<String> {
     out
 }
 
-/// Put `names` into cooldown until `until` for `reason`, **extend-only**: a
-/// seat already cooling for longer keeps its later deadline and its own
-/// reason. Returns the names whose cooldown actually changed.
+/// Apply a cooldown to one seat. The single rule every cooldown goes through:
+///
+/// - no active cooldown → set `until` and `reason`;
+/// - active cooldown for the **same** reason → leave it alone. Re-observing
+///   the same limit must not push the deadline out, otherwise a status check
+///   every few minutes slides a clamped cooldown forward forever;
+/// - active cooldown for a **different** reason → keep the later deadline and
+///   the stronger (less clearable) reason, so a new hard blocker is never
+///   hidden behind an older, weaker one.
+///
+/// Returns true when the stored cooldown changed.
+pub fn merge_cooldown(
+    entry: &mut SeatRuntimeState,
+    until: DateTime<Utc>,
+    reason: crate::ratelimit::CooldownReason,
+    now: DateTime<Utc>,
+) -> bool {
+    use crate::ratelimit::CooldownReason;
+    let Some(existing_until) = entry.cooldown_until.filter(|u| *u > now) else {
+        entry.cooldown_until = Some(until);
+        entry.cooldown_reason = Some(reason.as_str().to_string());
+        return true;
+    };
+    let existing_reason = CooldownReason::parse(entry.cooldown_reason.as_deref().unwrap_or(""));
+    if existing_reason == reason {
+        return false;
+    }
+    let new_until = existing_until.max(until);
+    let new_reason = if reason.strength() > existing_reason.strength() {
+        reason
+    } else {
+        existing_reason
+    };
+    let changed = new_until != existing_until || new_reason != existing_reason;
+    entry.cooldown_until = Some(new_until);
+    entry.cooldown_reason = Some(new_reason.as_str().to_string());
+    changed
+}
+
+/// `merge_cooldown` for several seats. Returns the names that changed.
 pub fn cool_seats(
     state: &mut SeatState,
     names: &[String],
     until: DateTime<Utc>,
-    reason: &str,
+    reason: crate::ratelimit::CooldownReason,
     now: DateTime<Utc>,
 ) -> Vec<String> {
-    let mut changed = Vec::new();
-    for name in names {
-        let entry = state.entry_mut(name);
-        let existing = entry.cooldown_until.filter(|u| *u > now);
-        if existing.is_none_or(|u| until > u) {
-            entry.cooldown_until = Some(until);
-            entry.cooldown_reason = Some(reason.to_string());
-            changed.push(name.clone());
-        }
-    }
-    changed
+    names
+        .iter()
+        .filter(|n| merge_cooldown(state.entry_mut(n), until, reason, now))
+        .cloned()
+        .collect()
 }
 
 /// Record a seat event: `<utc-ts> <kind> seat=<name> <detail>` on one line.
@@ -243,9 +331,20 @@ pub fn log_event(kind: &str, seat: &str, detail: &str) {
 /// the end of every run. `None` when every seat is usable. Background
 /// callers (agents, CI) read stdout, so this is where a "you need to act"
 /// signal has to live — a one-off stderr warning is never seen.
-pub fn seat_notice(config: &SeatConfig, state: &SeatState, now: DateTime<Utc>) -> Option<String> {
+///
+/// `credits_for(seat)` is this invocation's consent to spend credits on that
+/// seat: seats whose included quota is used up count as usable only with it,
+/// and otherwise produce the "credits available but not spent" warning.
+pub fn seat_notice(
+    config: &SeatConfig,
+    state: &SeatState,
+    now: DateTime<Utc>,
+    credits_for: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    use crate::usage::{quota_state, QuotaState};
     let mut parts: Vec<String> = Vec::new();
     let mut usable = 0usize;
+    let mut unspent: Vec<(String, Option<DateTime<Utc>>)> = Vec::new();
     for s in &config.seats {
         let st = state.get(&s.name);
         if st.needs_login {
@@ -266,9 +365,24 @@ pub fn seat_notice(config: &SeatConfig, state: &SeatState, now: DateTime<Utc>) -
                 until.with_timezone(&chrono::Local).format("%a %H:%M"),
                 reason
             ));
+        } else if let QuotaState::OnCredits { resets_at } = quota_state(&st, now) {
+            if credits_for(&s.name) {
+                usable += 1;
+            } else {
+                unspent.push((s.name.clone(), resets_at));
+            }
         } else {
             usable += 1;
         }
+    }
+    if !unspent.is_empty() {
+        parts.push(format!(
+            "included quota used up on {}; workspace credits available but not spent (credits: {}) \
+             — needs the user's consent: re-run with CODEX_CLEAN_USE_CREDITS=1 (this run) or run \
+             `codex-clean seat credits allow` (until quota resets)",
+            describe_quota_resets(&unspent),
+            config.rotation.credits
+        ));
     }
     if parts.is_empty() {
         return None;
@@ -288,6 +402,13 @@ fn home_dir() -> Result<PathBuf> {
 /// Env vars we strip from any codex child process so the swapped auth.json
 /// is the only credential in scope. `CODEX_HOME` is *not* on this list: we
 /// honour the user's setting and use it as the swap target.
+/// Consent/interaction variables that must never reach any codex child
+/// (removed even where the full scrub list is not applied).
+pub const CONSENT_ENV_VARS: &[&str] = &["CODEX_CLEAN_USE_CREDITS", "CODEX_CLEAN_NONINTERACTIVE"];
+
+/// Test visibility for [`SCRUB_ENV_VARS`].
+pub const SCRUB_ENV_VARS_FOR_TESTS: &[&str] = SCRUB_ENV_VARS;
+
 pub(crate) const SCRUB_ENV_VARS: &[&str] = &[
     "CODEX_SQLITE_HOME",
     "OPENAI_API_KEY",
@@ -295,6 +416,8 @@ pub(crate) const SCRUB_ENV_VARS: &[&str] = &[
     "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
     "CODEX_SANDBOX",
     "CODEX_CLEAN_SEAT",
+    "CODEX_CLEAN_USE_CREDITS",
+    "CODEX_CLEAN_NONINTERACTIVE",
 ];
 
 // ---------------------------------------------------------------------------
@@ -373,6 +496,14 @@ pub struct RotationConfig {
     /// older than this is refreshed (via `codex app-server`) before picking.
     #[serde(default = "default_balance_refresh")]
     pub balance_refresh_seconds: u64,
+    /// Whether runs may spend workspace credits once a seat's included quota
+    /// is used up: `ask` (default), `never`, `always`.
+    #[serde(default)]
+    pub credits: CreditPolicy,
+    /// When every seat is blocked, or a seat about to run is near its limit,
+    /// a usage snapshot older than this is refreshed first.
+    #[serde(default = "default_blocked_probe")]
+    pub blocked_probe_seconds: u64,
     #[serde(default = "default_default_cooldown")]
     pub default_cooldown_seconds: u64,
     #[serde(default = "default_max_retries")]
@@ -434,6 +565,56 @@ impl std::fmt::Display for Strategy {
     }
 }
 
+/// Whether runs may spend workspace credits after included quota is used up.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CreditPolicy {
+    /// Prompt in a terminal; in the background, do not spend and warn. The
+    /// default, so an existing seats.toml never starts spending credits.
+    #[default]
+    Ask,
+    /// Never prompt; spend only with explicit consent (env var or grant).
+    Never,
+    /// Spend automatically once every seat's included quota is used up.
+    Always,
+}
+
+impl CreditPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Never => "never",
+            Self::Always => "always",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "ask" => Self::Ask,
+            "never" => Self::Never,
+            "always" => Self::Always,
+            _ => return None,
+        })
+    }
+}
+
+impl std::fmt::Display for CreditPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Per-invocation consent to spend credits: exactly `1`. Scrubbed from the
+/// codex child so it can never authorise a nested codex-clean.
+pub const USE_CREDITS_ENV: &str = "CODEX_CLEAN_USE_CREDITS";
+
+/// True when `CODEX_CLEAN_USE_CREDITS` is exactly `1`. Monetary consent is
+/// never inferred from other values (`0`, `yes`, empty).
+pub fn env_use_credits() -> bool {
+    env::var(USE_CREDITS_ENV).is_ok_and(|v| v == "1")
+}
+
+fn default_blocked_probe() -> u64 { 300 }
 fn default_balance_refresh() -> u64 { 1800 }
 fn default_default_cooldown() -> u64 { 3600 }
 fn default_max_retries() -> u32 { 1 }
@@ -447,6 +628,8 @@ impl Default for RotationConfig {
             strategy: Strategy::LeastRecentlyUsed,
             fixed_seat: None,
             balance_refresh_seconds: default_balance_refresh(),
+            credits: CreditPolicy::Ask,
+            blocked_probe_seconds: default_blocked_probe(),
             default_cooldown_seconds: default_default_cooldown(),
             max_retries: default_max_retries(),
             cooldown_min_seconds: default_min_cooldown(),
@@ -586,6 +769,11 @@ pub struct SeatState {
     pub seats: BTreeMap<String, SeatRuntimeState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_seat: Option<String>,
+    /// "Use credits until quota resets" grants, keyed by workspace
+    /// (`account_id`, or the seat name for a seat without one). A grant is
+    /// active only while its deadline is strictly in the future.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub credit_grants: BTreeMap<String, DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -604,6 +792,10 @@ pub struct SeatRuntimeState {
     /// Last quota snapshot recorded by `seat status`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageSnapshot>,
+    /// When a usage fetch was last attempted for this seat (successful or
+    /// not), so automatic re-checks are rate-limited even when they fail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_checked_at: Option<DateTime<Utc>>,
 }
 
 impl SeatRuntimeState {
@@ -668,6 +860,9 @@ pub struct UsageBucket {
 pub struct UsageCredits {
     pub has_credits: bool,
     pub unlimited: bool,
+    /// Balance as codex reports it (a display string), when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -705,8 +900,17 @@ impl SeatState {
             fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let raw = serde_json::to_string_pretty(self).context("serialising state.json")?;
+        // Expired credit grants are pruned on the way out.
+        let now = Utc::now();
+        let mut pruned = self.clone();
+        pruned.credit_grants.retain(|_, until| *until > now);
+        let raw = serde_json::to_string_pretty(&pruned).context("serialising state.json")?;
         atomic_write(&path, raw.as_bytes())
+    }
+
+    /// The active "until quota resets" grant for a workspace, if any.
+    pub fn active_grant(&self, workspace: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.credit_grants.get(workspace).copied().filter(|u| *u > now)
     }
 
     pub fn entry_mut(&mut self, name: &str) -> &mut SeatRuntimeState {
@@ -915,6 +1119,22 @@ pub enum SeatPickError {
         /// How many seats are ineligible because they need login.
         needs_login: usize,
     },
+    /// Every candidate has used its included quota and runs only on workspace
+    /// credits, which this invocation has no consent to spend. Each entry is
+    /// a seat and when its quota resets.
+    QuotaUsedCreditsAvailable { seats: Vec<(String, Option<DateTime<Utc>>)> },
+}
+
+/// "main (resets Thu 08:09), backup1 (resets Sun 23:40)".
+pub fn describe_quota_resets(seats: &[(String, Option<DateTime<Utc>>)]) -> String {
+    seats
+        .iter()
+        .map(|(n, r)| match r {
+            Some(t) => format!("{} (resets {})", n, t.with_timezone(&chrono::Local).format("%a %H:%M")),
+            None => n.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl std::fmt::Display for SeatPickError {
@@ -964,6 +1184,11 @@ impl std::fmt::Display for SeatPickError {
                 }
                 Ok(())
             }
+            Self::QuotaUsedCreditsAvailable { seats } => write!(
+                f,
+                "included quota used up on {}; workspace credits are available but not allowed for this run",
+                describe_quota_resets(seats)
+            ),
         }
     }
 }
@@ -981,20 +1206,29 @@ pub fn pick_seat(
     override_seat: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<String, SeatPickError> {
-    pick_seat_excluding(config, state, override_seat, now, &[])
+    pick_seat_excluding(config, state, override_seat, now, &[], &|_| false)
 }
 
 /// `pick_seat`, but seats named in `exclude` (already tried in this run) are
 /// passed over while any other eligible seat remains. If every eligible seat
 /// is excluded the exclusion is ignored, so the caller's "already tried"
 /// guard still fires and the pool-exhausted logic runs as before.
+///
+/// `credits_for(seat)` says whether this invocation may spend workspace
+/// credits on that seat. Seats whose included quota is used up (quota state
+/// `OnCredits`) form a second tier: they are candidates only when no untried
+/// in-quota seat remains **and** their workspace has consent. Otherwise the
+/// picker returns `QuotaUsedCreditsAvailable`. A pinned seat is strict: it
+/// never rotates, and runs on credits only with consent.
 pub fn pick_seat_excluding(
     config: &SeatConfig,
     state: &SeatState,
     override_seat: Option<&str>,
     now: DateTime<Utc>,
     exclude: &[String],
+    credits_for: &dyn Fn(&str) -> bool,
 ) -> Result<String, SeatPickError> {
+    use crate::usage::{quota_state, QuotaState};
     if config.seats.is_empty() {
         return Err(SeatPickError::NoSeatsConfigured);
     }
@@ -1010,6 +1244,13 @@ pub fn pick_seat_excluding(
         if let Some(until) = st.cooldown_until {
             if until > now {
                 return Err(SeatPickError::SeatCooling { name: seat.name.clone(), until });
+            }
+        }
+        if let QuotaState::OnCredits { resets_at } = quota_state(&st, now) {
+            if !credits_for(&seat.name) {
+                return Err(SeatPickError::QuotaUsedCreditsAvailable {
+                    seats: vec![(seat.name.clone(), resets_at)],
+                });
             }
         }
         return Ok(seat.name.clone());
@@ -1031,7 +1272,34 @@ pub fn pick_seat_excluding(
         .copied()
         .filter(|s| !excluded.contains(s.name.as_str()))
         .collect();
-    let eligible = if untried.is_empty() { all_eligible } else { untried };
+    let pool = if untried.is_empty() { all_eligible } else { untried };
+
+    // Tier the (untried) pool: seats still inside their included quota come
+    // first; seats that would run on credits only if nothing else is left and
+    // their workspace has consent.
+    let mut in_quota: Vec<&SeatEntry> = Vec::new();
+    let mut on_credits: Vec<(&SeatEntry, Option<DateTime<Utc>>)> = Vec::new();
+    for s in pool {
+        match quota_state(&state.get(&s.name), now) {
+            QuotaState::OnCredits { resets_at } => on_credits.push((s, resets_at)),
+            QuotaState::Within | QuotaState::Unknown => in_quota.push(s),
+        }
+    }
+    let eligible: Vec<&SeatEntry> = if !in_quota.is_empty() {
+        in_quota
+    } else {
+        let allowed: Vec<&SeatEntry> = on_credits
+            .iter()
+            .filter(|(s, _)| credits_for(&s.name))
+            .map(|(s, _)| *s)
+            .collect();
+        if allowed.is_empty() {
+            return Err(SeatPickError::QuotaUsedCreditsAvailable {
+                seats: on_credits.iter().map(|(s, r)| (s.name.clone(), *r)).collect(),
+            });
+        }
+        allowed
+    };
 
     let lru = |pool: &[&SeatEntry]| -> String {
         // Smallest last_used (None sorts as oldest).
@@ -1248,13 +1516,56 @@ fn park_orphaned_blob(bytes: &[u8]) -> Result<PathBuf> {
     let dir = orphaned_dir()?;
     secure_create_dir_all(&dir)?;
     ensure_private_dir(&dir)?;
-    let path = dir.join(format!(
-        "auth-{}-{}.json",
-        Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
-        std::process::id()
-    ));
-    atomic_write(&path, bytes)?;
-    Ok(path)
+    // Idempotent: the same foreign blob seen again (a later refresh-back in
+    // the same or a following run) is not parked twice.
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if fs::symlink_metadata(&p).is_ok_and(|m| m.is_file()) && fs::read(&p).is_ok_and(|b| b == bytes) {
+                return Ok(p);
+            }
+        }
+    }
+    // Name by content: identical blobs map to the same file and different
+    // blobs never collide, even from concurrent threads in one process.
+    // `create_new` makes the write race-free: a second writer of the same
+    // content finds the file already there, which is success.
+    let path = dir.join(format!("auth-{:016x}.json", fnv1a64(bytes)));
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    match opts.open(&path) {
+        Ok(mut f) => {
+            let written = f.write_all(bytes).and_then(|_| f.sync_all());
+            if let Err(e) = written {
+                let _ = fs::remove_file(&path);
+                return Err(anyhow::Error::from(e).context(format!("writing {}", path.display())));
+            }
+            Ok(path)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(path),
+        Err(e) => Err(anyhow::Error::from(e).context(format!("creating {}", path.display()))),
+    }
+}
+
+/// FNV-1a 64-bit: a small, stable, dependency-free content hash for naming.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Stable, non-reversible label for a workspace in user-facing JSON, so
+/// account ids never appear there: `ws-<8 hex>`.
+pub fn workspace_label(workspace_key: &str) -> String {
+    format!("ws-{:08x}", fnv1a64(workspace_key.as_bytes()) as u32)
 }
 
 /// A directory that holds credentials must be a real directory (not a
@@ -1903,14 +2214,14 @@ mod tests {
             assert_eq!(pick_seat(&c, &s, None, now()).unwrap(), "a", "{:?}", strategy);
             // …and "b" once "a" has been tried this run.
             assert_eq!(
-                pick_seat_excluding(&c, &s, None, now(), &["a".to_string()]).unwrap(),
+                pick_seat_excluding(&c, &s, None, now(), &["a".to_string()], &|_| false).unwrap(),
                 "b",
                 "{:?}",
                 strategy
             );
             // With everything tried, exclusion is ignored (caller's guard handles it).
             assert_eq!(
-                pick_seat_excluding(&c, &s, None, now(), &["a".to_string(), "b".to_string()]).unwrap(),
+                pick_seat_excluding(&c, &s, None, now(), &["a".to_string(), "b".to_string()], &|_| false).unwrap(),
                 "a",
                 "{:?}",
                 strategy
@@ -1936,23 +2247,23 @@ mod tests {
     fn seat_notice_summarises_degraded_pool_only() {
         let c = cfg(&["main", "backup1"], Strategy::LeastRecentlyUsed);
         let mut s = SeatState::default();
-        assert_eq!(seat_notice(&c, &s, now()), None, "healthy pool is silent");
+        assert_eq!(seat_notice(&c, &s, now(), &|_| false), None, "healthy pool is silent");
 
         s.entry_mut("backup1").needs_login = true;
-        let n = seat_notice(&c, &s, now()).unwrap();
+        let n = seat_notice(&c, &s, now(), &|_| false).unwrap();
         assert!(n.contains("backup1 needs login (run: codex-clean seat login backup1)"), "{}", n);
         assert!(n.ends_with("1 of 2 usable"), "{}", n);
 
         s.entry_mut("main").cooldown_until = Some(now() + chrono::Duration::hours(1));
         s.entry_mut("main").cooldown_reason = Some("credits".into());
-        let n = seat_notice(&c, &s, now()).unwrap();
+        let n = seat_notice(&c, &s, now(), &|_| false).unwrap();
         assert!(n.contains("main cooling until"), "{}", n);
         assert!(n.contains(", credits"), "{}", n);
         assert!(n.ends_with("0 of 2 usable"), "{}", n);
 
         // An expired cooldown is not degraded.
         s.entry_mut("main").cooldown_until = Some(now() - chrono::Duration::hours(1));
-        let n = seat_notice(&c, &s, now()).unwrap();
+        let n = seat_notice(&c, &s, now(), &|_| false).unwrap();
         assert!(!n.contains("main"), "{}", n);
     }
 
@@ -1976,14 +2287,162 @@ mod tests {
             &mut s,
             &["main".to_string(), "backup1".to_string()],
             short,
-            "credits",
+            crate::ratelimit::CooldownReason::Credits,
             now(),
         );
-        assert_eq!(changed, vec!["main"]);
+        assert_eq!(changed, vec!["main", "backup1"]);
         assert_eq!(s.get("main").cooldown_until, Some(short));
         assert_eq!(s.get("main").cooldown_reason.as_deref(), Some("credits"));
-        assert_eq!(s.get("backup1").cooldown_until, Some(long), "longer cooldown kept");
-        assert_eq!(s.get("backup1").cooldown_reason.as_deref(), Some("rate_limit"));
+        assert_eq!(s.get("backup1").cooldown_until, Some(long), "longer deadline kept");
+        assert_eq!(
+            s.get("backup1").cooldown_reason.as_deref(),
+            Some("credits"),
+            "stronger reason recorded so it is not hidden behind rate_limit"
+        );
+    }
+
+    #[test]
+    fn merge_cooldown_never_slides_and_keeps_the_stronger_reason() {
+        use crate::ratelimit::CooldownReason::*;
+        let t0 = now();
+        let mut e = SeatRuntimeState::default();
+        assert!(merge_cooldown(&mut e, t0 + chrono::Duration::hours(24), RateLimit, t0));
+        let first = e.cooldown_until.unwrap();
+        // Same reason observed again later with a later computed deadline:
+        // unchanged (the 2026-09-11 slide).
+        for h in [1, 5, 12] {
+            let later = t0 + chrono::Duration::hours(h);
+            assert!(!merge_cooldown(&mut e, later + chrono::Duration::hours(24), RateLimit, later));
+            assert_eq!(e.cooldown_until, Some(first));
+        }
+        // Different reason, earlier deadline: deadline kept, stronger reason taken.
+        assert!(merge_cooldown(&mut e, t0 + chrono::Duration::hours(1), SpendControl, t0));
+        assert_eq!(e.cooldown_until, Some(first));
+        assert_eq!(e.cooldown_reason.as_deref(), Some("spend_control"));
+        // Weaker reason with a later deadline: deadline extends, reason stays strong.
+        assert!(merge_cooldown(&mut e, first + chrono::Duration::hours(2), Credits, t0));
+        assert_eq!(e.cooldown_until, Some(first + chrono::Duration::hours(2)));
+        assert_eq!(e.cooldown_reason.as_deref(), Some("spend_control"));
+        // Equal deadline, different weaker reason: nothing changes.
+        let cur = e.cooldown_until.unwrap();
+        assert!(!merge_cooldown(&mut e, cur, RateLimit, t0));
+        // After expiry, a new cooldown starts fresh.
+        let after = cur + chrono::Duration::seconds(1);
+        assert!(merge_cooldown(&mut e, after + chrono::Duration::hours(1), RateLimit, after));
+        assert_eq!(e.cooldown_reason.as_deref(), Some("rate_limit"));
+    }
+
+    #[test]
+    fn credit_grants_are_per_workspace_and_never_open_ended() {
+        let mut c = cfg(&["a", "b", "x"], Strategy::LeastRecentlyUsed);
+        c.seats[0].account_id = Some("ws1".into());
+        c.seats[1].account_id = Some("ws1".into());
+        c.seats[2].account_id = Some("ws2".into());
+        let mut s = SeatState::default();
+        let r1 = now() + chrono::Duration::hours(10);
+        let r2 = now() + chrono::Duration::hours(3);
+        let granted = grant_credits_until_reset(
+            &c,
+            &mut s,
+            &[("a".into(), Some(r1)), ("b".into(), Some(r2))],
+            now(),
+        )
+        .unwrap();
+        assert_eq!(granted, vec![(vec!["a".to_string(), "b".to_string()], r2)], "earliest reset in the workspace");
+        assert_eq!(s.active_grant("acct:ws1", now()), Some(r2));
+        assert_eq!(s.active_grant("acct:ws2", now()), None, "other workspace not covered");
+        // Strictly before the deadline only.
+        assert_eq!(s.active_grant("acct:ws1", r2), None);
+        // No known reset → refused.
+        let mut s2 = SeatState::default();
+        assert!(grant_credits_until_reset(&c, &mut s2, &[("x".into(), None)], now()).is_err());
+        assert!(s2.credit_grants.is_empty());
+    }
+
+    #[test]
+    fn workspace_keys_are_namespaced_so_names_and_account_ids_never_collide() {
+        let mut c = cfg(&["main", "other"], Strategy::LeastRecentlyUsed);
+        c.seats[1].account_id = Some("main".into());
+        assert_eq!(workspace_key(&c, "main"), "seat:main");
+        assert_eq!(workspace_key(&c, "other"), "acct:main");
+        assert_ne!(workspace_key(&c, "main"), workspace_key(&c, "other"));
+        assert_eq!(workspace_siblings(&c, "main"), vec!["main"]);
+        assert_eq!(workspace_siblings(&c, "other"), vec!["other"]);
+    }
+
+    #[test]
+    fn two_tier_pick_prefers_in_quota_seats_and_needs_consent_for_credits() {
+        let on_credits = || {
+            let mut snap = snapshot_with(&[(10080, 100)], 0);
+            snap.buckets[0].windows[0].resets_at = Some(now() + chrono::Duration::days(2));
+            snap.credits = Some(UsageCredits { has_credits: true, unlimited: false, balance: None });
+            snap
+        };
+        for strategy in [Strategy::LeastRecentlyUsed, Strategy::RoundRobin, Strategy::Fixed, Strategy::Balanced] {
+            let mut c = cfg(&["a", "b"], strategy);
+            c.rotation.fixed_seat = Some("a".into());
+            let mut s = SeatState::default();
+            s.entry_mut("a").usage = Some(on_credits());
+            s.entry_mut("b").usage = Some(snapshot_with(&[(10080, 60)], 0));
+            s.entry_mut("b").last_used = Some(now());
+            // Even with consent, the in-quota seat wins.
+            assert_eq!(pick_seat_excluding(&c, &s, None, now(), &[], &|_| true).unwrap(), "b", "{:?}", strategy);
+            // b already tried this run: a on credits needs consent.
+            let tried = ["b".to_string()];
+            assert_eq!(pick_seat_excluding(&c, &s, None, now(), &tried, &|_| true).unwrap(), "a", "{:?}", strategy);
+            match pick_seat_excluding(&c, &s, None, now(), &tried, &|_| false) {
+                Err(SeatPickError::QuotaUsedCreditsAvailable { seats }) => {
+                    assert_eq!(seats.len(), 1);
+                    assert_eq!(seats[0].0, "a");
+                    assert!(seats[0].1.is_some());
+                }
+                other => panic!("{:?}: expected QuotaUsedCreditsAvailable, got {:?}", strategy, other),
+            }
+        }
+        // Pinned: never rotates; on-credits pinned seat needs consent.
+        let c = cfg(&["a", "b"], Strategy::LeastRecentlyUsed);
+        let mut s = SeatState::default();
+        s.entry_mut("a").usage = Some(on_credits());
+        assert!(matches!(
+            pick_seat_excluding(&c, &s, Some("a"), now(), &[], &|_| false),
+            Err(SeatPickError::QuotaUsedCreditsAvailable { .. })
+        ));
+        assert_eq!(pick_seat_excluding(&c, &s, Some("a"), now(), &[], &|_| true).unwrap(), "a");
+    }
+
+    #[test]
+    fn seat_notice_warns_about_unspent_credits_only_without_consent() {
+        let c = cfg(&["main", "backup1"], Strategy::LeastRecentlyUsed);
+        let mut s = SeatState::default();
+        for n in ["main", "backup1"] {
+            let mut snap = snapshot_with(&[(10080, 100)], 0);
+            snap.buckets[0].windows[0].resets_at = Some(now() + chrono::Duration::days(2));
+            snap.credits = Some(UsageCredits { has_credits: true, unlimited: false, balance: None });
+            s.entry_mut(n).usage = Some(snap);
+        }
+        let n = seat_notice(&c, &s, now(), &|_| false).unwrap();
+        assert!(n.contains("included quota used up on main (resets "), "{}", n);
+        assert!(n.contains("workspace credits available but not spent (credits: ask)"), "{}", n);
+        assert!(n.contains("CODEX_CLEAN_USE_CREDITS=1"), "{}", n);
+        assert!(n.ends_with("0 of 2 usable"), "{}", n);
+        assert_eq!(seat_notice(&c, &s, now(), &|_| true), None, "with consent the pool is usable");
+    }
+
+    #[test]
+    fn credit_policy_defaults_to_ask_and_parses() {
+        assert_eq!(RotationConfig::default().credits, CreditPolicy::Ask);
+        let c: SeatConfig = toml::from_str("[[seat]]\nname = \"a\"\n").unwrap();
+        assert_eq!(c.rotation.credits, CreditPolicy::Ask, "old seats.toml keeps the no-spend default");
+        assert_eq!(c.rotation.blocked_probe_seconds, 300);
+        for p in [CreditPolicy::Ask, CreditPolicy::Never, CreditPolicy::Always] {
+            assert_eq!(CreditPolicy::parse(p.as_str()), Some(p));
+        }
+        assert_eq!(CreditPolicy::parse("sometimes"), None);
+        let raw = r#"{"seats":{},"credit_grants":{"ws":"2026-09-11T12:00:00Z"}}"#;
+        let st: SeatState = serde_json::from_str(raw).unwrap();
+        assert_eq!(st.credit_grants.len(), 1);
+        let legacy: SeatState = serde_json::from_str(r#"{"seats":{}}"#).unwrap();
+        assert!(legacy.credit_grants.is_empty());
     }
 
     #[test]
@@ -2080,7 +2539,7 @@ mod tests {
                 windows: vec![UsageWindow { window_minutes: Some(300), used_percent: 42, resets_at: Some(now()) }],
                 rate_limit_reached_type: None,
             }],
-            credits: Some(UsageCredits { has_credits: false, unlimited: false }),
+            credits: Some(UsageCredits { has_credits: false, unlimited: false, balance: None }),
             spend_control_reached: Some(false),
         });
         s2.entry_mut("a").cooldown_reason = Some("credits".into());
@@ -2168,6 +2627,8 @@ mod tests {
                 strategy: Strategy::RoundRobin,
                 fixed_seat: None,
                 balance_refresh_seconds: 600,
+                credits: CreditPolicy::Never,
+                blocked_probe_seconds: 120,
                 default_cooldown_seconds: 1800,
                 max_retries: 2,
                 cooldown_min_seconds: 60,

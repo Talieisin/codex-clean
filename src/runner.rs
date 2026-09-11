@@ -4,28 +4,30 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 
 use anyhow::{Context, Result};
-use chrono::{Local, Utc};
+use chrono::{DateTime, Local, Utc};
 
 use crate::events::{extract_event, Event};
 use crate::output::CodexOutput;
 use crate::ratelimit::{self, FailureKind};
 use crate::seat::{
     self, cool_seats, log_event, log_excerpt, refresh_back_guarded, seat_notice, swap_active_auth,
-    unmatched_log_path, warn_refresh_back, workspace_siblings, CodexLock, SeatConfig,
-    SeatPickError, SeatState, Strategy, SCRUB_ENV_VARS,
+    unmatched_log_path, warn_refresh_back, workspace_siblings, CodexLock, CreditPolicy,
+    SeatConfig, SeatPickError, SeatState, Strategy, SCRUB_ENV_VARS,
 };
-use crate::usage::{self, AppServerClient, UsageClient};
+use crate::usage::{self, quota_state, AppServerClient, QuotaState, UsageClient};
 
 const STDERR_CAP_BYTES: usize = 10 * 1024 * 1024;
 
 /// `EX_TEMPFAIL`: every seat is cooling; try again later.
 pub const EXIT_ALL_SEATS_COOLING: i32 = 75;
 
+/// `EX_NOPERM`: included quota is used up and only workspace credits remain,
+/// which need the user's consent. Distinct from 75 so a non-interactive
+/// caller (e.g. an agent) asks the user instead of retrying on a timer.
+pub const EXIT_CREDITS_CONSENT_NEEDED: i32 = 77;
+
 /// `(seat, reason)` pairs for seats exhausted earlier in a run.
 type Exhausted = Vec<(String, String)>;
-/// Seat of the last failed attempt, why it was cooled, and what was
-/// exhausted before it.
-type FailureCtx = Option<(String, String, Exhausted)>;
 
 /// Target for resume command
 pub enum ResumeTarget {
@@ -59,23 +61,23 @@ pub struct AttemptResult {
 
 /// Run codex with the given arguments and prompt. Drives the multi-seat
 /// orchestration if seats are configured; otherwise behaves identically to
-/// the pre-seat version.
-pub fn run_codex(args: &[String], prompt: &str, mode: Mode) -> Result<i32> {
-    run_codex_with(args, prompt, mode, attempt_codex)
+/// the pre-seat version. `interactive` says whether a credits prompt may be
+/// shown (a terminal on stdin and stderr, prompt not read from stdin).
+pub fn run_codex(args: &[String], prompt: &str, mode: Mode, interactive: bool) -> Result<i32> {
+    let decider: &dyn CreditDecider = if interactive { &TerminalPrompt } else { &NoPrompt };
+    run_codex_with_deps(args, prompt, mode, attempt_codex, &AppServerClient::default(), decider)
 }
 
-/// `run_codex_with_client` with the production app-server usage client.
+/// Non-interactive orchestration with an injected spawner and **no** usage
+/// fetching (automatic checks fail fast instead of spawning codex). Tests.
 pub fn run_codex_with<F>(args: &[String], prompt: &str, mode: Mode, attempt: F) -> Result<i32>
 where
     F: Fn(&[String], &str, &Mode, bool) -> Result<AttemptResult>,
 {
-    run_codex_with_client(args, prompt, mode, attempt, &AppServerClient::default())
+    run_codex_with_client(args, prompt, mode, attempt, &usage::NoUsageClient)
 }
 
-/// Internal orchestration that drives the lock/swap/spawn/classify state
-/// machine. Generic over the codex attempt callback so tests can inject a
-/// fake spawner without touching real auth.json or running real codex, and
-/// over the usage client the `balanced` strategy uses to refresh snapshots.
+/// Non-interactive orchestration with an injected usage client (tests).
 pub fn run_codex_with_client<F>(
     args: &[String],
     prompt: &str,
@@ -86,21 +88,378 @@ pub fn run_codex_with_client<F>(
 where
     F: Fn(&[String], &str, &Mode, bool) -> Result<AttemptResult>,
 {
-    let cfg_opt = SeatConfig::load().context("loading seats.toml")?;
-    let cfg = match cfg_opt {
-        Some(c) if !c.seats.is_empty() => c,
-        _ => {
-            // Backwards-compat: no seats configured → run as today.
-            let result = attempt(args, prompt, &mode, false)?;
-            print_attempt(&result);
-            return Ok(result.exit_code);
-        }
-    };
+    run_codex_with_deps(args, prompt, mode, attempt, usage_client, &NoPrompt)
+}
 
-    // Multi-seat path. Lock held for the entire orchestration window —
-    // concurrent codex-clean invocations serialise. This matches multi-auth's
-    // single-codex constraint and avoids the auth.json refresh-write race.
+// ---------------------------------------------------------------------------
+// Credit consent
+// ---------------------------------------------------------------------------
+
+/// Why a run is allowed to spend workspace credits. Decided when the seat is
+/// picked and carried with the attempt, so the `Seat:` line reports the
+/// consent that applied even if a grant expires mid-run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreditUse {
+    /// `CODEX_CLEAN_USE_CREDITS=1`, or "use credits for this run" at the prompt.
+    ThisRun,
+    /// A "use credits until quota resets" grant for the seat's workspace.
+    Grant(DateTime<Utc>),
+    /// `rotation.credits = "always"`.
+    Always,
+}
+
+impl CreditUse {
+    pub fn describe(self) -> String {
+        match self {
+            Self::ThisRun => "this run".to_string(),
+            Self::Grant(until) => format!("until {}", until.with_timezone(&Local).format("%a %H:%M")),
+            Self::Always => "always".to_string(),
+        }
+    }
+}
+
+/// The consent (if any) this invocation has to spend credits on `seat`.
+///
+/// `this_run_workspaces` are the workspaces the user said "use credits for
+/// this run" about at the prompt. That consent covers only those workspaces,
+/// checked against the seat's *current* workspace, so a seat re-registered
+/// under another workspace while the question was open is not covered.
+/// `CODEX_CLEAN_USE_CREDITS=1` is invocation-wide by design.
+pub fn consent_for(
+    cfg: &SeatConfig,
+    state: &SeatState,
+    seat_name: &str,
+    this_run_workspaces: &[String],
+    now: DateTime<Utc>,
+) -> Option<CreditUse> {
+    if cfg.rotation.credits == CreditPolicy::Always {
+        return Some(CreditUse::Always);
+    }
+    let workspace = seat::workspace_key(cfg, seat_name);
+    if seat::env_use_credits() || this_run_workspaces.contains(&workspace) {
+        return Some(CreditUse::ThisRun);
+    }
+    state.active_grant(&workspace, now).map(CreditUse::Grant)
+}
+
+/// The answer to "included quota is used up — wait or spend credits?".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreditChoice {
+    Wait,
+    ThisRun,
+    UntilReset,
+    Always,
+}
+
+impl CreditChoice {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Wait => "wait",
+            Self::ThisRun => "this run",
+            Self::UntilReset => "until quota resets",
+            Self::Always => "always",
+        }
+    }
+}
+
+/// Parse a prompt answer. Anything but `o`, `u` or `a` (including empty
+/// input, EOF and garbage) means wait: consent to spend money is never
+/// inferred.
+pub fn parse_credit_choice(answer: &str) -> CreditChoice {
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "o" | "once" | "this run" => CreditChoice::ThisRun,
+        "u" | "until" | "until reset" => CreditChoice::UntilReset,
+        "a" | "always" => CreditChoice::Always,
+        _ => CreditChoice::Wait,
+    }
+}
+
+/// Decides whether to spend credits when every candidate seat has used its
+/// included quota. Called with `CodexLock` **released**, so a slow answer
+/// never blocks other codex-clean runs.
+pub trait CreditDecider {
+    fn decide(&self, seats: &[(String, Option<DateTime<Utc>>)]) -> CreditChoice;
+}
+
+/// Background / non-interactive: never spend without prior consent.
+pub struct NoPrompt;
+
+impl CreditDecider for NoPrompt {
+    fn decide(&self, _: &[(String, Option<DateTime<Utc>>)]) -> CreditChoice {
+        CreditChoice::Wait
+    }
+}
+
+/// Ask on the terminal (stderr prompt, stdin answer).
+pub struct TerminalPrompt;
+
+impl CreditDecider for TerminalPrompt {
+    fn decide(&self, seats: &[(String, Option<DateTime<Utc>>)]) -> CreditChoice {
+        eprintln!(
+            "Included quota is used up: {}.",
+            seat::describe_quota_resets(seats)
+        );
+        eprintln!(
+            "Workspace credits are available. (A run that starts on included quota can still finish on credits.)"
+        );
+        eprintln!("  [w] wait for quota (exit 77)   [o] use credits for this run");
+        eprintln!("  [u] use credits until quota resets   [a] always use credits");
+        eprint!("Choice [w]: ");
+        let _ = io::stderr().flush();
+        let mut line = String::new();
+        match io::stdin().read_line(&mut line) {
+            Ok(0) | Err(_) => CreditChoice::Wait,
+            Ok(_) => parse_credit_choice(&line),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Orchestration
+// ---------------------------------------------------------------------------
+
+/// A failed attempt kept for printing: which seat, why it was cooled, what
+/// had been exhausted before it, and the credit consent it ran under.
+#[derive(Clone)]
+struct FailedSeat {
+    seat: String,
+    reason: String,
+    before: Exhausted,
+    credit_use: Option<CreditUse>,
+}
+
+/// State that survives across orchestration passes within one invocation
+/// (a pass ends when a credits decision is needed and the lock is released).
+#[derive(Default)]
+struct RunCtx {
+    tried_seats: Vec<String>,
+    attempts_used: u32,
+    last_failure: Option<AttemptResult>,
+    last_failed_seat: Option<FailedSeat>,
+    exhausted_so_far: Exhausted,
+    /// Workspaces the user gave "use credits for this run" consent for.
+    credits_this_run: Vec<String>,
+    balanced_refreshed: bool,
+    blocked_probed: bool,
+    prerun_checked: Vec<String>,
+    decisions: u32,
+}
+
+/// One seat in a credits decision: which seat, its workspace at the time the
+/// question was asked, and when its quota resets. The workspace is re-checked
+/// under the lock before any grant is written, so consent given for one
+/// workspace can never attach to another (e.g. a seat re-added meanwhile).
+#[derive(Debug, Clone)]
+struct PromptedSeat {
+    seat: String,
+    workspace: String,
+    resets_at: Option<DateTime<Utc>>,
+}
+
+enum Step {
+    Done(i32),
+    NeedCreditDecision(Vec<PromptedSeat>),
+}
+
+/// Upper bound on credits decisions in one invocation (each can change
+/// config/state and re-enter orchestration).
+const MAX_CREDIT_DECISIONS: u32 = 3;
+
+/// Full orchestration with injected codex spawner, usage client and credits
+/// decider.
+pub fn run_codex_with_deps<F>(
+    args: &[String],
+    prompt: &str,
+    mode: Mode,
+    attempt: F,
+    usage_client: &dyn UsageClient,
+    decider: &dyn CreditDecider,
+) -> Result<i32>
+where
+    F: Fn(&[String], &str, &Mode, bool) -> Result<AttemptResult>,
+{
+    let cfg_opt = SeatConfig::load().context("loading seats.toml")?;
+    if !matches!(&cfg_opt, Some(c) if !c.seats.is_empty()) {
+        // Backwards-compat: no seats configured → run as today.
+        let result = attempt(args, prompt, &mode, false)?;
+        print_attempt(&result);
+        return Ok(result.exit_code);
+    }
+
+    let override_seat = env::var("CODEX_CLEAN_SEAT").ok().filter(|s| !s.is_empty());
+    let mut ctx = RunCtx::default();
+    loop {
+        let step = orchestrate(
+            args,
+            prompt,
+            &mode,
+            &attempt,
+            usage_client,
+            override_seat.as_deref(),
+            &mut ctx,
+        )?;
+        let prompted = match step {
+            Step::Done(code) => return Ok(code),
+            Step::NeedCreditDecision(p) => p,
+        };
+        let seats: Vec<(String, Option<DateTime<Utc>>)> =
+            prompted.iter().map(|p| (p.seat.clone(), p.resets_at)).collect();
+        // CodexLock was released when `orchestrate` returned.
+        let cfg = SeatConfig::load()?.unwrap_or_default();
+        ctx.decisions += 1;
+        let choice = if cfg.rotation.credits == CreditPolicy::Ask && ctx.decisions <= MAX_CREDIT_DECISIONS {
+            decider.decide(&seats)
+        } else {
+            CreditChoice::Wait
+        };
+        let names: Vec<&str> = seats.iter().map(|(n, _)| n.as_str()).collect();
+        log_event(
+            "credits",
+            &names.join(","),
+            &format!("quota used up with credits available; choice={} (credits: {})", choice.as_str(), cfg.rotation.credits),
+        );
+        let applied = match choice {
+            CreditChoice::Wait => false,
+            CreditChoice::ThisRun => {
+                for p in &prompted {
+                    if !ctx.credits_this_run.contains(&p.workspace) {
+                        ctx.credits_this_run.push(p.workspace.clone());
+                    }
+                }
+                true
+            }
+            CreditChoice::UntilReset => match grant_until_reset(&prompted) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("Could not record the credits grant ({:#}); not spending credits.", e);
+                    false
+                }
+            },
+            CreditChoice::Always => match set_credit_policy(CreditPolicy::Always) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("Could not save credits = \"always\" ({:#}); not spending credits.", e);
+                    false
+                }
+            },
+        };
+        if !applied {
+            return finish_waiting_for_quota(&mut ctx, override_seat.as_deref(), &seats);
+        }
+    }
+}
+
+/// Exit 77 because the only way forward is spending credits without consent:
+/// print any previous failed attempt and its `Seat:` line, the reason on
+/// stderr, and the `Seats:` warning on stdout.
+///
+/// Re-checked under the lock: 77 is returned only if consent is *still* the
+/// sole blocker. If the situation changed while the question was open (quota
+/// reset, a grant or `always` set by another process), nothing is spent —
+/// the user said wait — and the exit is 75 ("re-run to continue").
+fn finish_waiting_for_quota(
+    ctx: &mut RunCtx,
+    override_seat: Option<&str>,
+    seats: &[(String, Option<DateTime<Utc>>)],
+) -> Result<i32> {
     let _lock = CodexLock::acquire().context("acquiring codex.lock")?;
+    let cfg = SeatConfig::load()?.unwrap_or_default();
+    let state = SeatState::load()?;
+    let still_needs_consent = matches!(
+        pick_now(&cfg, &state, override_seat, &ctx.tried_seats, &ctx.credits_this_run),
+        Err(SeatPickError::QuotaUsedCreditsAvailable { .. })
+    );
+    let code = if still_needs_consent {
+        eprintln!(
+            "{}.",
+            SeatPickError::QuotaUsedCreditsAvailable { seats: seats.to_vec() }
+        );
+        log_event(
+            "quota_exhausted_credits_available",
+            &seats.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(","),
+            &format!("not spending credits (credits: {})", cfg.rotation.credits),
+        );
+        EXIT_CREDITS_CONSENT_NEEDED
+    } else {
+        eprintln!(
+            "Not spending credits as asked; the seat situation changed while waiting \
+             (quota reset, or consent recorded elsewhere). Nothing was run — re-run to continue."
+        );
+        EXIT_ALL_SEATS_COOLING
+    };
+    if let Some(prev) = ctx.last_failure.take() {
+        print_attempt(&prev);
+        print_failed_seat_line(&cfg, &state, override_seat, &ctx.last_failed_seat);
+    }
+    print_seat_notice(&cfg, &state, &ctx.credits_this_run);
+    Ok(code)
+}
+
+/// "Use credits until quota resets": grant each affected workspace until the
+/// earliest known reset among its seats. Refused when no reset is known —
+/// there is no blanket open-ended grant.
+fn grant_until_reset(prompted: &[PromptedSeat]) -> Result<()> {
+    let _lock = CodexLock::acquire()?;
+    let cfg = SeatConfig::load()?.ok_or_else(|| anyhow::anyhow!("no seats configured"))?;
+    let mut state = SeatState::load()?;
+    let now = Utc::now();
+    // Only seats that still belong to the workspace the user was asked about
+    // and are still on credits; their *current* reset time is used.
+    let verified: Vec<(String, Option<DateTime<Utc>>)> = prompted
+        .iter()
+        .filter(|p| cfg.find(&p.seat).is_some() && seat::workspace_key(&cfg, &p.seat) == p.workspace)
+        .filter_map(|p| match quota_state(&state.get(&p.seat), now) {
+            QuotaState::OnCredits { resets_at } => Some((p.seat.clone(), resets_at)),
+            _ => None,
+        })
+        .collect();
+    if verified.is_empty() {
+        anyhow::bail!("the seats changed while the question was open; nothing to grant");
+    }
+    let granted = seat::grant_credits_until_reset(&cfg, &mut state, &verified, now)?;
+    state.save()?;
+    for (ws_seats, until) in granted {
+        log_event(
+            "credits_grant",
+            &ws_seats.join(","),
+            &format!("until {}", until.to_rfc3339()),
+        );
+    }
+    Ok(())
+}
+
+fn set_credit_policy(policy: CreditPolicy) -> Result<()> {
+    let _lock = CodexLock::acquire()?;
+    let mut cfg = SeatConfig::load()?.ok_or_else(|| anyhow::anyhow!("no seats configured"))?;
+    cfg.rotation.credits = policy;
+    cfg.save()?;
+    log_event("credits_mode", "-", &format!("set to {}", policy));
+    Ok(())
+}
+
+/// One orchestration pass under `CodexLock`: reload config and state, pick,
+/// run, classify, rotate. Returns `NeedCreditDecision` (after persisting
+/// state and refresh-back) when the only candidates are seats on credits
+/// without consent, so the caller can ask with the lock released.
+fn orchestrate<F>(
+    args: &[String],
+    prompt: &str,
+    mode: &Mode,
+    attempt: &F,
+    usage_client: &dyn UsageClient,
+    override_seat: Option<&str>,
+    ctx: &mut RunCtx,
+) -> Result<Step>
+where
+    F: Fn(&[String], &str, &Mode, bool) -> Result<AttemptResult>,
+{
+    // Multi-seat path. Lock held for the whole pass — concurrent codex-clean
+    // invocations serialise, which avoids the auth.json refresh-write race.
+    let _lock = CodexLock::acquire().context("acquiring codex.lock")?;
+    let cfg = SeatConfig::load()
+        .context("loading seats.toml")?
+        .filter(|c| !c.seats.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("seats.toml no longer lists any seats"))?;
 
     // Re-validate config.toml on every multi-seat run. If somebody flipped
     // cli_auth_credentials_store back to "keyring", subsequent codex spawns
@@ -113,65 +472,115 @@ where
         );
     }
 
-    let override_seat = env::var("CODEX_CLEAN_SEAT").ok().filter(|s| !s.is_empty());
     let mut state = SeatState::load()?;
     let max_attempts = cfg.rotation.max_retries.saturating_add(1);
-    let mut last_failure: Option<AttemptResult> = None;
-    // Seat of `last_failure`, why it was cooled, and which seats had already
-    // been exhausted before it in this run — for the `Seat:` line.
-    let mut last_failure_ctx: FailureCtx = None;
-    let mut tried_seats: Vec<String> = Vec::new();
-    let mut exhausted_so_far: Exhausted = Vec::new();
 
-    for attempt_index in 0..max_attempts {
+    while ctx.attempts_used < max_attempts {
         // Before anything touches the slots, stash any token refresh the
         // previously active seat received (from plain `codex`, or from our
-        // own last attempt). This must precede a balanced-strategy snapshot
-        // refresh too: that stages the slot blob into a scratch home, and a
-        // stale refresh token there would be rejected as reused. Runs even
-        // when the same seat is about to be re-picked, so a single-seat /
-        // pinned run never clobbers a fresher global blob with the stale
-        // slot copy. Guarded by identity; never fatal.
+        // own last attempt). This must precede any snapshot refresh too: that
+        // stages the slot blob into a scratch home, and a stale refresh token
+        // there would be rejected as reused. Runs even when the same seat is
+        // about to be re-picked. Guarded by identity; never fatal.
         if let Some(prev) = state.active_seat.clone() {
             persist_refresh(&cfg, &prev);
         }
 
-        if attempt_index == 0 && cfg.rotation.strategy == Strategy::Balanced && override_seat.is_none() {
+        if !ctx.balanced_refreshed && cfg.rotation.strategy == Strategy::Balanced && override_seat.is_none() {
+            ctx.balanced_refreshed = true;
             refresh_stale_usage(&cfg, &mut state, usage_client);
         }
 
-        let now = Utc::now();
-        let chosen = match seat::pick_seat_excluding(&cfg, &state, override_seat.as_deref(), now, &tried_seats) {
+        // A cached reading that still shows a seat exhausted (no credits,
+        // reset ahead) keeps it cooling even after its cooldown clock ran out.
+        let recooled = usage::reapply_cached_exhaustion(&cfg, &mut state, Utc::now());
+        if !recooled.is_empty() {
+            state.save()?;
+        }
+
+        let this_run = ctx.credits_this_run.clone();
+        let this_run = this_run.as_slice();
+        let mut pick = pick_now(&cfg, &state, override_seat, &ctx.tried_seats, this_run);
+
+        // Everything cooling (or the pinned seat cooling) for reasons that
+        // purchased credits could lift: re-check before giving up.
+        if !ctx.blocked_probed
+            && matches!(pick, Err(SeatPickError::AllSeatsBlocked { .. }) | Err(SeatPickError::SeatCooling { .. }))
+        {
+            ctx.blocked_probed = true;
+            if probe_blocked_seats(&cfg, &mut state, usage_client, override_seat) {
+                pick = pick_now(&cfg, &state, override_seat, &ctx.tried_seats, this_run);
+            }
+        }
+
+        let chosen = match pick {
             Ok(name) => name,
+            Err(SeatPickError::QuotaUsedCreditsAvailable { seats }) => {
+                state.save()?;
+                let prompted = seats
+                    .into_iter()
+                    .map(|(seat_name, resets_at)| PromptedSeat {
+                        workspace: seat::workspace_key(&cfg, &seat_name),
+                        seat: seat_name,
+                        resets_at,
+                    })
+                    .collect();
+                return Ok(Step::NeedCreditDecision(prompted));
+            }
             Err(blocked @ SeatPickError::AllSeatsBlocked { .. }) => {
                 let code = report_all_blocked(&blocked);
-                if let Some(prev) = last_failure {
+                if let Some(prev) = ctx.last_failure.take() {
                     print_attempt(&prev);
-                    print_failed_seat_line(&cfg, &state, override_seat.as_deref(), &last_failure_ctx);
+                    print_failed_seat_line(&cfg, &state, override_seat, &ctx.last_failed_seat);
                 }
-                print_seat_notice(&cfg, &state);
-                return Ok(code);
+                print_seat_notice(&cfg, &state, this_run);
+                return Ok(Step::Done(code));
             }
             Err(e) => {
-                if let Some(prev) = last_failure {
+                if let Some(prev) = ctx.last_failure.take() {
                     eprintln!("{}", e);
                     print_attempt(&prev);
-                    print_failed_seat_line(&cfg, &state, override_seat.as_deref(), &last_failure_ctx);
-                    print_seat_notice(&cfg, &state);
-                    return Ok(prev.exit_code);
+                    print_failed_seat_line(&cfg, &state, override_seat, &ctx.last_failed_seat);
+                    print_seat_notice(&cfg, &state, this_run);
+                    return Ok(Step::Done(prev.exit_code));
                 }
                 // A pinned seat that is cooling / needs login: still tell a
                 // stdout-only caller why nothing ran.
-                print_seat_notice(&cfg, &state);
+                print_seat_notice(&cfg, &state, this_run);
                 anyhow::bail!("{}", e);
             }
         };
 
-        if tried_seats.contains(&chosen) {
+        let now = Utc::now();
+        let consent = consent_for(&cfg, &state, &chosen, this_run, now);
+
+        // Best-effort pre-run check: about to run without credit consent on a
+        // seat whose last reading is missing, or old and near its limit.
+        if consent.is_none()
+            && !ctx.prerun_checked.contains(&chosen)
+            && needs_prerun_check(&cfg, &state.get(&chosen), now)
+        {
+            ctx.prerun_checked.push(chosen.clone());
+            if let Some(entry) = cfg.find(&chosen).cloned() {
+                fetch_and_reconcile(&cfg, &mut state, usage_client, vec![entry], "pre-run check");
+            }
+            continue; // re-pick with the fresh reading; no attempt consumed
+        }
+
+        if ctx.tried_seats.contains(&chosen) {
             // We've already tried this seat in this run — guard against loops.
             break;
         }
-        tried_seats.push(chosen.clone());
+        ctx.tried_seats.push(chosen.clone());
+        ctx.attempts_used += 1;
+
+        let credit_use = match quota_state(&state.get(&chosen), now) {
+            QuotaState::OnCredits { .. } => consent,
+            _ => None,
+        };
+        if let Some(cu) = credit_use {
+            log_event("on_credits", &chosen, &format!("running on workspace credits ({})", cu.describe()));
+        }
 
         // Eager state update: write last_used before spawning so a future
         // pick (after retry) doesn't reselect the same seat by accident.
@@ -183,24 +592,24 @@ where
         state.active_seat = Some(chosen.clone());
         state.save()?;
 
-        let attempt = attempt(args, prompt, &mode, true)?;
+        let attempt_result = attempt(args, prompt, mode, true)?;
         // Codex may have refreshed the OAuth token during the run; persist
         // it into the side store so the next swap doesn't install stale
         // credentials.
         persist_refresh(&cfg, &chosen);
 
-        let kind = classify_attempt(&attempt);
+        let kind = classify_attempt(&attempt_result);
         match kind {
-            FailureKind::Other if attempt.exit_code == 0 && attempt.output.errors.is_empty() => {
+            FailureKind::Other if attempt_result.exit_code == 0 && attempt_result.output.errors.is_empty() => {
                 let entry = state.entry_mut(&chosen);
                 entry.consecutive_failures = 0;
                 entry.cooldown_until = None;
                 entry.cooldown_reason = None;
                 state.save()?;
-                print_attempt(&attempt);
-                print_seat_line(&cfg, &state, &chosen, override_seat.as_deref(), &exhausted_so_far, None);
-                print_seat_notice(&cfg, &state);
-                return Ok(attempt.exit_code);
+                print_attempt(&attempt_result);
+                print_seat_line(&cfg, &state, &chosen, override_seat, &ctx.exhausted_so_far, None, credit_use);
+                print_seat_notice(&cfg, &state, this_run);
+                return Ok(Step::Done(attempt_result.exit_code));
             }
             FailureKind::AuthError => {
                 let entry = state.entry_mut(&chosen);
@@ -209,23 +618,24 @@ where
                 log_event(
                     "auth_error",
                     &chosen,
-                    &format!("marked needs_login; {}", failure_excerpt(&attempt)),
+                    &format!("marked needs_login; {}", failure_excerpt(&attempt_result)),
                 );
                 eprintln!(
                     "Seat '{}' has invalid credentials. Run: codex-clean seat login {}",
                     chosen, chosen
                 );
-                print_attempt(&attempt);
+                print_attempt(&attempt_result);
                 print_seat_line(
                     &cfg,
                     &state,
                     &chosen,
-                    override_seat.as_deref(),
-                    &exhausted_so_far,
+                    override_seat,
+                    &ctx.exhausted_so_far,
                     Some("auth failed; needs login"),
+                    credit_use,
                 );
-                print_seat_notice(&cfg, &state);
-                return Ok(attempt.exit_code);
+                print_seat_notice(&cfg, &state, this_run);
+                return Ok(Step::Done(attempt_result.exit_code));
             }
             FailureKind::RateLimit { recovery, reason } => {
                 let cd = ratelimit::apply_recovery_window(
@@ -240,18 +650,22 @@ where
                     cfg.rotation.cooldown_max_seconds,
                     cfg.rotation.cooldown_jitter_seconds,
                 );
-                // Personal windows are per user: cool this seat only. Credits
-                // and spend caps are per *workspace*: every seat sharing this
-                // seat's account_id is equally blocked, so cool them together
-                // rather than burning an attempt discovering it.
+                // Personal limits cool this seat only. Credits and spend caps
+                // are per *workspace*: every seat sharing this seat's
+                // account_id is equally blocked, so cool them together rather
+                // than burning an attempt discovering it.
                 let affected = affected_seats(&cfg, &chosen, reason);
-                // Extend-only: a sibling already cooling for longer keeps its
-                // later deadline (and its own reason).
-                let _changed = cool_seats(&mut state, &affected, cd, reason.as_str(), Utc::now());
+                cool_seats(&mut state, &affected, cd, reason, Utc::now());
                 let entry = state.entry_mut(&chosen);
                 entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
                 state.save()?;
-                let until = cd.with_timezone(&Local).format("%a %H:%M").to_string();
+                let until = state
+                    .get(&chosen)
+                    .cooldown_until
+                    .unwrap_or(cd)
+                    .with_timezone(&Local)
+                    .format("%a %H:%M")
+                    .to_string();
                 if affected.len() > 1 {
                     eprintln!(
                         "Seat '{}' exhausted ({}); this applies to the whole workspace, so seats {} are all cooling until {}.",
@@ -271,31 +685,37 @@ where
                         reason,
                         cd.to_rfc3339(),
                         affected.join(","),
-                        failure_excerpt(&attempt)
+                        failure_excerpt(&attempt_result)
                     ),
                 );
-                last_failure = Some(attempt);
                 let reason_str = reason.to_string();
-                last_failure_ctx = Some((chosen.clone(), reason_str.clone(), exhausted_so_far.clone()));
-                exhausted_so_far.push((chosen.clone(), reason_str));
+                ctx.last_failed_seat = Some(FailedSeat {
+                    seat: chosen.clone(),
+                    reason: reason_str.clone(),
+                    before: ctx.exhausted_so_far.clone(),
+                    credit_use,
+                });
+                ctx.last_failure = Some(attempt_result);
+                ctx.exhausted_so_far.push((chosen.clone(), reason_str));
                 if override_seat.is_some() {
                     break;
                 }
                 continue;
             }
             FailureKind::Other => {
-                let _ = log_unmatched(&chosen, &attempt);
-                print_attempt(&attempt);
+                let _ = log_unmatched(&chosen, &attempt_result);
+                print_attempt(&attempt_result);
                 print_seat_line(
                     &cfg,
                     &state,
                     &chosen,
-                    override_seat.as_deref(),
-                    &exhausted_so_far,
+                    override_seat,
+                    &ctx.exhausted_so_far,
                     Some("run failed"),
+                    credit_use,
                 );
-                print_seat_notice(&cfg, &state);
-                return Ok(attempt.exit_code);
+                print_seat_notice(&cfg, &state, this_run);
+                return Ok(Step::Done(attempt_result.exit_code));
             }
         }
     }
@@ -305,34 +725,94 @@ where
     // ineligible right now, that is EX_TEMPFAIL — the same situation the
     // up-front check reports — regardless of how short the cooldowns are.
     // A pinned seat keeps the child's exit code (README contract).
-    match last_failure {
+    let this_run = ctx.credits_this_run.clone();
+    let this_run = this_run.as_slice();
+    match ctx.last_failure.take() {
         Some(prev) => {
             let now = Utc::now();
             let all_blocked = override_seat.is_none()
                 && cfg.seats.iter().all(|s| {
-                    tried_seats.contains(&s.name) || !state.get(&s.name).is_eligible(now)
+                    ctx.tried_seats.contains(&s.name) || !state.get(&s.name).is_eligible(now)
                 });
             if all_blocked {
                 let code = report_all_blocked(&seat::all_blocked_error(&cfg, &state));
                 print_attempt(&prev);
-                print_failed_seat_line(&cfg, &state, override_seat.as_deref(), &last_failure_ctx);
-                print_seat_notice(&cfg, &state);
-                return Ok(code);
+                print_failed_seat_line(&cfg, &state, override_seat, &ctx.last_failed_seat);
+                print_seat_notice(&cfg, &state, this_run);
+                return Ok(Step::Done(code));
             }
             print_attempt(&prev);
-            print_failed_seat_line(&cfg, &state, override_seat.as_deref(), &last_failure_ctx);
-            print_seat_notice(&cfg, &state);
-            Ok(prev.exit_code)
+            print_failed_seat_line(&cfg, &state, override_seat, &ctx.last_failed_seat);
+            print_seat_notice(&cfg, &state, this_run);
+            Ok(Step::Done(prev.exit_code))
         }
-        None => Ok(1),
+        None => Ok(Step::Done(1)),
     }
+}
+
+fn pick_now(
+    cfg: &SeatConfig,
+    state: &SeatState,
+    override_seat: Option<&str>,
+    tried: &[String],
+    this_run: &[String],
+) -> Result<String, SeatPickError> {
+    let now = Utc::now();
+    let credits_for = |s: &str| consent_for(cfg, state, s, this_run, now).is_some();
+    seat::pick_seat_excluding(cfg, state, override_seat, now, tried, &credits_for)
+}
+
+/// Last used-% at or above which a stale reading is re-checked before a run
+/// that has no credit consent.
+const PRERUN_CHECK_PERCENT: u32 = 80;
+
+fn needs_prerun_check(cfg: &SeatConfig, st: &seat::SeatRuntimeState, now: DateTime<Utc>) -> bool {
+    let probe = chrono::Duration::seconds(cfg.rotation.blocked_probe_seconds as i64);
+    if st.usage_checked_at.is_some_and(|t| now - t < probe) {
+        return false; // checked (successfully or not) very recently
+    }
+    match &st.usage {
+        None => true,
+        Some(u) => now - u.fetched_at > probe && st.usage_score().unwrap_or(0) >= PRERUN_CHECK_PERCENT,
+    }
+}
+
+/// When every seat (or the pinned seat) is cooling, re-check the seats whose
+/// cooldowns purchased credits could lift, at most once per
+/// `blocked_probe_seconds` per seat. Returns true when anything was fetched.
+fn probe_blocked_seats(
+    cfg: &SeatConfig,
+    state: &mut SeatState,
+    client: &dyn UsageClient,
+    override_seat: Option<&str>,
+) -> bool {
+    let now = Utc::now();
+    let probe = chrono::Duration::seconds(cfg.rotation.blocked_probe_seconds as i64);
+    let candidates: Vec<seat::SeatEntry> = cfg
+        .seats
+        .iter()
+        .filter(|s| override_seat.is_none_or(|o| o == s.name))
+        .filter(|s| {
+            let st = state.get(&s.name);
+            let cooling = st.cooldown_until.is_some_and(|u| u > now) && !st.needs_login;
+            let clearable = ratelimit::CooldownReason::parse(st.cooldown_reason.as_deref().unwrap_or(""))
+                .is_clearable_by_credits();
+            let recently_checked = st.usage_checked_at.is_some_and(|t| now - t < probe);
+            let fresh = st.usage.as_ref().is_some_and(|u| now - u.fetched_at < probe);
+            cooling && clearable && !recently_checked && !fresh
+        })
+        .cloned()
+        .collect();
+    if candidates.is_empty() {
+        return false;
+    }
+    fetch_and_reconcile(cfg, state, client, candidates, "all seats blocked");
+    true
 }
 
 /// For the `balanced` strategy: refresh the usage snapshot of every eligible
 /// seat whose snapshot is missing or older than `balance_refresh_seconds`,
-/// so the pick reflects real headroom. Costs one app-server round-trip per
-/// stale seat, so most runs pay nothing. Never fails the run: a seat whose
-/// fetch fails keeps its old snapshot (or none, which counts as unused).
+/// so the pick reflects real headroom. Never fails the run.
 fn refresh_stale_usage(cfg: &SeatConfig, state: &mut SeatState, client: &dyn UsageClient) {
     let now = Utc::now();
     let max_age = chrono::Duration::seconds(cfg.rotation.balance_refresh_seconds as i64);
@@ -348,43 +828,36 @@ fn refresh_stale_usage(cfg: &SeatConfig, state: &mut SeatState, client: &dyn Usa
     if stale.is_empty() {
         return;
     }
-    let names: Vec<&str> = stale.iter().map(|s| s.name.as_str()).collect();
-    eprintln!("Refreshing usage for seat(s) {} (balanced strategy).", names.join(", "));
+    fetch_and_reconcile(cfg, state, client, stale, "balanced strategy");
+}
 
-    // The fetch may rotate a seat's token in its slot. For the active seat,
-    // ~/.codex/auth.json must follow, or an early exit (all seats cooling)
-    // would leave the old refresh token in place and the next run would copy
-    // it back over the fresh slot.
+/// Fetch usage for `seats`, reconcile the snapshots into state (cooldowns,
+/// workspace propagation, credit clearing), mark seats whose tokens are
+/// rejected as `needs_login`, save, and keep `~/.codex/auth.json` in step if
+/// the active seat's token was rotated during the fetch. Never fails the run.
+fn fetch_and_reconcile(
+    cfg: &SeatConfig,
+    state: &mut SeatState,
+    client: &dyn UsageClient,
+    seats: Vec<seat::SeatEntry>,
+    why: &str,
+) {
+    let names: Vec<&str> = seats.iter().map(|s| s.name.as_str()).collect();
+    eprintln!("Refreshing usage for seat(s) {} ({}).", names.join(", "), why);
+
     let active = state.active_seat.clone();
     let active_slot_before = active
         .as_deref()
         .and_then(|a| seat::seat_auth_path(a).ok())
         .and_then(|p| std::fs::read(p).ok());
 
-    for (name, result) in usage::fetch_all(client, &stale) {
+    let now = Utc::now();
+    let mut fetched = Vec::new();
+    for (name, result) in usage::fetch_all(client, &seats) {
+        state.entry_mut(&name).usage_checked_at = Some(now);
         match result {
-            Ok(snap) => {
-                let verdict = usage::verdict(&snap);
-                let notices = usage::apply_snapshot(&name, state.entry_mut(&name), snap, &cfg.rotation, now);
-                if let usage::UsageVerdict::Exhausted { reason, .. } = verdict {
-                    if !reason.is_window_based() {
-                        if let Some(until) = state.get(&name).cooldown_until {
-                            let siblings: Vec<String> = workspace_siblings(cfg, &name)
-                                .into_iter()
-                                .filter(|n| *n != name)
-                                .collect();
-                            cool_seats(state, &siblings, until, reason.as_str(), now);
-                        }
-                    }
-                }
-                for n in notices {
-                    eprintln!("Note: {}", n);
-                    log_event("status", &name, &n);
-                }
-            }
+            Ok(snap) => fetched.push((name, snap)),
             Err(usage::UsageFetchError::AuthRequired) => {
-                // The seat's tokens are dead; do not let a zero score send
-                // the run straight into an auth failure with no fallback.
                 state.entry_mut(&name).needs_login = true;
                 log_event("auth_error", &name, "usage refresh rejected the seat's tokens; marked needs_login");
                 eprintln!(
@@ -394,6 +867,10 @@ fn refresh_stale_usage(cfg: &SeatConfig, state: &mut SeatState, client: &dyn Usa
             }
             Err(e) => eprintln!("Warning: could not refresh usage for seat '{}': {}", name, e),
         }
+    }
+    for (seat_name, notice) in usage::reconcile_snapshots(cfg, state, fetched, now) {
+        eprintln!("Note: {}", notice);
+        log_event("status", &seat_name, &notice);
     }
     if let Err(e) = state.save() {
         eprintln!("Warning: could not save refreshed usage: {:#}", e);
@@ -416,8 +893,8 @@ fn refresh_stale_usage(cfg: &SeatConfig, state: &mut SeatState, client: &dyn Usa
     }
 }
 
-/// Seats to cool for a failure on `chosen`: just it for a personal window
-/// limit; every seat in the same workspace for credits / spend caps.
+/// Seats to cool for a failure on `chosen`: just it for a personal limit;
+/// every seat in the same workspace for credits / spend caps.
 fn affected_seats(cfg: &SeatConfig, chosen: &str, reason: ratelimit::CooldownReason) -> Vec<String> {
     if reason.is_window_based() {
         vec![chosen.to_string()]
@@ -427,12 +904,14 @@ fn affected_seats(cfg: &SeatConfig, chosen: &str, reason: ratelimit::CooldownRea
 }
 
 /// Compose the `Seat:` line: which seat ran, under which strategy (or pin),
-/// its recorded usage and how old that reading is, which seats were
-/// exhausted earlier in this run, and the outcome if the run failed.
+/// its recorded usage and how old that reading is (and whether it ran on
+/// credits, with the consent that applied), which seats were exhausted
+/// earlier in this run, and the outcome if the run failed.
 ///
 ///   Seat: backup1 (balanced; usage 5h 48% wk 14%, as of 2m ago)
+///   Seat: main (balanced; usage 5h 0% wk 100%, on credits (this run), as of 1m ago)
 ///   Seat: backup1 (balanced; usage unknown; after main exhausted: rate_limit)
-///   Seat: main (pinned via CODEX_CLEAN_SEAT; usage 5h 18% wk 90%, as of 1m ago; exhausted: credits)
+#[allow(clippy::too_many_arguments)]
 pub fn seat_line(
     seat_name: &str,
     strategy: Strategy,
@@ -440,7 +919,8 @@ pub fn seat_line(
     usage_snapshot: Option<&seat::UsageSnapshot>,
     exhausted_before: &[(String, String)],
     outcome: Option<&str>,
-    now: chrono::DateTime<Utc>,
+    credit_use: Option<CreditUse>,
+    now: DateTime<Utc>,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     parts.push(if pinned {
@@ -448,13 +928,17 @@ pub fn seat_line(
     } else {
         strategy.to_string()
     });
+    let credits = credit_use
+        .map(|c| format!(", on credits ({})", c.describe()))
+        .unwrap_or_default();
     match usage_snapshot {
         Some(u) => parts.push(format!(
-            "usage {}, as of {} ago",
+            "usage {}{}, as of {} ago",
             usage::summarize_usage_short(u),
+            credits,
             usage::format_duration_short(now - u.fetched_at)
         )),
-        None => parts.push("usage unknown".to_string()),
+        None => parts.push(format!("usage unknown{}", credits)),
     }
     if !exhausted_before.is_empty() {
         let list: Vec<String> = exhausted_before
@@ -473,6 +957,7 @@ pub fn seat_line(
 /// are shared or retained where seat names should not appear).
 pub const NO_SEAT_LINE_ENV: &str = "CODEX_CLEAN_NO_SEAT_LINE";
 
+#[allow(clippy::too_many_arguments)]
 fn print_seat_line(
     cfg: &SeatConfig,
     state: &SeatState,
@@ -480,6 +965,7 @@ fn print_seat_line(
     override_seat: Option<&str>,
     exhausted_before: &[(String, String)],
     outcome: Option<&str>,
+    credit_use: Option<CreditUse>,
 ) {
     if env::var_os(NO_SEAT_LINE_ENV).is_some_and(|v| !v.is_empty()) {
         return;
@@ -494,6 +980,7 @@ fn print_seat_line(
             st.usage.as_ref(),
             exhausted_before,
             outcome,
+            credit_use,
             Utc::now(),
         )
     );
@@ -504,18 +991,20 @@ fn print_failed_seat_line(
     cfg: &SeatConfig,
     state: &SeatState,
     override_seat: Option<&str>,
-    ctx: &FailureCtx,
+    failed: &Option<FailedSeat>,
 ) {
-    if let Some((seat_name, reason, before)) = ctx {
-        let outcome = format!("exhausted: {}", reason);
-        print_seat_line(cfg, state, seat_name, override_seat, before, Some(&outcome));
+    if let Some(f) = failed {
+        let outcome = format!("exhausted: {}", f.reason);
+        print_seat_line(cfg, state, &f.seat, override_seat, &f.before, Some(&outcome), f.credit_use);
     }
 }
 
 /// The degraded-pool summary goes on **stdout**, after the normal output, on
 /// every multi-seat run. Background callers read stdout; stderr is discarded.
-fn print_seat_notice(cfg: &SeatConfig, state: &SeatState) {
-    if let Some(n) = seat_notice(cfg, state, Utc::now()) {
+fn print_seat_notice(cfg: &SeatConfig, state: &SeatState, this_run: &[String]) {
+    let now = Utc::now();
+    let credits_for = |s: &str| consent_for(cfg, state, s, this_run, now).is_some();
+    if let Some(n) = seat_notice(cfg, state, now, &credits_for) {
         println!();
         println!("{}", n);
     }
@@ -686,6 +1175,11 @@ pub fn attempt_codex(
         for var in SCRUB_ENV_VARS {
             cmd.env_remove(var);
         }
+    }
+    // Monetary consent is for this codex-clean invocation only; it must never
+    // reach codex or anything codex runs, even on the no-seats passthrough.
+    for var in seat::CONSENT_ENV_VARS {
+        cmd.env_remove(var);
     }
 
     let mut use_stdin_for_prompt = false;
@@ -875,16 +1369,16 @@ mod tests {
             spend_control_reached: None,
         };
         assert_eq!(
-            seat_line("backup1", Strategy::Balanced, false, Some(&snap), &[], None, now),
+            seat_line("backup1", Strategy::Balanced, false, Some(&snap), &[], None, None, now),
             "Seat: backup1 (balanced; usage 5h 48% wk 14%, as of 2m ago)"
         );
         let before = vec![("main".to_string(), "rate_limit".to_string())];
         assert_eq!(
-            seat_line("backup1", Strategy::LeastRecentlyUsed, false, None, &before, None, now),
+            seat_line("backup1", Strategy::LeastRecentlyUsed, false, None, &before, None, None, now),
             "Seat: backup1 (least-recently-used; usage unknown; after main exhausted: rate_limit)"
         );
         assert_eq!(
-            seat_line("main", Strategy::Balanced, true, Some(&snap), &[], Some("exhausted: credits"), now),
+            seat_line("main", Strategy::Balanced, true, Some(&snap), &[], Some("exhausted: credits"), None, now),
             "Seat: main (pinned via CODEX_CLEAN_SEAT; usage 5h 48% wk 14%, as of 2m ago; exhausted: credits)"
         );
     }

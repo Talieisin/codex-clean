@@ -130,11 +130,46 @@ codex-clean seat remove work
 
 | Message (codex 0.153.x wording) | Recorded reason | Scope | Cooldown |
 |---|---|---|---|
+| "You've hit your usage limit for <model> …" | `model_limit` | this seat | until the "try again at HH:MM" codex reports, else `default_cooldown_seconds` |
 | "You've hit your usage limit …", "Usage limit reached. You've reached your usage limit …" | `rate_limit` | this seat | until the "try again at HH:MM" codex reports, else `default_cooldown_seconds` |
 | "Your workspace is out of credits …", "You've reached your workspace credit limit" | `credits` | **every seat in the same workspace** | `default_cooldown_seconds` (top up and carry on) |
 | "You hit your spend cap set in your workspace …" | `spend_control` | **every seat in the same workspace** | `cooldown_max_seconds` (admin-set hard stop) |
 
 Codex sometimes delivers these sentences as the *final agent message* rather than an error event (the out-of-credits case does), so on a failed run the last agent message is classified too. Credits and spend caps are workspace-wide (typically the `premium` credit pool for premium models), so seats sharing an `account_id` are cooled together instead of rotating into the same wall. Transient per-minute 429s are left to codex's own retries and are not treated as exhaustion.
+
+**Cooldown rules.** Every cooldown goes through one merge rule. Seeing the same limit again never pushes an existing cooldown later, so repeated `seat status` checks cannot slide it forward. A different reason keeps the later deadline and records the stronger reason (`spend_control` > `model_limit` > `credits` > `rate_limit`), so a hard stop is never hidden behind a weaker one. A fresh usage snapshot counts as the check: once a cooldown expires, a snapshot that still shows the seat exhausted (and no credits) starts a new one without needing a failed run.
+
+**Workspace credits.** On Team and similar plans, usage past a seat's included quota (its 5-hour or weekly window at 100%) is billed to workspace credits once they have been bought. `codex-clean` treats such a seat as *on credits*: usable, but only with your consent. `rotation.credits` in `seats.toml` (or `codex-clean seat credits …`) controls this:
+
+| Mode | In a terminal | In the background (no TTY, e.g. an agent) |
+|---|---|---|
+| `ask` (default) | prompts: wait, use credits for this run, until quota resets, or always | does not spend; prints the `Seats:` consent warning; exits **77** |
+| `never` | no prompt; does not spend | does not spend; exits **77** |
+| `always` | spends automatically once every seat's included quota is used up | same |
+
+The prompt looks like this (it runs with the lock released, so other runs are not blocked while you decide):
+
+```
+Included quota is used up: main (weekly resets Thu 08:09), backup1 (weekly resets Sun 23:40).
+Workspace credits are available. (A run that starts on included quota can still finish on credits.)
+  [w] wait for quota (exit 77)   [o] use credits for this run
+  [u] use credits until quota resets   [a] always use credits
+Choice [w]:
+```
+
+Anything other than `o`, `u` or `a` (including just Enter) means wait. Consent can also be given without a prompt: `CODEX_CLEAN_USE_CREDITS=1` (exactly `1`) for one invocation, or `codex-clean seat credits allow` to allow each workspace whose quota is used up until its quota resets (recorded in `state.json`, expires by itself; `seat credits revoke` removes it). Both work in `never` mode too, as explicit consent. Grants are per workspace: allowing one workspace never lets another spend. Seats still inside their included quota are always used before any seat on credits, whatever the strategy; a seat pinned with `CODEX_CLEAN_SEAT` never rotates, and runs on credits only with consent.
+
+Credits that were bought after seats started cooling are picked up automatically. When every seat (or the pinned seat) is cooling for a reason credits can lift, the next run re-checks those seats' usage first (at most once per `rotation.blocked_probe_seconds`, default 300). A seat whose tokens are rejected during that check is marked as needing login.
+
+**What "no credits without consent" can promise.** codex bills credits automatically and reports no quota while a run is in progress, so `codex-clean` can only promise never to *knowingly start* a run on credits, based on the latest usage reading. A run that starts inside the allowance can finish on credits. To narrow that window, a seat with no reading, or with a reading at 80% or more that is older than `blocked_probe_seconds`, is re-checked before a run without consent. A check that fails lets the run proceed with a warning rather than blocking all work.
+
+**Under Claude Code or another agent.** There is no terminal to prompt on, so `ask` behaves like `never`. The run exits **77** (`EX_NOPERM`) and the last stdout line says consent is needed:
+
+```
+Seats: included quota used up on main (resets Thu 08:09), backup1 (resets Sun 23:40); workspace credits available but not spent (credits: ask) — needs the user's consent: re-run with CODEX_CLEAN_USE_CREDITS=1 (this run) or run `codex-clean seat credits allow` (until quota resets) — 0 of 2 usable
+```
+
+An agent should treat 77 as "ask the user", not as "retry later" (that is 75): relay the message, and on approval re-run with `CODEX_CLEAN_USE_CREDITS=1`, or run `codex-clean seat credits allow` once. `CODEX_CLEAN_NONINTERACTIVE=1` forces this non-interactive behaviour even in a terminal (useful for `$(…)` command substitution, which would otherwise prompt on your terminal).
 
 **Running in the background.** Anything a background caller (an agent, CI, a cron job) needs to act on is put on **stdout**, after the normal output, on every multi-seat run while the pool is degraded:
 
@@ -144,12 +179,14 @@ Seats: backup1 needs login (run: codex-clean seat login backup1); main cooling u
 
 It repeats on every run until fixed, so a caller that only reads stdout cannot miss it. Every significant event is also appended to `~/.config/codex-clean/seat-events.log` (limits hit and what codex said, auth failures, cooldowns and which seats they covered, orphaned blobs, logins, `seat use`) — `codex-clean seat events [--tail N]` prints the recent ones. Both this log and `unmatched.log` are written `0600`, cap every field they record, and roll over once to `<name>.1` at 1 MiB. Unlike `state.json`, the log survives `seat login` and `seat remove`, so "did it ever rotate?" has an answer. If no seat is eligible — at the start of a run, or after rotation has exhausted every seat within one run — the exit status is 75 (`EX_TEMPFAIL`) so callers can branch on it. If every seat needs a login (nothing will recover by waiting) the exit status is 1 instead. With two healthy seats the default LRU strategy alternates between them, which looks the same as round-robin.
 
-**Checking quota (`seat status`).** `codex exec` never reports quota, so `seat status` asks codex's own app-server instead: for each seat it copies the seat's auth blob into a private scratch `CODEX_HOME` under `seats/<name>.status-<pid>/`, runs `codex app-server` there with a minimal allow-listed environment, calls `account/rateLimits/read` over JSON-RPC, tears the child down, copies any token refresh back into the seat's slot, and deletes the scratch directory. The snapshot (plan, per-window used %, reset times) is recorded in `state.json`, so `seat list` can show it offline. A seat reporting a window at 100% (or a backend "limit reached" / spend-cap flag on the main `codex` limit) is marked cooling until its reset time, so the next run skips it even if the text match never fired. A flag on a secondary limit (such as the `premium` credit pool) is reported as a warning only, because it affects just the models metered by that limit. A healthy reading never clears an existing cooldown or `needs_login` (those came from a real failure); `--clear-cooldown <name>` does that explicitly. `seat status` refuses to run while another `codex-clean` holds the lock (use `seat list` for the cached snapshot) and keeps `~/.codex/auth.json` in sync with the active seat if the app-server rotated its token. Requires codex 0.153 or newer; a concurrently running plain `codex` session is not supported while `seat status` runs.
+**Checking quota (`seat status`).** The table has a `CREDITS` column (`yes`, `yes (<balance>)`, `unlimited`, `none`) and the status shows `quota used; credits not in use (ask)` or `ready (on credits)` for a seat whose included quota is used up; the first notice line states the credits mode and any active grant. `codex exec` never reports quota, so `seat status` asks codex's own app-server instead: for each seat it copies the seat's auth blob into a private scratch `CODEX_HOME` under `seats/<name>.status-<pid>/`, runs `codex app-server` there with a minimal allow-listed environment, calls `account/rateLimits/read` over JSON-RPC, tears the child down, copies any token refresh back into the seat's slot, and deletes the scratch directory. The snapshot (plan, per-window used %, reset times) is recorded in `state.json`, so `seat list` can show it offline. A seat reporting a window at 100% with no credits available (or a backend "limit reached" / spend-cap flag on the main `codex` limit) is marked cooling until its reset time, so the next run skips it even if the text match never fired. With credits available it is marked *on credits* instead, and cooldowns that credits make moot (`rate_limit`, `credits`) are cleared across the workspace; a reading from any seat in a workspace that shows a hard block (spend cap, credits depleted) wins over another seat's reading showing credits. A flag on a secondary limit (such as the `premium` credit pool) is reported as a warning only, because it affects just the models metered by that limit. Apart from the credits case above, a healthy reading never clears an existing cooldown, and it never clears `needs_login`; `--clear-cooldown <name>` does that explicitly. A seat whose tokens the check rejects is marked as needing login. `seat status` refuses to run while another `codex-clean` holds the lock (use `seat list` for the cached snapshot) and keeps `~/.codex/auth.json` in sync with the active seat if the app-server rotated its token. Requires codex 0.153 or newer; a concurrently running plain `codex` session is not supported while `seat status` runs.
 
 ```
-NAME           LABEL              PLAN     5H                         WEEKLY                     STATUS
-main           Main work account  team     12% · in 3h12m (Mon 03:00)  64% · in 2d5h (Wed 09:48)  ready (active)
-backup1        Backup work acco…  team     0% · -                      3% · in 6d1h (Sat 01:00)   ready
+NAME           LABEL              PLAN     5H                           WEEKLY                       CREDITS        STATUS
+main           Main work account  team     0% · in 3h6m (Fri 23:42)     100% · in 3d11h (Tue 08:04)  yes            quota used; credits not in use (ask)
+backup1        Backup work accou… team     27% · in 1h16m (Mon 04:40)   4% · in 6d20h (Sun 23:40)    yes            ready
+
+• credits: ask (no active grant)
 ```
 
 **Safety.** Auth files are written `0600` and seat directories `0700` on Unix; writes are atomic (temp file + rename + parent fsync); concurrent codex-clean invocations serialise via `~/.config/codex-clean/codex.lock`. Every copy of an auth blob into a seat's slot is identity-guarded: the blob's workspace `account_id` *and* user id (`chatgpt_user_id` from the id token) must match the seat's recorded identity. Two seats in the same Team workspace share an `account_id`, so the user id is what stops one colleague's login being filed under another's seat. A blob that fails the guard (or cannot be verified, or is not parseable) is never written to the slot and never destroyed either — it is parked under `~/.config/codex-clean/orphaned/` before anything overwrites it. Re-authenticating the active seat with `seat login` also updates `~/.codex/auth.json`, so the two copies never drift apart. `seat login` applies the same check and refuses to overwrite on a mismatch. Login and status flows run codex against an isolated scratch `CODEX_HOME` so a Ctrl-C never leaves `~/.codex/auth.json` half-replaced; scratch directories older than an hour are swept up on the next `seat add` / `seat login` / `seat status`.
@@ -191,7 +228,7 @@ Seat: backup1 (balanced; usage 5h 48% wk 14%, as of 2m ago)
 
 - **Session ID** is displayed first for easy copying/resuming
 - **`Seat:` line** (multi-seat only) — the last line of the normal output (after `Tokens:` when codex reported usage; a run that failed before reporting usage has no `Tokens:` line, so anchor on the `Seat:` prefix rather than on position). It names the seat that ran, the strategy (or `pinned via CODEX_CLEAN_SEAT`), that seat's last recorded usage and its age, any seats exhausted earlier in the same run, and the outcome if the run failed, e.g. `Seat: backup1 (balanced; usage 5h 48% wk 14%, as of 2m ago)`. Seat names and quota percentages therefore reach any log that captures stdout; set `CODEX_CLEAN_NO_SEAT_LINE=1` to suppress the line
-- **`Seats:` trailer** (multi-seat only) — one extra paragraph after `Tokens:` whenever a seat needs login or is cooling; absent when every seat is usable. Parsers should treat any trailing paragraph beginning `Seats:` as status, not agent output
+- **`Seats:` trailer** (multi-seat only) — one extra paragraph after `Tokens:` whenever a seat needs login, is cooling, or has used its included quota while credits are available but not allowed (then it states that the user's consent is needed); absent when every seat is usable. Parsers should treat any trailing paragraph beginning `Seats:` as status, not agent output
 - **Stderr is suppressed** on success (no thinking tokens cluttering output)
 - **Stderr is shown** on failure to aid debugging
 - **Agent messages** are aggregated with newline separators
@@ -232,6 +269,7 @@ codex-clean seat add <NAME> [--label LABEL] [--import] [--browser]
 codex-clean seat list
 codex-clean seat status [NAME] [--json] [--clear-cooldown NAME]
 codex-clean seat strategy [NAME [SEAT]]
+codex-clean seat credits [ask|never|always|allow|revoke]
 codex-clean seat events [--tail N]
 codex-clean seat login <NAME> [--browser]
 codex-clean seat use <NAME>
@@ -254,6 +292,7 @@ codex-clean seat remove <NAME> [--yes]
 | `seat list` | Table of seats with last-used / last recorded usage / status. Offline |
 | `seat status [name]` | Query live quota per seat via `codex app-server`, print it, record it in `state.json`, and cool any exhausted seat. `--json` for machine-readable output; `--clear-cooldown <name>` removes a recorded cooldown. Exits 1 if every fetch failed or another codex-clean run holds the lock |
 | `seat strategy [name [seat]]` | Show the rotation strategy, or set it: `least-recently-used`/`lru`, `round-robin`/`rr`, `fixed <seat>`, `balanced` |
+| `seat credits [action]` | Show the credits mode, grants and each seat's credit and quota state; set the mode (`ask`, `never`, `always`); `allow` grants every workspace whose quota is used up until its quota resets; `revoke` removes all grants |
 | `seat events [--tail N]` | Print the last N entries (default 20) of `seat-events.log` |
 | `seat login <name>` | Re-authenticate a seat. The new login's workspace and user identity are verified against the stored values and a mismatch refuses to overwrite |
 | `seat use <name>` | Pre-position `~/.codex/auth.json` to this seat's blob and record it as active. Does not disable rotation for subsequent `codex-clean` runs (use `CODEX_CLEAN_SEAT` for that) |
@@ -266,6 +305,8 @@ codex-clean seat remove <NAME> [--yes]
 | `CODEX_CLEAN_SEAT` | Pin a specific seat for this invocation (bypasses rotation; errors if the seat is cooling or `needs_login`) |
 | `CODEX_HOME` | Honoured as codex's home directory (default `~/.codex`) — used both as the swap target and by codex itself |
 | `CODEX_CLEAN_HOME` | Override the side-store location (default `~/.config/codex-clean`); used by integration tests |
+| `CODEX_CLEAN_USE_CREDITS` | Exactly `1`: consent to spend workspace credits for this invocation (any other value is ignored). Never passed on to codex |
+| `CODEX_CLEAN_NONINTERACTIVE` | Exactly `1`: never show the credits prompt, even in a terminal |
 | `CODEX_CLEAN_NO_SEAT_LINE` | Any non-empty value suppresses the `Seat:` output line (the `Seats:` warning trailer is never suppressed) |
 
 ### Exit codes
@@ -275,6 +316,7 @@ codex-clean seat remove <NAME> [--yes]
 | `0` | Success |
 | `1` | Codex error (rate-limit on a pinned seat, auth error, or any other non-zero codex exit); also when every seat needs a login |
 | `75` | All seats cooling (`EX_TEMPFAIL`), whether detected up front or after rotation exhausted every seat within the run — try again after the soonest cooldown expiry |
+| `77` | Included quota is used up and only workspace credits remain, without consent (`EX_NOPERM`) — ask the user, then re-run with `CODEX_CLEAN_USE_CREDITS=1` or run `codex-clean seat credits allow` |
 
 ## Features
 

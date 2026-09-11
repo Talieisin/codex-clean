@@ -7,12 +7,13 @@
 use chrono::{DateTime, Duration, Local, NaiveDateTime, NaiveTime, TimeZone, Utc};
 
 /// Why a seat is being cooled. Recorded in `state.json` as a string and used
-/// to pick the cooldown policy: window-based limits reset on their own, the
-/// other two need purchase/admin action so we back off for the maximum.
+/// to pick the cooldown policy and its scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CooldownReason {
     /// A metered usage window (5-hour / weekly) is exhausted.
     RateLimit,
+    /// A per-model usage cap ("usage limit for gpt-5.5") was hit.
+    ModelLimit,
     /// The workspace has run out of credits.
     Credits,
     /// A workspace spend cap was hit.
@@ -23,15 +24,46 @@ impl CooldownReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::RateLimit => "rate_limit",
+            Self::ModelLimit => "model_limit",
             Self::Credits => "credits",
             Self::SpendControl => "spend_control",
         }
     }
 
-    /// Window-based limits come back on a schedule codex tells us about;
-    /// everything else needs a human, so we wait the maximum.
+    /// Parse a reason recorded in `state.json`. Unknown strings (from a
+    /// newer build) are treated as the weakest reason, `rate_limit`.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "model_limit" => Self::ModelLimit,
+            "credits" => Self::Credits,
+            "spend_control" => Self::SpendControl,
+            _ => Self::RateLimit,
+        }
+    }
+
+    /// Personal limits (the seat's own windows, or a per-model cap) cool only
+    /// the seat that hit them; credits and spend caps are workspace-wide.
     pub fn is_window_based(self) -> bool {
-        matches!(self, Self::RateLimit)
+        matches!(self, Self::RateLimit | Self::ModelLimit)
+    }
+
+    /// Cooldowns that newly available workspace credits make moot: the seat's
+    /// included quota, or the workspace having had no credits. A per-model cap
+    /// and an admin spend cap are not lifted by buying credits.
+    pub fn is_clearable_by_credits(self) -> bool {
+        matches!(self, Self::RateLimit | Self::Credits)
+    }
+
+    /// Precedence when two reasons compete for one seat's cooldown: the less
+    /// clearable reason wins, so a newly seen hard blocker is never hidden
+    /// behind an older, weaker one.
+    pub fn strength(self) -> u8 {
+        match self {
+            Self::RateLimit => 0,
+            Self::Credits => 1,
+            Self::ModelLimit => 2,
+            Self::SpendControl => 3,
+        }
     }
 }
 
@@ -96,8 +128,11 @@ const RATE_LIMIT_PHRASES: &[(&str, CooldownReason)] = &[
     ("you're out of credits", CooldownReason::Credits),
     // "You've reached your workspace credit limit"
     ("reached your workspace credit limit", CooldownReason::Credits),
-    // Personal caps, every plan variant ("…for gpt-5…", "…send a request to
-    // your admin…", "…Upgrade to Pro…").
+    // Per-model cap: "You've hit your usage limit for gpt-5.5. Try again at …".
+    // Must precede the generic phrase below, which it contains.
+    ("you've hit your usage limit for ", CooldownReason::ModelLimit),
+    // Personal caps, every plan variant ("…send a request to your admin…",
+    // "…Upgrade to Pro…").
     ("you've hit your usage limit", CooldownReason::RateLimit),
     // "Usage limit reached. You've reached your usage limit. Increase your limits…"
     ("you've reached your usage limit", CooldownReason::RateLimit),
@@ -111,10 +146,26 @@ fn rate_limit_reason(s: &str) -> Option<CooldownReason> {
         .map(|(_, reason)| *reason)
 }
 
-fn is_auth_error(s: &str) -> bool {
-    s.contains("refresh token has expired")
-        || s.contains("refresh_token_expired")
-        || s.contains("refresh_token_reused")
+/// Login-failure wordings: codex 0.153.4's refresh failures ("Your access
+/// token could not be refreshed[ because your refresh token has expired / was
+/// already used / was revoked / you have since logged out…]"), the backend's
+/// "Encountered invalidated oauth token", and the error codes. Compared
+/// case-insensitively. A bare "401 Unauthorized" is deliberately not here: a
+/// proxy can return that, and re-logging in would not fix it.
+const AUTH_ERROR_PHRASES: &[&str] = &[
+    "your access token could not be refreshed",
+    "refresh token has expired",
+    "refresh token was already used",
+    "refresh token was revoked",
+    "invalidated oauth token",
+    "refresh_token_expired",
+    "refresh_token_reused",
+    "refresh_token_invalidated",
+];
+
+pub(crate) fn is_auth_error(s: &str) -> bool {
+    let lower = s.to_lowercase();
+    AUTH_ERROR_PHRASES.iter().any(|p| lower.contains(p))
 }
 
 /// Find a `(try) again at <time>` clause and resolve it to a local timestamp.
@@ -193,7 +244,9 @@ pub fn default_cooldown_for(
     max_seconds: u64,
 ) -> u64 {
     match reason {
-        CooldownReason::RateLimit | CooldownReason::Credits => default_seconds,
+        CooldownReason::RateLimit | CooldownReason::ModelLimit | CooldownReason::Credits => {
+            default_seconds
+        }
         CooldownReason::SpendControl => max_seconds,
     }
 }
@@ -258,10 +311,50 @@ mod tests {
     fn rate_limit_detected_per_model_variant() {
         // "You've hit your usage limit for gpt-5.5. Try again at 5:32 PM."
         let msg = "You've hit your usage limit for gpt-5.5. Try again at 5:32 PM.";
+        match classify_text(msg) {
+            FailureKind::RateLimit { reason, recovery } => {
+                assert_eq!(reason, CooldownReason::ModelLimit);
+                assert!(recovery.is_some(), "recovery time still parsed");
+            }
+            other => panic!("expected ModelLimit, got {:?}", other),
+        }
+        // The generic personal cap is still RateLimit.
         assert!(matches!(
-            classify_text(msg),
+            classify_text("You've hit your usage limit. Try again later."),
             FailureKind::RateLimit { reason: CooldownReason::RateLimit, .. }
         ));
+    }
+
+    #[test]
+    fn auth_errors_cover_every_codex_refresh_failure_wording() {
+        for msg in [
+            "Your access token could not be refreshed because your refresh token has expired. Please log out and sign in again.",
+            "Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.",
+            "Your access token could not be refreshed because your refresh token was revoked.",
+            "Your access token could not be refreshed because you have since logged out or signed in to another account.",
+            "Your access token could not be refreshed.",
+            "GET https://chatgpt.com/backend-api/wham/usage failed: 401 Unauthorized; body={\"error\":{\"message\":\"Encountered invalidated oauth token\"}}",
+            "REFRESH_TOKEN_REUSED",
+        ] {
+            assert_eq!(classify_text(msg), FailureKind::AuthError, "{}", msg);
+        }
+        // A proxy 401 alone is not a login problem.
+        assert_eq!(classify_text("upstream proxy returned 401 Unauthorized"), FailureKind::Other);
+    }
+
+    #[test]
+    fn reason_strength_parse_and_clearability() {
+        use CooldownReason::*;
+        for r in [RateLimit, ModelLimit, Credits, SpendControl] {
+            assert_eq!(CooldownReason::parse(r.as_str()), r);
+        }
+        assert_eq!(CooldownReason::parse("something_new"), RateLimit);
+        assert!(SpendControl.strength() > ModelLimit.strength());
+        assert!(ModelLimit.strength() > Credits.strength());
+        assert!(Credits.strength() > RateLimit.strength());
+        assert!(RateLimit.is_clearable_by_credits() && Credits.is_clearable_by_credits());
+        assert!(!ModelLimit.is_clearable_by_credits() && !SpendControl.is_clearable_by_credits());
+        assert!(ModelLimit.is_window_based());
     }
 
     #[test]

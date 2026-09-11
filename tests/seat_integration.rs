@@ -2181,7 +2181,7 @@ fn prompt_answers_this_run_until_reset_always_and_wait() {
     assert_eq!(d2.calls.get(), 0, "an active grant needs no prompt");
     // After the grant expires the prompt/77 comes back.
     let mut st = env.load_state();
-    st.credit_grants.insert("ws-1".into(), chrono::Utc::now() - chrono::Duration::seconds(1));
+    st.credit_grants.insert("acct:ws-1".into(), chrono::Utc::now() - chrono::Duration::seconds(1));
     fs::write(env.clean_home_path.join("state.json"), serde_json::to_string(&st).unwrap()).unwrap();
     let attempt = |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
         panic!("expired grant must not authorise")
@@ -2702,8 +2702,8 @@ fn status_json_reports_credits_mode_grants_and_quota_state() {
     env.write_seat("a", "acc-a");
     env.save_config(&cfg_with_seats(&[("a", "acc-a")]));
     let mut st = SeatState::default();
-    st.credit_grants.insert("acc-a".into(), chrono::Utc::now() + chrono::Duration::hours(5));
-    st.credit_grants.insert("acc-expired".into(), chrono::Utc::now() - chrono::Duration::hours(1));
+    st.credit_grants.insert("acct:acc-a".into(), chrono::Utc::now() + chrono::Duration::hours(5));
+    st.credit_grants.insert("acct:acc-expired".into(), chrono::Utc::now() - chrono::Duration::hours(1));
     env.save_state(&st);
     let bin = tempfile::tempdir().unwrap();
     let canned = r#"{"id":2,"result":{"rateLimits":{"limitId":"codex","planType":"team","primary":{"usedPercent":3,"windowDurationMins":300,"resetsAt":4102444800},"secondary":{"usedPercent":100,"windowDurationMins":10080,"resetsAt":4102448400},"credits":{"hasCredits":true,"unlimited":false,"balance":"12.50"},"rateLimitReachedType":null,"spendControlReached":false}}}"#;
@@ -2730,4 +2730,42 @@ fn status_json_reports_credits_mode_grants_and_quota_state() {
     assert_eq!(seat0["quota_state"]["state"], "on_credits");
     assert!(seat0["quota_state"]["resets_at"].is_string());
     assert_eq!(seat0["usage"]["credits"]["balance"], "12.50");
+}
+
+
+#[test]
+fn this_run_consent_does_not_cover_a_workspace_changed_while_unlocked() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    setup_both_on_credits(&env, CreditPolicy::Ask);
+    /// Says "this run" to the first question (about ws-1) while re-registering
+    /// the seats under ws-OTHER, then "wait" to the follow-up about ws-OTHER.
+    struct ReAddThisRun {
+        calls: std::cell::Cell<u32>,
+    }
+    impl CreditDecider for ReAddThisRun {
+        fn decide(&self, seats: &[(String, Option<chrono::DateTime<chrono::Utc>>)]) -> CreditChoice {
+            self.calls.set(self.calls.get() + 1);
+            assert!(!seats.is_empty());
+            if self.calls.get() == 1 {
+                let _lock = seat::CodexLock::try_acquire().unwrap().expect("lock is free");
+                let mut cfg = SeatConfig::load().unwrap().unwrap();
+                for s in &mut cfg.seats {
+                    s.account_id = Some("ws-OTHER".into());
+                }
+                cfg.save().unwrap();
+                CreditChoice::ThisRun
+            } else {
+                CreditChoice::Wait
+            }
+        }
+    }
+    let d = ReAddThisRun { calls: std::cell::Cell::new(0) };
+    let attempt = |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
+        panic!("this-run consent was for ws-1, not ws-OTHER")
+    };
+    // Consent for ws-1 does not cover ws-OTHER: the re-entry asks again, the
+    // answer is wait, and the run stops at 77 without spending.
+    assert_eq!(run_deps(attempt, &d), EXIT_CREDITS_CONSENT_NEEDED);
+    assert_eq!(d.calls.get(), 2, "the new workspace was asked about separately");
 }

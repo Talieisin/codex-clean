@@ -352,7 +352,7 @@ pub fn list() -> Result<()> {
             &st,
             active.map(|a| a == seat.name).unwrap_or(false),
             now,
-            consent_for(&config, &state, &seat.name, false, now),
+            consent_for(&config, &state, &seat.name, &[], now),
             config.rotation.credits,
         );
         println!(
@@ -540,7 +540,7 @@ pub fn status_with(
             label: seat_entry.label.clone(),
             active: active.as_deref() == Some(seat_entry.name.as_str()),
             quota: quota_state(&st, now),
-            consent: consent_for(&config, &state, &seat_entry.name, false, now),
+            consent: consent_for(&config, &state, &seat_entry.name, &[], now),
             policy: config.rotation.credits,
             state: st,
             result,

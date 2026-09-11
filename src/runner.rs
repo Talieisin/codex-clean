@@ -119,22 +119,27 @@ impl CreditUse {
 }
 
 /// The consent (if any) this invocation has to spend credits on `seat`.
+///
+/// `this_run_workspaces` are the workspaces the user said "use credits for
+/// this run" about at the prompt. That consent covers only those workspaces,
+/// checked against the seat's *current* workspace, so a seat re-registered
+/// under another workspace while the question was open is not covered.
+/// `CODEX_CLEAN_USE_CREDITS=1` is invocation-wide by design.
 pub fn consent_for(
     cfg: &SeatConfig,
     state: &SeatState,
     seat_name: &str,
-    this_run: bool,
+    this_run_workspaces: &[String],
     now: DateTime<Utc>,
 ) -> Option<CreditUse> {
     if cfg.rotation.credits == CreditPolicy::Always {
         return Some(CreditUse::Always);
     }
-    if this_run || seat::env_use_credits() {
+    let workspace = seat::workspace_key(cfg, seat_name);
+    if seat::env_use_credits() || this_run_workspaces.contains(&workspace) {
         return Some(CreditUse::ThisRun);
     }
-    state
-        .active_grant(&seat::workspace_key(cfg, seat_name), now)
-        .map(CreditUse::Grant)
+    state.active_grant(&workspace, now).map(CreditUse::Grant)
 }
 
 /// The answer to "included quota is used up — wait or spend credits?".
@@ -232,8 +237,8 @@ struct RunCtx {
     last_failure: Option<AttemptResult>,
     last_failed_seat: Option<FailedSeat>,
     exhausted_so_far: Exhausted,
-    /// Consent given at the prompt for the rest of this invocation.
-    credits_this_run: bool,
+    /// Workspaces the user gave "use credits for this run" consent for.
+    credits_this_run: Vec<String>,
     balanced_refreshed: bool,
     blocked_probed: bool,
     prerun_checked: Vec<String>,
@@ -316,7 +321,11 @@ where
         let applied = match choice {
             CreditChoice::Wait => false,
             CreditChoice::ThisRun => {
-                ctx.credits_this_run = true;
+                for p in &prompted {
+                    if !ctx.credits_this_run.contains(&p.workspace) {
+                        ctx.credits_this_run.push(p.workspace.clone());
+                    }
+                }
                 true
             }
             CreditChoice::UntilReset => match grant_until_reset(&prompted) {
@@ -357,7 +366,7 @@ fn finish_waiting_for_quota(
     let cfg = SeatConfig::load()?.unwrap_or_default();
     let state = SeatState::load()?;
     let still_needs_consent = matches!(
-        pick_now(&cfg, &state, override_seat, &ctx.tried_seats, ctx.credits_this_run),
+        pick_now(&cfg, &state, override_seat, &ctx.tried_seats, &ctx.credits_this_run),
         Err(SeatPickError::QuotaUsedCreditsAvailable { .. })
     );
     let code = if still_needs_consent {
@@ -382,7 +391,7 @@ fn finish_waiting_for_quota(
         print_attempt(&prev);
         print_failed_seat_line(&cfg, &state, override_seat, &ctx.last_failed_seat);
     }
-    print_seat_notice(&cfg, &state, ctx.credits_this_run);
+    print_seat_notice(&cfg, &state, &ctx.credits_this_run);
     Ok(code)
 }
 
@@ -489,7 +498,8 @@ where
             state.save()?;
         }
 
-        let this_run = ctx.credits_this_run;
+        let this_run = ctx.credits_this_run.clone();
+        let this_run = this_run.as_slice();
         let mut pick = pick_now(&cfg, &state, override_seat, &ctx.tried_seats, this_run);
 
         // Everything cooling (or the pinned seat cooling) for reasons that
@@ -715,7 +725,8 @@ where
     // ineligible right now, that is EX_TEMPFAIL — the same situation the
     // up-front check reports — regardless of how short the cooldowns are.
     // A pinned seat keeps the child's exit code (README contract).
-    let this_run = ctx.credits_this_run;
+    let this_run = ctx.credits_this_run.clone();
+    let this_run = this_run.as_slice();
     match ctx.last_failure.take() {
         Some(prev) => {
             let now = Utc::now();
@@ -744,7 +755,7 @@ fn pick_now(
     state: &SeatState,
     override_seat: Option<&str>,
     tried: &[String],
-    this_run: bool,
+    this_run: &[String],
 ) -> Result<String, SeatPickError> {
     let now = Utc::now();
     let credits_for = |s: &str| consent_for(cfg, state, s, this_run, now).is_some();
@@ -990,7 +1001,7 @@ fn print_failed_seat_line(
 
 /// The degraded-pool summary goes on **stdout**, after the normal output, on
 /// every multi-seat run. Background callers read stdout; stderr is discarded.
-fn print_seat_notice(cfg: &SeatConfig, state: &SeatState, this_run: bool) {
+fn print_seat_notice(cfg: &SeatConfig, state: &SeatState, this_run: &[String]) {
     let now = Utc::now();
     let credits_for = |s: &str| consent_for(cfg, state, s, this_run, now).is_some();
     if let Some(n) = seat_notice(cfg, state, now, &credits_for) {

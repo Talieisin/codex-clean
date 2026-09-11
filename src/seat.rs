@@ -179,13 +179,16 @@ pub fn log_excerpt(s: &str, max: usize) -> String {
     }
 }
 
-/// The workspace key for `seat`: its `account_id`, or the seat's own name
-/// when none is recorded (a seat with no account id is its own workspace).
+/// The workspace key for `seat`: `acct:<account_id>`, or `seat:<name>` when
+/// no account id is recorded (a seat with no account id is its own
+/// workspace). The prefixes keep the two forms in separate key spaces, so a
+/// seat named `main` and a seat whose account id is `main` never share
+/// grants or cooldowns.
 pub fn workspace_key(config: &SeatConfig, seat: &str) -> String {
-    config
-        .find(seat)
-        .and_then(|s| s.account_id.clone())
-        .unwrap_or_else(|| seat.to_string())
+    match config.find(seat).and_then(|s| s.account_id.as_deref()) {
+        Some(acct) => format!("acct:{}", acct),
+        None => format!("seat:{}", seat),
+    }
 }
 
 /// Record "use credits until quota resets" grants for the workspaces of
@@ -2346,14 +2349,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(granted, vec![(vec!["a".to_string(), "b".to_string()], r2)], "earliest reset in the workspace");
-        assert_eq!(s.active_grant("ws1", now()), Some(r2));
-        assert_eq!(s.active_grant("ws2", now()), None, "other workspace not covered");
+        assert_eq!(s.active_grant("acct:ws1", now()), Some(r2));
+        assert_eq!(s.active_grant("acct:ws2", now()), None, "other workspace not covered");
         // Strictly before the deadline only.
-        assert_eq!(s.active_grant("ws1", r2), None);
+        assert_eq!(s.active_grant("acct:ws1", r2), None);
         // No known reset → refused.
         let mut s2 = SeatState::default();
         assert!(grant_credits_until_reset(&c, &mut s2, &[("x".into(), None)], now()).is_err());
         assert!(s2.credit_grants.is_empty());
+    }
+
+    #[test]
+    fn workspace_keys_are_namespaced_so_names_and_account_ids_never_collide() {
+        let mut c = cfg(&["main", "other"], Strategy::LeastRecentlyUsed);
+        c.seats[1].account_id = Some("main".into());
+        assert_eq!(workspace_key(&c, "main"), "seat:main");
+        assert_eq!(workspace_key(&c, "other"), "acct:main");
+        assert_ne!(workspace_key(&c, "main"), workspace_key(&c, "other"));
+        assert_eq!(workspace_siblings(&c, "main"), vec!["main"]);
+        assert_eq!(workspace_siblings(&c, "other"), vec!["other"]);
     }
 
     #[test]

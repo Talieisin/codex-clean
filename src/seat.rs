@@ -206,8 +206,9 @@ pub fn reset_eligible_seats(
             let cooling = st.cooldown_until.is_some_and(|u| u > now);
             let reason =
                 crate::ratelimit::CooldownReason::parse(st.cooldown_reason.as_deref().unwrap_or(""));
-            if cooling && !reason.is_window_based() {
-                return None; // credits / spend cap: a reset cannot lift it
+            if cooling && !reason.is_lifted_by_reset() {
+                // A per-model cap, credits or a spend cap all survive a reset.
+                return None;
             }
             let on_credits = matches!(
                 crate::usage::quota_state(&st, now),
@@ -263,7 +264,7 @@ pub fn sync_active_auth(seat: &str, slot_before: Option<Vec<u8>>) -> bool {
         }
         Err(e) => {
             eprintln!(
-                "Warning: could not update ~/.codex/auth.json with seat '{}''s refreshed token: {:#}",
+                "Warning: could not update ~/.codex/auth.json for seat '{}' after its token refreshed: {:#}",
                 seat, e
             );
             false

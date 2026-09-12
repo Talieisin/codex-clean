@@ -1181,7 +1181,7 @@ pub fn invalidate_after_reset(state: &mut SeatState, seat: &str, now: DateTime<U
     let reason = CooldownReason::parse(st.cooldown_reason.as_deref().unwrap_or(""));
     let entry = state.entry_mut(seat);
     entry.usage = None;
-    if entry.cooldown_until.is_some_and(|u| u > now) && reason.is_window_based() {
+    if entry.cooldown_until.is_some_and(|u| u > now) && reason.is_lifted_by_reset() {
         entry.cooldown_until = None;
         entry.cooldown_reason = None;
         return true;
@@ -1207,7 +1207,7 @@ pub fn clear_window_cooldown_after_reset(
         return false;
     }
     let reason = CooldownReason::parse(st.cooldown_reason.as_deref().unwrap_or(""));
-    if st.cooldown_until.is_none_or(|u| u <= now) || !reason.is_window_based() {
+    if st.cooldown_until.is_none_or(|u| u <= now) || !reason.is_lifted_by_reset() {
         return false;
     }
     let entry = state.entry_mut(seat);

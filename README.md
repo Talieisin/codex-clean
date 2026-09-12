@@ -169,7 +169,7 @@ Credits that were bought after seats started cooling are picked up automatically
 | `never` | does not redeem and does not mention resets (77/75 as before) |
 | `auto` | redeems one, re-reads usage, clears the cooldown and carries on (at most one per invocation) |
 
-A reset is only ever redeemed for a block it can actually lift: a seat that needs login, or is cooling because the workspace ran out of credits or hit a spend cap, is left alone so the grant is not wasted. `codex-clean seat reset [SEAT]` redeems one by hand; `seat reset --dry-run` lists the grants (id, title, expiry) without redeeming. `seat status` shows a `RESETS` column and `seat credits` lists them alongside credits.
+A reset is only ever redeemed for a block it can actually lift — the account's own usage windows. A seat that needs login, or is cooling because of a per-model cap, depleted workspace credits or a spend cap, is left alone so the grant is not wasted. The free option is also offered ahead of a run that *would* have proceeded on credits, so an available reset is used before money is. `codex-clean seat reset [SEAT]` redeems one by hand; `seat reset --dry-run` lists the grants (id, title, expiry) without redeeming. `seat status` shows a `RESETS` column and `seat credits` lists them alongside credits.
 
 **Exit-code precedence: 78 before 77 before 75.** The free option is offered before the paid one, and both before simply waiting. A headless caller should treat 78 as "ask the user whether to redeem a free reset", 77 as "ask whether to spend credits", and 75 as "retry later". The `Seats:` line names the seat, the expiry and the command:
 

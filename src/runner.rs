@@ -526,8 +526,14 @@ where
 
         // A free usage-limit reset beats both waiting and paying, so it is
         // decided here — under the lock, before the credits question — and
-        // only for blocks a reset can actually lift.
-        if cfg.rotation.resets != ResetPolicy::Never && pick_is_blocked(&pick) {
+        // only for blocks a reset can actually lift. This covers the run that
+        // *would* proceed on credits (consent already given): a free reset is
+        // still better than spending money, so it is offered first.
+        let would_pay = pick
+            .as_ref()
+            .ok()
+            .is_some_and(|n| matches!(quota_state(&state.get(n), Utc::now()), QuotaState::OnCredits { .. }));
+        if cfg.rotation.resets != ResetPolicy::Never && (pick_is_blocked(&pick) || would_pay) {
             match reset_candidates(&cfg, &state, override_seat, Utc::now()) {
                 candidates if candidates.is_empty() => {}
                 candidates => {

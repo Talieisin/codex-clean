@@ -1217,10 +1217,19 @@ pub fn reset_with(
             .find(n)
             .map(|s| s.name.clone())
             .ok_or_else(|| anyhow!("seat '{}' not found; run `codex-clean seat list`", n))?,
-        None => seat::pick_seat(&config, &state, None, now)
-            .ok()
-            .or_else(|| state.active_seat.clone())
-            .unwrap_or_else(|| config.seats[0].name.clone()),
+        None => {
+            // The seat a run would actually use: honour a pin, then prefer a
+            // seat a reset would unblock (the normal exit-78 case, where
+            // ordinary picking fails), then the seat a run would pick.
+            let pinned = std::env::var("CODEX_CLEAN_SEAT").ok().filter(|s| !s.is_empty());
+            let eligible = seat::reset_eligible_seats(&config, &state, now);
+            pinned
+                .filter(|p| config.find(p).is_some())
+                .or_else(|| eligible.first().map(|(n, _, _)| n.clone()))
+                .or_else(|| seat::pick_seat(&config, &state, None, now).ok())
+                .or_else(|| state.active_seat.clone())
+                .unwrap_or_else(|| config.seats[0].name.clone())
+        }
     };
     let entry = config.find(&seat_name).cloned().expect("seat exists");
 

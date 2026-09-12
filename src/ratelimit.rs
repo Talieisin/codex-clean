@@ -47,6 +47,13 @@ impl CooldownReason {
         matches!(self, Self::RateLimit | Self::ModelLimit)
     }
 
+    /// Does a free "Full reset (Weekly + 5 hr)" grant lift this block? Only
+    /// the account's own usage windows. A per-model cap, credits and a spend
+    /// cap all survive a reset, so redeeming for them would waste a grant.
+    pub fn is_lifted_by_reset(self) -> bool {
+        matches!(self, Self::RateLimit)
+    }
+
     /// Cooldowns that newly available workspace credits make moot: the seat's
     /// included quota, or the workspace having had no credits. A per-model cap
     /// and an admin spend cap are not lifted by buying credits.
@@ -355,6 +362,9 @@ mod tests {
         assert!(RateLimit.is_clearable_by_credits() && Credits.is_clearable_by_credits());
         assert!(!ModelLimit.is_clearable_by_credits() && !SpendControl.is_clearable_by_credits());
         assert!(ModelLimit.is_window_based());
+        assert!(RateLimit.is_lifted_by_reset());
+        assert!(!ModelLimit.is_lifted_by_reset(), "a weekly/5h reset does not lift a per-model cap");
+        assert!(!Credits.is_lifted_by_reset() && !SpendControl.is_lifted_by_reset());
     }
 
     #[test]

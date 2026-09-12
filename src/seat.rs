@@ -179,6 +179,48 @@ pub fn log_excerpt(s: &str, max: usize) -> String {
     }
 }
 
+/// Seats a free usage-limit reset could actually unblock right now.
+///
+/// Excludes seats that need login and seats cooling for a reason a reset does
+/// not lift (`credits`, `spend_control`): redeeming for those would spend a
+/// finite grant and change nothing. Ordered by soonest grant expiry, so the
+/// grant closest to expiring is offered first. Used by both the runner's
+/// auto-redeem and the `Seats:` notice, so the advice and the behaviour agree.
+pub fn reset_eligible_seats(
+    config: &SeatConfig,
+    state: &SeatState,
+    now: DateTime<Utc>,
+) -> Vec<(String, u32, Option<DateTime<Utc>>)> {
+    let mut out: Vec<(String, u32, Option<DateTime<Utc>>)> = config
+        .seats
+        .iter()
+        .filter_map(|s| {
+            let st = state.get(&s.name);
+            if st.needs_login {
+                return None;
+            }
+            let resets = st.usage.as_ref().and_then(|u| u.resets.as_ref())?;
+            if resets.available == 0 {
+                return None;
+            }
+            let cooling = st.cooldown_until.is_some_and(|u| u > now);
+            let reason =
+                crate::ratelimit::CooldownReason::parse(st.cooldown_reason.as_deref().unwrap_or(""));
+            if cooling && !reason.is_lifted_by_reset() {
+                // A per-model cap, credits or a spend cap all survive a reset.
+                return None;
+            }
+            let on_credits = matches!(
+                crate::usage::quota_state(&st, now),
+                crate::usage::QuotaState::OnCredits { .. }
+            );
+            (cooling || on_credits).then(|| (s.name.clone(), resets.available, resets.next_expires_at))
+        })
+        .collect();
+    out.sort_by_key(|(_, _, exp)| *exp);
+    out
+}
+
 /// The workspace key for `seat`: `acct:<account_id>`, or `seat:<name>` when
 /// no account id is recorded (a seat with no account id is its own
 /// workspace). The prefixes keep the two forms in separate key spaces, so a
@@ -189,6 +231,50 @@ pub fn workspace_key(config: &SeatConfig, seat: &str) -> String {
         Some(acct) => format!("acct:{}", acct),
         None => format!("seat:{}", seat),
     }
+}
+
+/// Keep `~/.codex/auth.json` in step with a seat's slot after an app-server
+/// call may have rotated its token: if the slot changed, copy it into the
+/// active auth file. Without this the next run's refresh-back would copy the
+/// older (identity-matching) global blob back over the refreshed slot and the
+/// seat would start failing with "refresh token was already used".
+///
+/// `slot_before` is the slot's contents captured before the operation.
+/// Returns true when the active auth file was updated. Never fatal.
+pub fn sync_active_auth(seat: &str, slot_before: Option<Vec<u8>>) -> bool {
+    // Only the recorded active seat owns ~/.codex/auth.json. Refreshing some
+    // other seat (e.g. `cost --seat backup`) must never install its
+    // credentials there, or a later plain `codex` would run as that account.
+    match SeatState::load() {
+        Ok(st) if st.active_seat.as_deref() == Some(seat) => {}
+        _ => return false,
+    }
+    let Ok(path) = seat_auth_path(seat) else { return false };
+    let after = fs::read(path).ok();
+    if after.is_none() || after == slot_before {
+        return false;
+    }
+    match swap_active_auth(seat) {
+        Ok(()) => {
+            eprintln!(
+                "Note: seat '{}' refreshed its token during the check; ~/.codex/auth.json updated.",
+                seat
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!(
+                "Warning: could not update ~/.codex/auth.json for seat '{}' after its token refreshed: {:#}",
+                seat, e
+            );
+            false
+        }
+    }
+}
+
+/// The slot bytes for `seat`, for a later [`sync_active_auth`].
+pub fn slot_snapshot(seat: &str) -> Option<Vec<u8>> {
+    seat_auth_path(seat).ok().and_then(|p| fs::read(p).ok())
 }
 
 /// Record "use credits until quota resets" grants for the workspaces of
@@ -375,6 +461,23 @@ pub fn seat_notice(
             usable += 1;
         }
     }
+    // A free reset beats spending credits, so it is mentioned first — and
+    // only for seats a reset would actually unblock (same rule the runner
+    // redeems by), so the advice never wastes a grant.
+    let resets = reset_eligible_seats(config, state, now);
+    if config.rotation.resets != ResetPolicy::Never && !resets.is_empty() {
+        let expiry = resets[0]
+            .2
+            .map(|e| format!(" (next expires {})", e.with_timezone(&chrono::Local).format("%a %d %b")))
+            .unwrap_or_default();
+        parts.push(format!(
+            "{} free usage-limit reset(s) available on {}{} — redeem with `codex-clean seat reset {}`",
+            resets[0].1,
+            resets.iter().map(|(n, _, _)| n.as_str()).collect::<Vec<_>>().join(", "),
+            expiry,
+            resets[0].0
+        ));
+    }
     if !unspent.is_empty() {
         parts.push(format!(
             "included quota used up on {}; workspace credits available but not spent (credits: {}) \
@@ -500,6 +603,15 @@ pub struct RotationConfig {
     /// is used up: `ask` (default), `never`, `always`.
     #[serde(default)]
     pub credits: CreditPolicy,
+    /// Whether a blocked run may redeem a free usage-limit reset: `ask`
+    /// (default: never redeems, but says one is available and exits 78),
+    /// `never` (stay quiet), `auto` (redeem one and carry on).
+    #[serde(default)]
+    pub resets: ResetPolicy,
+    /// Append an estimated credit cost to the `Seat:` line of every run. Off
+    /// by default: it costs one extra app-server round trip per run.
+    #[serde(default)]
+    pub show_session_cost: bool,
     /// When every seat is blocked, or a seat about to run is near its limit,
     /// a usage snapshot older than this is refreshed first.
     #[serde(default = "default_blocked_probe")]
@@ -604,6 +716,46 @@ impl std::fmt::Display for CreditPolicy {
     }
 }
 
+/// Whether a blocked run may redeem a free usage-limit reset.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResetPolicy {
+    /// Never redeem automatically, but report that a free reset is available
+    /// (exit 78) so the caller — or the user — can choose. The default: the
+    /// grants are finite and expire, so spending one is the user's call.
+    #[default]
+    Ask,
+    /// Do not redeem and do not mention resets.
+    Never,
+    /// Redeem one automatically when it would unblock the run.
+    Auto,
+}
+
+impl ResetPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Never => "never",
+            Self::Auto => "auto",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "ask" => Self::Ask,
+            "never" => Self::Never,
+            "auto" => Self::Auto,
+            _ => return None,
+        })
+    }
+}
+
+impl std::fmt::Display for ResetPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Per-invocation consent to spend credits: exactly `1`. Scrubbed from the
 /// codex child so it can never authorise a nested codex-clean.
 pub const USE_CREDITS_ENV: &str = "CODEX_CLEAN_USE_CREDITS";
@@ -629,6 +781,8 @@ impl Default for RotationConfig {
             fixed_seat: None,
             balance_refresh_seconds: default_balance_refresh(),
             credits: CreditPolicy::Ask,
+            resets: ResetPolicy::Ask,
+            show_session_cost: false,
             blocked_probe_seconds: default_blocked_probe(),
             default_cooldown_seconds: default_default_cooldown(),
             max_retries: default_max_retries(),
@@ -796,6 +950,13 @@ pub struct SeatRuntimeState {
     /// not), so automatic re-checks are rate-limited even when they fail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_checked_at: Option<DateTime<Utc>>,
+    /// Session (thread) id of the last run on this seat, for `cost --last`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_session: Option<String>,
+    /// When `last_session` was recorded (a failed run leaves the old id in
+    /// place, so `last_used` is the wrong clock for "most recent session").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_session_at: Option<DateTime<Utc>>,
 }
 
 impl SeatRuntimeState {
@@ -876,6 +1037,22 @@ pub struct UsageSnapshot {
     pub credits: Option<UsageCredits>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spend_control_reached: Option<bool>,
+    /// Free "usage limit reset" grants the backend reports for this account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets: Option<UsageResets>,
+}
+
+/// Free usage-limit resets available on the account. Redeeming one resets the
+/// exhausted windows at no cost; they expire whether used or not.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct UsageResets {
+    pub available: u32,
+    /// Earliest expiry among the available grants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_expires_at: Option<DateTime<Utc>>,
+    /// Backend title of that grant, e.g. "Full reset (Weekly + 5 hr)".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_title: Option<String>,
 }
 
 impl SeatState {
@@ -2129,6 +2306,7 @@ mod tests {
             }],
             credits: None,
             spend_control_reached: None,
+            resets: None,
         }
     }
 
@@ -2541,6 +2719,7 @@ mod tests {
             }],
             credits: Some(UsageCredits { has_credits: false, unlimited: false, balance: None }),
             spend_control_reached: Some(false),
+            resets: None,
         });
         s2.entry_mut("a").cooldown_reason = Some("credits".into());
         let raw2 = serde_json::to_string(&s2).unwrap();
@@ -2628,6 +2807,8 @@ mod tests {
                 fixed_seat: None,
                 balance_refresh_seconds: 600,
                 credits: CreditPolicy::Never,
+                resets: ResetPolicy::Auto,
+                show_session_cost: true,
                 blocked_probe_seconds: 120,
                 default_cooldown_seconds: 1800,
                 max_retries: 2,

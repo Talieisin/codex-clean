@@ -20,7 +20,9 @@ use crate::seat::{
     SeatIdentity, SeatRuntimeState, SeatState, UsageSnapshot,
 };
 use crate::runner::{consent_for, CreditUse};
-use crate::usage::{self, quota_state, AppServerClient, QuotaState, UsageClient, UsageFetchError};
+use crate::usage::{
+    self, quota_state, AppServerClient, QuotaState, ResetOutcome, UsageClient, UsageFetchError,
+};
 
 /// Read lines from a child stdio handle and forward them to our own
 /// stdout/stderr, flushing after each line. Solves the case where codex's
@@ -412,8 +414,13 @@ fn format_status(
 // ---------------------------------------------------------------------------
 
 /// `codex-clean seat status [NAME] [--json] [--clear-cooldown NAME]`.
-pub fn status(name: Option<&str>, json_out: bool, clear_cooldown: Option<&str>) -> Result<i32> {
-    status_with(&AppServerClient::default(), name, json_out, clear_cooldown)
+pub fn status(
+    name: Option<&str>,
+    json_out: bool,
+    clear_cooldown: Option<&str>,
+    with_usage: bool,
+) -> Result<i32> {
+    status_with_opts(&AppServerClient::default(), name, json_out, clear_cooldown, with_usage)
 }
 
 /// Outcome for one seat, assembled for both the table and `--json`.
@@ -435,6 +442,17 @@ pub fn status_with(
     only: Option<&str>,
     json_out: bool,
     clear_cooldown: Option<&str>,
+) -> Result<i32> {
+    status_with_opts(client, only, json_out, clear_cooldown, false)
+}
+
+/// `status_with`, plus the opt-in account-usage lines.
+pub fn status_with_opts(
+    client: &dyn UsageClient,
+    only: Option<&str>,
+    json_out: bool,
+    clear_cooldown: Option<&str>,
+    with_usage: bool,
 ) -> Result<i32> {
     // Lock first, then load: a concurrent add/remove/run cannot leave us
     // with stale config, and — more importantly — a codex-clean run's own
@@ -551,6 +569,24 @@ pub fn status_with(
     for (_, v) in per_seat {
         global_notices.extend(v);
     }
+    if with_usage {
+        for seat_entry in &targets {
+            let before = seat::slot_snapshot(&seat_entry.name);
+            let got = client.account_usage(seat_entry);
+            seat::sync_active_auth(&seat_entry.name, before);
+            match got {
+                Ok(u) => global_notices.push(format!(
+                    "{}: {} tokens in the last 7 days{}",
+                    seat_entry.name,
+                    usage::format_tokens(u.last_7d_tokens),
+                    u.lifetime_tokens
+                        .map(|t| format!(", {} lifetime", usage::format_tokens(t)))
+                        .unwrap_or_default()
+                )),
+                Err(e) => global_notices.push(format!("{}: account usage unavailable ({})", seat_entry.name, e)),
+            }
+        }
+    }
     global_notices.insert(0, describe_credit_policy(&config, &state, now));
 
     // Sync 2: if the app-server rotated the active seat's token, push the new
@@ -585,20 +621,23 @@ pub fn status_with(
 fn print_status_table(rows: &[SeatStatusRow], global_notices: &[String], now: DateTime<Utc>) {
     const W: (usize, usize, usize, usize, usize) = (14, 18, 8, 28, 28);
     const WC: usize = 14;
+    const WR: usize = 7;
     println!(
-        "{:<w0$} {:<w1$} {:<w2$} {:<w3$} {:<w4$} {:<wc$} STATUS",
+        "{:<w0$} {:<w1$} {:<w2$} {:<w3$} {:<w4$} {:<wc$} {:<wr$} STATUS",
         "NAME",
         "LABEL",
         "PLAN",
         "5H",
         "WEEKLY",
         "CREDITS",
+        "RESETS",
         w0 = W.0,
         w1 = W.1,
         w2 = W.2,
         w3 = W.3,
         w4 = W.4,
-        wc = WC
+        wc = WC,
+        wr = WR
     );
     let mut footnotes: Vec<String> = Vec::new();
     for row in rows {
@@ -649,21 +688,31 @@ fn print_status_table(rows: &[SeatStatusRow], global_notices: &[String], now: Da
             Ok(snap) => usage::format_credits(snap),
             Err(_) => "?".to_string(),
         };
+        let resets = match &row.result {
+            Ok(snap) => snap
+                .resets
+                .as_ref()
+                .map(|r| r.available.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            Err(_) => "?".to_string(),
+        };
         println!(
-            "{:<w0$} {:<w1$} {:<w2$} {:<w3$} {:<w4$} {:<wc$} {}",
+            "{:<w0$} {:<w1$} {:<w2$} {:<w3$} {:<w4$} {:<wc$} {:<wr$} {}",
             row.name,
             truncate(label, W.1),
             truncate(&plan, W.2),
             five_h,
             weekly,
             truncate(&credits, WC),
+            resets,
             status,
             w0 = W.0,
             w1 = W.1,
             w2 = W.2,
             w3 = W.3,
             w4 = W.4,
-            wc = WC
+            wc = WC,
+            wr = WR
         );
     }
     if !footnotes.is_empty() {
@@ -726,6 +775,11 @@ fn print_status_json(
                 "cooldown_until": r.state.cooldown_until,
                 "cooldown_reason": r.state.cooldown_reason,
                 "quota_state": { "state": r.quota.as_str(), "resets_at": quota_resets },
+                "free_resets": r.result.as_ref().ok().and_then(|s| s.resets.as_ref()).map(|r| json!({
+                    "available": r.available,
+                    "next_expires_at": r.next_expires_at,
+                    "next_title": r.next_title,
+                })),
                 "usage": usage_v,
                 "error": error_v,
                 "notices": r.notices,
@@ -824,7 +878,22 @@ pub fn credits(action: Option<&str>) -> Result<()> {
                 QuotaState::Within => "within included quota".to_string(),
                 QuotaState::Unknown => "no usage recorded yet".to_string(),
             };
-            println!("  {}: credits {}; {}", s.name, credits, quota);
+            let free = st
+                .usage
+                .as_ref()
+                .and_then(|u| u.resets.as_ref())
+                .filter(|r| r.available > 0)
+                .map(|r| {
+                    format!(
+                        "; {} free usage-limit reset(s){}",
+                        r.available,
+                        r.next_expires_at
+                            .map(|e| format!(" (next expires {})", e.with_timezone(&Local).format("%a %d %b")))
+                            .unwrap_or_default()
+                    )
+                })
+                .unwrap_or_default();
+            println!("  {}: credits {}; {}{}", s.name, credits, quota, free);
         }
         println!("Change with: codex-clean seat credits ask|never|always|allow|revoke");
         return Ok(());
@@ -1106,6 +1175,274 @@ pub fn strategy(name: Option<&str>, fixed_seat: Option<&str>) -> Result<()> {
             .unwrap_or_default()
     );
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// reset (redeem a free usage-limit reset)
+// ---------------------------------------------------------------------------
+
+/// `codex-clean seat reset [NAME] [--credit-id ID] [--dry-run] [--json]`.
+pub fn reset(
+    name: Option<&str>,
+    credit_id: Option<&str>,
+    dry_run: bool,
+    json_out: bool,
+) -> Result<i32> {
+    reset_with(&AppServerClient::default(), name, credit_id, dry_run, json_out)
+}
+
+/// Injectable core of `seat reset`.
+pub fn reset_with(
+    client: &dyn UsageClient,
+    name: Option<&str>,
+    credit_id: Option<&str>,
+    dry_run: bool,
+    json_out: bool,
+) -> Result<i32> {
+    let _ = seat::scavenge_scratch_dirs();
+    let Some(_lock) = CodexLock::try_acquire()? else {
+        bail!(
+            "a codex-clean run is in progress (holding {}); retry when it finishes",
+            seat::lock_path()?.display()
+        );
+    };
+    let config = SeatConfig::load()?
+        .filter(|c| !c.seats.is_empty())
+        .ok_or_else(|| anyhow!("no seats configured; run `codex-clean seat add <name>` first"))?;
+    let mut state = SeatState::load()?;
+    let now = Utc::now();
+    // Default: the seat a run would pick, else the active one, else the first.
+    let seat_name = match name {
+        Some(n) => config
+            .find(n)
+            .map(|s| s.name.clone())
+            .ok_or_else(|| anyhow!("seat '{}' not found; run `codex-clean seat list`", n))?,
+        None => seat::pick_seat(&config, &state, None, now)
+            .ok()
+            .or_else(|| state.active_seat.clone())
+            .unwrap_or_else(|| config.seats[0].name.clone()),
+    };
+    let entry = config.find(&seat_name).cloned().expect("seat exists");
+
+    if dry_run {
+        let before = seat::slot_snapshot(&seat_name);
+        let listed = client.list_resets(&entry);
+        seat::sync_active_auth(&seat_name, before);
+        let listing = listed?;
+        if json_out {
+            let rows: Vec<serde_json::Value> = listing
+                .credits
+                .iter()
+                .map(|c| json!({ "id": c.id, "title": c.title, "expires_at": c.expires_at }))
+                .collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "seat": seat_name,
+                    "available": listing.available,
+                    "resets": rows,
+                }))?
+            );
+        } else if !listing.credits.is_empty() {
+            println!("Free usage-limit resets on seat '{}' (nothing redeemed):", seat_name);
+            for c in &listing.credits {
+                println!(
+                    "  {}  {}{}",
+                    c.id,
+                    c.title.as_deref().unwrap_or("reset"),
+                    c.expires_at
+                        .map(|e| format!("  expires {}", e.with_timezone(&Local).format("%a %d %b %H:%M")))
+                        .unwrap_or_default()
+                );
+            }
+        } else if listing.available > 0 {
+            // The backend sometimes reports only a count, with no detail rows.
+            println!(
+                "Seat '{}': {} free usage-limit reset(s) available; codex did not list their details, \
+                 so redeem without --credit-id.",
+                seat_name, listing.available
+            );
+        } else {
+            println!("No free usage-limit resets available on seat '{}'.", seat_name);
+        }
+        // Having grants is success, whether or not their details were listed.
+        return Ok(if listing.available > 0 || !listing.credits.is_empty() { 0 } else { 1 });
+    }
+
+    // If this is the active seat, make sure its slot holds the freshest token
+    // before it is staged into a scratch home (plain `codex` may have
+    // refreshed the global file since the last run), exactly as status does.
+    if state.active_seat.as_deref() == Some(seat_name.as_str()) {
+        match seat::refresh_back_guarded(&seat_name, &config.identity_for(&seat_name)) {
+            Ok(outcome) => seat::warn_refresh_back(&seat_name, &outcome),
+            Err(e) => eprintln!("Warning: refresh-back for active seat '{}' failed: {:#}", seat_name, e),
+        }
+    }
+    let before = seat::slot_snapshot(&seat_name);
+    let outcome = client.consume_reset(&entry, credit_id);
+    seat::sync_active_auth(&seat_name, before);
+    let outcome = outcome?;
+    log_event("reset", &seat_name, &format!("outcome={} (manual)", outcome.as_str()));
+
+    let mut cleared = false;
+    if outcome.is_reset() {
+        state.entry_mut(&seat_name).usage_checked_at = Some(Utc::now());
+        let before = seat::slot_snapshot(&seat_name);
+        let refreshed = client.fetch(&entry);
+        seat::sync_active_auth(&seat_name, before);
+        match refreshed {
+            Ok(snap) => {
+                for (s, notice) in
+                    usage::reconcile_snapshots(&config, &mut state, vec![(seat_name.clone(), snap)], Utc::now())
+                {
+                    log_event("status", &s, &notice);
+                }
+            }
+            Err(e) => {
+                eprintln!("Warning: could not re-read usage after the reset: {}", e);
+                // The grant is spent; do not leave the seat blocked on a
+                // reading we now know is stale.
+                cleared = usage::invalidate_after_reset(&mut state, &seat_name, Utc::now());
+            }
+        }
+        if !cleared {
+            cleared = usage::clear_window_cooldown_after_reset(&mut state, &seat_name, Utc::now());
+        }
+        state.save()?;
+    }
+
+    let st = state.get(&seat_name);
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "seat": seat_name,
+                "outcome": outcome.as_str(),
+                "cooldown_cleared": cleared,
+                "usage": st.usage,
+            }))?
+        );
+    } else {
+        match outcome {
+            ResetOutcome::Reset => {
+                println!("Seat '{}': usage limits reset (one free reset used).", seat_name);
+                if let Some(u) = st.usage.as_ref() {
+                    println!("  now {}", usage::summarize_usage_short(u));
+                }
+                if cleared {
+                    println!("  its cooldown was cleared; the seat is available again.");
+                }
+            }
+            ResetOutcome::NothingToReset => println!(
+                "Seat '{}': nothing to reset — no usage window is currently exhausted. No reset was used.",
+                seat_name
+            ),
+            ResetOutcome::NoCredit => println!(
+                "Seat '{}': no free usage-limit resets are available on this account.",
+                seat_name
+            ),
+            ResetOutcome::AlreadyRedeemed => {
+                println!("Seat '{}': that reset was already redeemed.", seat_name)
+            }
+        }
+    }
+    Ok(if outcome.is_reset() { 0 } else { 1 })
+}
+
+// ---------------------------------------------------------------------------
+// cost
+// ---------------------------------------------------------------------------
+
+/// `codex-clean cost [SESSION_ID | --last] [--seat NAME] [--json]`.
+pub fn cost(session: Option<&str>, last: bool, seat_name: Option<&str>, json_out: bool) -> Result<i32> {
+    cost_with(&AppServerClient::default(), session, last, seat_name, json_out)
+}
+
+/// Injectable core of `cost`.
+pub fn cost_with(
+    client: &dyn UsageClient,
+    session: Option<&str>,
+    last: bool,
+    seat_name: Option<&str>,
+    json_out: bool,
+) -> Result<i32> {
+    let Some(_lock) = CodexLock::try_acquire()? else {
+        bail!(
+            "a codex-clean run is in progress (holding {}); retry when it finishes",
+            seat::lock_path()?.display()
+        );
+    };
+    let config = SeatConfig::load()?
+        .filter(|c| !c.seats.is_empty())
+        .ok_or_else(|| anyhow!("no seats configured; run `codex-clean seat add <name>` first"))?;
+    let state = SeatState::load()?;
+
+    // Resolve the session and the seat that ran it.
+    let (seat_name, session_id) = match (session, last) {
+        (Some(id), _) => {
+            let owner = seat_name
+                .map(String::from)
+                .or_else(|| {
+                    config
+                        .seats
+                        .iter()
+                        .find(|s| state.get(&s.name).last_session.as_deref() == Some(id))
+                        .map(|s| s.name.clone())
+                })
+                .or_else(|| state.active_seat.clone())
+                .ok_or_else(|| anyhow!("could not tell which seat ran that session; pass --seat"))?;
+            (owner, id.to_string())
+        }
+        (None, true) => {
+            let mut best: Option<(String, String, chrono::DateTime<Utc>)> = None;
+            for s in &config.seats {
+                let st = state.get(&s.name);
+                // Ordered by when the session was recorded, not by last_used:
+                // a later failed run on another seat must not win.
+                if let (Some(id), Some(when)) = (st.last_session.clone(), st.last_session_at) {
+                    if seat_name.is_none_or(|n| n == s.name)
+                        && best.as_ref().is_none_or(|(_, _, w)| when > *w)
+                    {
+                        best = Some((s.name.clone(), id, when));
+                    }
+                }
+            }
+            let (n, id, _) = best.ok_or_else(|| {
+                anyhow!("no session recorded yet; run codex-clean once, or pass a session id")
+            })?;
+            (n, id)
+        }
+        (None, false) => bail!("pass a session id or --last"),
+    };
+
+    let entry = config.find(&seat_name).cloned().ok_or_else(|| anyhow!("seat '{}' not found", seat_name))?;
+    // Same as status and reset: if this is the active seat, bring its slot up
+    // to date first, so the scratch home is not staged from a stale token.
+    if state.active_seat.as_deref() == Some(seat_name.as_str()) {
+        match seat::refresh_back_guarded(&seat_name, &config.identity_for(&seat_name)) {
+            Ok(outcome) => seat::warn_refresh_back(&seat_name, &outcome),
+            Err(e) => eprintln!("Warning: refresh-back for active seat '{}' failed: {:#}", seat_name, e),
+        }
+    }
+    let before = seat::slot_snapshot(&seat_name);
+    let got = client.thread_cost(&entry, &session_id);
+    seat::sync_active_auth(&seat_name, before);
+    let cost = got?;
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "seat": seat_name,
+                "session": session_id,
+                "credits_micros": cost.credits_micros,
+                "usd_micros": cost.usd_micros,
+                "display": usage::format_cost(&cost),
+            }))?
+        );
+    } else {
+        println!("Session {} on seat '{}': {}", session_id, seat_name, usage::format_cost(&cost));
+    }
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------

@@ -921,6 +921,7 @@ fn snapshot(used_5h: u32, used_weekly: u32) -> UsageSnapshot {
         }],
         credits: Some(seat::UsageCredits { has_credits: false, unlimited: false, balance: None }),
         spend_control_reached: Some(false),
+            resets: None,
     }
 }
 
@@ -2768,4 +2769,518 @@ fn this_run_consent_does_not_cover_a_workspace_changed_while_unlocked() {
     // answer is wait, and the run stops at 77 without spending.
     assert_eq!(run_deps(attempt, &d), EXIT_CREDITS_CONSENT_NEEDED);
     assert_eq!(d.calls.get(), 2, "the new workspace was asked about separately");
+}
+
+
+// ===========================================================================
+// Free usage-limit resets, and session cost
+// ===========================================================================
+
+use codex_clean::runner::EXIT_RESET_AVAILABLE;
+use codex_clean::seat::{ResetPolicy, UsageResets};
+use codex_clean::usage::{AccountUsage, ResetCredit, ResetListing, ResetOutcome, ThreadCost};
+
+fn with_resets(mut snap: UsageSnapshot, available: u32) -> UsageSnapshot {
+    snap.resets = Some(UsageResets {
+        available,
+        next_expires_at: Some(chrono::Utc::now() + chrono::Duration::days(9)),
+        next_title: Some("Full reset (Weekly + 5 hr)".into()),
+    });
+    snap
+}
+
+/// Seats blocked the way the real account was: weekly at 100%, credits
+/// available, and free resets granted.
+fn setup_blocked_with_resets(env: &TestEnv, credits: CreditPolicy, resets: ResetPolicy) {
+    setup_both_on_credits(env, credits);
+    let mut cfg = SeatConfig::load().unwrap().unwrap();
+    cfg.rotation.resets = resets;
+    env.save_config(&cfg);
+    let mut st = env.load_state();
+    for n in ["main", "backup1"] {
+        st.entry_mut(n).usage = Some(with_resets(on_credits_snapshot(), 3));
+    }
+    env.save_state(&st);
+}
+
+/// Client that scripts the reset/cost calls and counts them.
+struct ResetClient {
+    outcome: ResetOutcome,
+    after: UsageSnapshot,
+    consumes: std::sync::atomic::AtomicUsize,
+    fetches: std::sync::atomic::AtomicUsize,
+    fail: bool,
+}
+
+impl ResetClient {
+    fn new(outcome: ResetOutcome, after: UsageSnapshot) -> Self {
+        Self {
+            outcome,
+            after,
+            consumes: std::sync::atomic::AtomicUsize::new(0),
+            fetches: std::sync::atomic::AtomicUsize::new(0),
+            fail: false,
+        }
+    }
+    fn consumed(&self) -> usize {
+        self.consumes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl UsageClient for ResetClient {
+    fn fetch(&self, _: &SE) -> Result<UsageSnapshot, UsageFetchError> {
+        self.fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut s = self.after.clone();
+        s.fetched_at = chrono::Utc::now();
+        Ok(s)
+    }
+    fn consume_reset(&self, _: &SE, _: Option<&str>) -> Result<ResetOutcome, UsageFetchError> {
+        self.consumes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail {
+            return Err(UsageFetchError::Timeout(std::time::Duration::from_secs(1)));
+        }
+        Ok(self.outcome)
+    }
+    fn thread_cost(&self, _: &SE, _: &str) -> Result<ThreadCost, UsageFetchError> {
+        Ok(ThreadCost { credits_micros: 420_000, usd_micros: Some(52_000) })
+    }
+    fn account_usage(&self, _: &SE) -> Result<AccountUsage, UsageFetchError> {
+        Ok(AccountUsage { lifetime_tokens: Some(1_000_000), last_7d_tokens: 250_000 })
+    }
+    fn list_resets(&self, _: &SE) -> Result<ResetListing, UsageFetchError> {
+        Ok(ResetListing {
+            available: 3,
+            credits: vec![ResetCredit {
+                id: "RateLimitResetCredit_abc".into(),
+                title: Some("Full reset (Weekly + 5 hr)".into()),
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::days(9)),
+            }],
+        })
+    }
+}
+
+#[test]
+fn a_free_reset_is_offered_before_paying_and_before_waiting() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    setup_blocked_with_resets(&env, CreditPolicy::Ask, ResetPolicy::Ask);
+    let client = ResetClient::new(ResetOutcome::Reset, snapshot(1, 1));
+    let decider = decider(CreditChoice::ThisRun);
+    let attempt = |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
+        panic!("nothing should run: the free reset is offered first")
+    };
+    let exit = runner::run_codex_with_deps(&[], "hi", Mode::Exec, attempt, &client, &decider).unwrap();
+    assert_eq!(exit, EXIT_RESET_AVAILABLE, "78 takes precedence over 77");
+    assert_eq!(decider.calls.get(), 0, "the credits question is never asked");
+    assert_eq!(client.consumed(), 0, "ask never redeems by itself");
+    let log = fs::read_to_string(env.clean_home_path.join("seat-events.log")).unwrap();
+    assert!(log.contains("reset_available"), "{}", log);
+}
+
+#[test]
+fn never_policy_keeps_the_old_exit_codes_and_says_nothing_about_resets() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    setup_blocked_with_resets(&env, CreditPolicy::Ask, ResetPolicy::Never);
+    let client = ResetClient::new(ResetOutcome::Reset, snapshot(1, 1));
+    let attempt = |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
+        panic!("must not run")
+    };
+    let exit = runner::run_codex_with_client(&[], "hi", Mode::Exec, attempt, &client).unwrap();
+    assert_eq!(exit, EXIT_CREDITS_CONSENT_NEEDED, "credits question as before");
+    assert_eq!(client.consumed(), 0);
+    let st = env.load_state();
+    assert!(st.get("main").usage.unwrap().resets.is_some(), "still recorded, just not offered");
+}
+
+#[test]
+fn auto_redeems_once_and_the_recovered_seat_runs_even_at_the_end_of_the_budget() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    setup_blocked_with_resets(&env, CreditPolicy::Ask, ResetPolicy::Auto);
+    // Both seats already tried and cooling: the budget is spent.
+    let mut st = env.load_state();
+    for n in ["main", "backup1"] {
+        let e = st.entry_mut(n);
+        e.cooldown_until = Some(chrono::Utc::now() + chrono::Duration::hours(20));
+        e.cooldown_reason = Some("rate_limit".into());
+        e.usage_checked_at = Some(chrono::Utc::now());
+    }
+    env.save_state(&st);
+    let client = ResetClient::new(ResetOutcome::Reset, with_resets(snapshot(2, 2), 2));
+    let codex_home = env.codex_home_path.clone();
+    let exit = runner::run_codex_with_client(&[], "hi", Mode::Exec, mock_attempt(&codex_home, |_| ok_attempt()), &client).unwrap();
+    assert_eq!(exit, 0, "the reset recovered a seat and the run went through");
+    assert_eq!(client.consumed(), 1, "exactly one grant spent");
+    let st = env.load_state();
+    let recovered = ["main", "backup1"].iter().filter(|n| st.get(n).cooldown_until.is_none()).count();
+    assert_eq!(recovered, 1, "only the reset seat was cleared");
+    let log = fs::read_to_string(env.clean_home_path.join("seat-events.log")).unwrap();
+    assert!(log.contains("reset seat=") && log.contains("redeemed a free usage-limit reset"), "{}", log);
+}
+
+#[test]
+fn auto_falls_through_when_the_backend_declines_or_errors() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for (outcome, fail) in [(ResetOutcome::NothingToReset, false), (ResetOutcome::NoCredit, false), (ResetOutcome::Reset, true)] {
+        let env = TestEnv::new();
+        setup_blocked_with_resets(&env, CreditPolicy::Ask, ResetPolicy::Auto);
+        let mut client = ResetClient::new(outcome, snapshot(1, 1));
+        client.fail = fail;
+        let attempt = |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
+            panic!("must not run")
+        };
+        let exit = runner::run_codex_with_client(&[], "hi", Mode::Exec, attempt, &client).unwrap();
+        assert_eq!(exit, EXIT_CREDITS_CONSENT_NEEDED, "{:?}/{}: falls through to the credits path", outcome, fail);
+        assert_eq!(client.consumed(), 1, "one attempt, not a loop");
+    }
+}
+
+#[test]
+fn a_reset_is_never_redeemed_for_a_block_it_cannot_lift() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for (reason, needs_login) in [("credits", false), ("spend_control", false), ("rate_limit", true)] {
+        let env = TestEnv::new();
+        setup_blocked_with_resets(&env, CreditPolicy::Never, ResetPolicy::Auto);
+        let mut st = env.load_state();
+        for n in ["main", "backup1"] {
+            let e = st.entry_mut(n);
+            e.cooldown_until = Some(chrono::Utc::now() + chrono::Duration::hours(20));
+            e.cooldown_reason = Some(reason.into());
+            e.needs_login = needs_login;
+            e.usage_checked_at = Some(chrono::Utc::now());
+        }
+        env.save_state(&st);
+        let client = ResetClient::new(ResetOutcome::Reset, snapshot(1, 1));
+        let attempt = |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
+            panic!("must not run")
+        };
+        let exit = runner::run_codex_with_client(&[], "hi", Mode::Exec, attempt, &client).unwrap();
+        assert_eq!(client.consumed(), 0, "{}: a reset cannot lift this block", reason);
+        assert!(exit == 75 || exit == 1, "{}: got {}", reason, exit);
+    }
+}
+
+#[test]
+fn a_stale_pre_upgrade_snapshot_is_refreshed_before_the_78_77_decision() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    setup_both_on_credits(&env, CreditPolicy::Ask);
+    // 0.8.0 wrote snapshots with no `resets` field at all.
+    let mut st = env.load_state();
+    for n in ["main", "backup1"] {
+        let mut old = on_credits_snapshot();
+        old.fetched_at = chrono::Utc::now() - chrono::Duration::hours(2);
+        old.resets = None;
+        st.entry_mut(n).usage = Some(old);
+        st.entry_mut(n).cooldown_until = Some(chrono::Utc::now() + chrono::Duration::hours(5));
+        st.entry_mut(n).cooldown_reason = Some("rate_limit".into());
+    }
+    env.save_state(&st);
+    let client = ResetClient::new(ResetOutcome::Reset, with_resets(on_credits_snapshot(), 3));
+    let attempt = |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
+        panic!("must not run under ask")
+    };
+    let exit = runner::run_codex_with_client(&[], "hi", Mode::Exec, attempt, &client).unwrap();
+    assert_eq!(exit, EXIT_RESET_AVAILABLE, "the probe found the grants first");
+    assert!(client.fetches.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    assert!(env.load_state().get("main").usage.unwrap().resets.is_some());
+}
+
+#[test]
+fn seat_reset_command_outcomes_and_dry_run() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Successful redeem clears the cooldown.
+    let env = TestEnv::new();
+    setup_blocked_with_resets(&env, CreditPolicy::Ask, ResetPolicy::Ask);
+    let mut st = env.load_state();
+    st.entry_mut("main").cooldown_until = Some(chrono::Utc::now() + chrono::Duration::hours(20));
+    st.entry_mut("main").cooldown_reason = Some("rate_limit".into());
+    env.save_state(&st);
+    let client = ResetClient::new(ResetOutcome::Reset, with_resets(snapshot(1, 1), 2));
+    assert_eq!(codex_clean::seat_cmd::reset_with(&client, Some("main"), None, false, false).unwrap(), 0);
+    assert_eq!(client.consumed(), 1);
+    assert!(env.load_state().get("main").cooldown_until.is_none(), "cooldown cleared after the reset");
+
+    // --dry-run lists and redeems nothing.
+    let client = ResetClient::new(ResetOutcome::Reset, snapshot(1, 1));
+    assert_eq!(codex_clean::seat_cmd::reset_with(&client, Some("main"), None, true, true).unwrap(), 0);
+    assert_eq!(client.consumed(), 0, "--dry-run must never redeem");
+
+    // nothingToReset / noCredit report and exit 1 without changing state.
+    for outcome in [ResetOutcome::NothingToReset, ResetOutcome::NoCredit] {
+        let env = TestEnv::new();
+        setup_blocked_with_resets(&env, CreditPolicy::Ask, ResetPolicy::Ask);
+        let mut st = env.load_state();
+        st.entry_mut("main").cooldown_until = Some(chrono::Utc::now() + chrono::Duration::hours(20));
+        st.entry_mut("main").cooldown_reason = Some("rate_limit".into());
+        env.save_state(&st);
+        let client = ResetClient::new(outcome, snapshot(1, 1));
+        assert_eq!(codex_clean::seat_cmd::reset_with(&client, Some("main"), None, false, false).unwrap(), 1);
+        assert!(env.load_state().get("main").cooldown_until.is_some(), "{:?}", outcome);
+    }
+
+    // Unknown seat is rejected before any call.
+    let client = ResetClient::new(ResetOutcome::Reset, snapshot(1, 1));
+    assert!(codex_clean::seat_cmd::reset_with(&client, Some("nope"), None, false, false).is_err());
+    assert_eq!(client.consumed(), 0);
+}
+
+#[test]
+fn cost_command_resolves_the_session_and_seat() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    env.write_seat("a", "acc-a");
+    env.write_seat("b", "acc-b");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a"), ("b", "acc-b")]));
+    let client = ResetClient::new(ResetOutcome::Reset, snapshot(1, 1));
+    // Nothing recorded yet.
+    assert!(codex_clean::seat_cmd::cost_with(&client, None, true, None, false).is_err());
+    // A run records the session on the seat that ran it.
+    let codex_home = env.codex_home_path.clone();
+    let attempt = move |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
+        let mut ok = ok_attempt();
+        ok.output.session_id = Some("thread-xyz".into());
+        let _ = fs::read(codex_home.join("auth.json"))?;
+        Ok(ok)
+    };
+    assert_eq!(runner::run_codex_with_client(&[], "hi", Mode::Exec, attempt, &client).unwrap(), 0);
+    let st = env.load_state();
+    let ran = st.active_seat.clone().unwrap();
+    assert_eq!(st.get(&ran).last_session.as_deref(), Some("thread-xyz"));
+    assert_eq!(codex_clean::seat_cmd::cost_with(&client, None, true, None, true).unwrap(), 0);
+    assert_eq!(codex_clean::seat_cmd::cost_with(&client, Some("thread-xyz"), false, None, false).unwrap(), 0);
+    // Neither an id nor --last is an error, not a guess.
+    assert!(codex_clean::seat_cmd::cost_with(&client, None, false, None, false).is_err());
+}
+
+#[test]
+fn session_cost_appears_on_the_seat_line_only_when_enabled() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    env.write_seat("a", "acc-a");
+    let mut cfg = cfg_with_seats(&[("a", "acc-a")]);
+    cfg.rotation.show_session_cost = true;
+    env.save_config(&cfg);
+    let client = ResetClient::new(ResetOutcome::Reset, snapshot(1, 1));
+    let attempt = |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
+        let mut ok = ok_attempt();
+        ok.output.session_id = Some("t-1".into());
+        Ok(ok)
+    };
+    assert_eq!(runner::run_codex_with_client(&[], "hi", Mode::Exec, attempt, &client).unwrap(), 0);
+    // A client without cost support leaves the line alone (no failure).
+    let plain = FakeClient { by_seat: Box::new(|_| Ok(snapshot(1, 1))), rewrite_slot_tag: None };
+    assert_eq!(runner::run_codex_with_client(&[], "hi", Mode::Exec, attempt, &plain).unwrap(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn stdout_tells_a_headless_caller_about_the_free_reset() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    setup_blocked_with_resets(&env, CreditPolicy::Ask, ResetPolicy::Ask);
+    let bin = tempfile::tempdir().unwrap();
+    install_fake_codex_exec(bin.path(), "{\"type\":\"thread.started\",\"thread_id\":\"t\"}", 0);
+    let (code, out) = run_binary(&env, bin.path(), &[]);
+    assert_eq!(code, 78, "{}", out);
+    let last = out.lines().last().unwrap_or_default();
+    assert!(last.contains("3 free usage-limit reset(s) available on main"), "{}", last);
+    assert!(last.contains("codex-clean seat reset main"), "{}", last);
+    assert!(last.contains("next expires"), "{}", last);
+}
+
+
+#[test]
+fn the_reset_decision_still_happens_after_the_last_failed_attempt() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Both seats look healthy, so the run spends its whole budget before
+    // anything is known to be blocked; the reset offer must still appear.
+    let env = TestEnv::new();
+    setup_blocked_with_resets(&env, CreditPolicy::Never, ResetPolicy::Ask);
+    let mut st = env.load_state();
+    for n in ["main", "backup1"] {
+        st.entry_mut(n).usage = Some(with_resets(snapshot(10, 10), 3));
+    }
+    env.save_state(&st);
+    let client = ResetClient::new(ResetOutcome::Reset, with_resets(snapshot(1, 1), 2));
+    let codex_home = env.codex_home_path.clone();
+    let attempt = mock_attempt(&codex_home, |_| rate_limit_attempt());
+    let exit = runner::run_codex_with_client(&[], "hi", Mode::Exec, attempt, &client).unwrap();
+    assert_eq!(exit, EXIT_RESET_AVAILABLE, "78 after the budget is spent, not 75");
+    assert_eq!(client.consumed(), 0, "ask does not redeem");
+
+    // With auto, the same situation redeems and runs the recovered seat.
+    let env = TestEnv::new();
+    setup_blocked_with_resets(&env, CreditPolicy::Never, ResetPolicy::Auto);
+    let mut st = env.load_state();
+    for n in ["main", "backup1"] {
+        st.entry_mut(n).usage = Some(with_resets(snapshot(10, 10), 3));
+    }
+    env.save_state(&st);
+    let client = ResetClient::new(ResetOutcome::Reset, with_resets(snapshot(1, 1), 2));
+    let codex_home = env.codex_home_path.clone();
+    let calls = std::rc::Rc::new(RefCell::new(0usize));
+    let calls2 = calls.clone();
+    let attempt = move |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
+        *calls2.borrow_mut() += 1;
+        let _ = fs::read(codex_home.join("auth.json"))?;
+        Ok(if *calls2.borrow() <= 2 { rate_limit_attempt() } else { ok_attempt() })
+    };
+    let exit = runner::run_codex_with_client(&[], "hi", Mode::Exec, attempt, &client).unwrap();
+    assert_eq!(exit, 0, "the reset bought one more attempt");
+    assert_eq!(*calls.borrow(), 3, "two failures, then the recovered seat");
+    assert_eq!(client.consumed(), 1);
+}
+
+#[test]
+fn a_pinned_seat_is_offered_a_reset_too() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    setup_blocked_with_resets(&env, CreditPolicy::Never, ResetPolicy::Ask);
+    let mut st = env.load_state();
+    st.entry_mut("main").usage = Some(with_resets(snapshot(10, 10), 3));
+    env.save_state(&st);
+    std::env::set_var("CODEX_CLEAN_SEAT", "main");
+    let client = ResetClient::new(ResetOutcome::Reset, snapshot(1, 1));
+    let codex_home = env.codex_home_path.clone();
+    let attempt = mock_attempt(&codex_home, |_| rate_limit_attempt());
+    let exit = runner::run_codex_with_client(&[], "hi", Mode::Exec, attempt, &client).unwrap();
+    assert_eq!(exit, EXIT_RESET_AVAILABLE, "a pin does not hide the free option");
+    std::env::remove_var("CODEX_CLEAN_SEAT");
+}
+
+#[test]
+fn a_non_active_seat_refresh_never_takes_over_the_global_auth_file() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    env.write_seat("main", "acc-main");
+    env.write_seat("backup1", "acc-backup1");
+    env.save_config(&cfg_with_seats(&[("main", "acc-main"), ("backup1", "acc-backup1")]));
+    let state = SeatState { active_seat: Some("main".to_string()), ..Default::default() };
+    env.save_state(&state);
+    fs::write(env.codex_home_path.join("auth.json"), fake_auth_json("acc-main")).unwrap();
+
+    // backup1's slot changes (as an app-server call would rotate it).
+    let before = seat::slot_snapshot("backup1");
+    fs::write(
+        env.clean_home_path.join("seats/backup1/auth.json"),
+        fake_auth_json_refreshed("acc-backup1", "rotated"),
+    )
+    .unwrap();
+    assert!(!seat::sync_active_auth("backup1", before), "not the active seat");
+    assert_eq!(env.active_auth_account_id().as_deref(), Some("acc-main"), "global auth untouched");
+
+    // The active seat's rotation is still mirrored.
+    let before = seat::slot_snapshot("main");
+    fs::write(
+        env.clean_home_path.join("seats/main/auth.json"),
+        fake_auth_json_refreshed("acc-main", "rotated"),
+    )
+    .unwrap();
+    assert!(seat::sync_active_auth("main", before));
+    assert!(fs::read_to_string(env.codex_home_path.join("auth.json")).unwrap().contains("fake-access-rotated"));
+}
+
+#[test]
+fn a_spent_reset_frees_the_seat_even_when_the_follow_up_read_fails() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    setup_blocked_with_resets(&env, CreditPolicy::Never, ResetPolicy::Auto);
+    let mut st = env.load_state();
+    for n in ["main", "backup1"] {
+        let e = st.entry_mut(n);
+        e.cooldown_until = Some(chrono::Utc::now() + chrono::Duration::hours(20));
+        e.cooldown_reason = Some("rate_limit".into());
+        e.usage_checked_at = Some(chrono::Utc::now());
+    }
+    env.save_state(&st);
+    /// Consume succeeds; the follow-up usage read always fails.
+    struct FlakyClient {
+        consumes: std::sync::atomic::AtomicUsize,
+    }
+    impl UsageClient for FlakyClient {
+        fn fetch(&self, _: &SE) -> Result<UsageSnapshot, UsageFetchError> {
+            Err(UsageFetchError::Timeout(std::time::Duration::from_secs(1)))
+        }
+        fn consume_reset(&self, _: &SE, _: Option<&str>) -> Result<ResetOutcome, UsageFetchError> {
+            self.consumes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ResetOutcome::Reset)
+        }
+    }
+    let client = FlakyClient { consumes: std::sync::atomic::AtomicUsize::new(0) };
+    let codex_home = env.codex_home_path.clone();
+    let exit = runner::run_codex_with_client(&[], "hi", Mode::Exec, mock_attempt(&codex_home, |_| ok_attempt()), &client).unwrap();
+    assert_eq!(exit, 0, "the grant was spent, so the seat must actually be used");
+    assert_eq!(client.consumes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let st = env.load_state();
+    let freed = ["main", "backup1"].iter().filter(|n| st.get(n).cooldown_until.is_none()).count();
+    assert_eq!(freed, 1, "the reset seat was freed despite the failed re-read");
+}
+
+#[test]
+fn the_stdout_advice_never_points_at_a_block_a_reset_cannot_lift() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    setup_blocked_with_resets(&env, CreditPolicy::Never, ResetPolicy::Ask);
+    let mut st = env.load_state();
+    for n in ["main", "backup1"] {
+        let e = st.entry_mut(n);
+        e.cooldown_until = Some(chrono::Utc::now() + chrono::Duration::hours(20));
+        e.cooldown_reason = Some("spend_control".into());
+    }
+    env.save_state(&st);
+    let cfg = SeatConfig::load().unwrap().unwrap();
+    let notice = seat::seat_notice(&cfg, &env.load_state(), chrono::Utc::now(), &|_| false).unwrap();
+    assert!(!notice.contains("seat reset"), "a spend cap is not lifted by a reset: {}", notice);
+
+    // A window cooldown is, so there the advice appears.
+    let mut st = env.load_state();
+    for n in ["main", "backup1"] {
+        st.entry_mut(n).cooldown_reason = Some("rate_limit".into());
+    }
+    env.save_state(&st);
+    let notice = seat::seat_notice(&cfg, &env.load_state(), chrono::Utc::now(), &|_| false).unwrap();
+    assert!(notice.contains("codex-clean seat reset main"), "{}", notice);
+}
+
+#[test]
+fn cost_last_follows_the_session_clock_not_the_run_clock() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    env.write_seat("a", "acc-a");
+    env.write_seat("b", "acc-b");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a"), ("b", "acc-b")]));
+    let mut st = SeatState::default();
+    let now = chrono::Utc::now();
+    // b ran the most recent session; a ran later but failed, keeping an old id.
+    let e = st.entry_mut("b");
+    e.last_session = Some("newest".into());
+    e.last_session_at = Some(now - chrono::Duration::minutes(1));
+    e.last_used = Some(now - chrono::Duration::minutes(1));
+    let e = st.entry_mut("a");
+    e.last_session = Some("older".into());
+    e.last_session_at = Some(now - chrono::Duration::hours(3));
+    e.last_used = Some(now); // the later, failed run
+    env.save_state(&st);
+
+    struct RecordingClient {
+        seen: std::sync::Mutex<Vec<(String, String)>>,
+    }
+    impl UsageClient for RecordingClient {
+        fn fetch(&self, _: &SE) -> Result<UsageSnapshot, UsageFetchError> {
+            Err(UsageFetchError::Protocol("unused".into()))
+        }
+        fn thread_cost(&self, seat: &SE, thread: &str) -> Result<ThreadCost, UsageFetchError> {
+            self.seen.lock().unwrap().push((seat.name.clone(), thread.to_string()));
+            Ok(ThreadCost { credits_micros: 1, usd_micros: None })
+        }
+    }
+    let client = RecordingClient { seen: std::sync::Mutex::new(Vec::new()) };
+    assert_eq!(codex_clean::seat_cmd::cost_with(&client, None, true, None, false).unwrap(), 0);
+    assert_eq!(
+        client.seen.lock().unwrap().as_slice(),
+        [("b".to_string(), "newest".to_string())],
+        "the most recently recorded session wins"
+    );
 }

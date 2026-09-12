@@ -23,8 +23,8 @@ use serde_json::{json, Value};
 use crate::ratelimit::{self, CooldownReason};
 use crate::seat::{
     self, merge_cooldown, workspace_key, RotationConfig, ScratchCodexHome, SeatConfig, SeatEntry,
-    SeatIdentity, SeatRuntimeState, SeatState, UsageBucket, UsageCredits, UsageSnapshot,
-    UsageWindow,
+    SeatIdentity, SeatRuntimeState, SeatState, UsageBucket, UsageCredits, UsageResets,
+    UsageSnapshot, UsageWindow,
 };
 
 /// Wall-clock budget for one seat: spawn, handshake, read, teardown.
@@ -96,10 +96,107 @@ impl From<anyhow::Error> for UsageFetchError {
 // Client seam
 // ---------------------------------------------------------------------------
 
-/// Fetches one seat's snapshot. `seat_cmd::status_with` takes a `&dyn
-/// UsageClient` so tests can feed canned snapshots without a process.
+/// What `account/rateLimitResetCredit/consume` answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetOutcome {
+    /// A grant was spent and the eligible windows were reset.
+    Reset,
+    /// No window currently needs resetting (no grant spent).
+    NothingToReset,
+    /// The account has no reset grants available.
+    NoCredit,
+    /// This idempotency key already completed a reset.
+    AlreadyRedeemed,
+}
+
+impl ResetOutcome {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "reset" => Self::Reset,
+            "nothingToReset" => Self::NothingToReset,
+            "noCredit" => Self::NoCredit,
+            "alreadyRedeemed" => Self::AlreadyRedeemed,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reset => "reset",
+            Self::NothingToReset => "nothing_to_reset",
+            Self::NoCredit => "no_credit",
+            Self::AlreadyRedeemed => "already_redeemed",
+        }
+    }
+
+    /// Did this spend a grant and change the windows?
+    pub fn is_reset(self) -> bool {
+        matches!(self, Self::Reset)
+    }
+}
+
+/// Estimated cost of one session, as codex reports it (micros).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ThreadCost {
+    pub credits_micros: i64,
+    pub usd_micros: Option<i64>,
+}
+
+/// Account-wide token activity. There is no credit figure at this level.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountUsage {
+    pub lifetime_tokens: Option<i64>,
+    pub last_7d_tokens: i64,
+}
+
+/// Fetches seat usage and the other per-seat account calls.
+/// `seat_cmd::status_with` takes a `&dyn UsageClient` so tests can feed canned
+/// answers without a process. The three extra calls have default
+/// implementations so a fake only overrides what it exercises.
 pub trait UsageClient: Sync {
     fn fetch(&self, seat: &SeatEntry) -> Result<UsageSnapshot, UsageFetchError>;
+
+    /// Redeem a free usage-limit reset for this seat's account.
+    fn consume_reset(
+        &self,
+        _seat: &SeatEntry,
+        _credit_id: Option<&str>,
+    ) -> Result<ResetOutcome, UsageFetchError> {
+        Err(UsageFetchError::Protocol("not supported by this client".to_string()))
+    }
+
+    /// Estimated cost of one session.
+    fn thread_cost(&self, _seat: &SeatEntry, _thread_id: &str) -> Result<ThreadCost, UsageFetchError> {
+        Err(UsageFetchError::Protocol("not supported by this client".to_string()))
+    }
+
+    /// Account-wide token activity.
+    fn account_usage(&self, _seat: &SeatEntry) -> Result<AccountUsage, UsageFetchError> {
+        Err(UsageFetchError::Protocol("not supported by this client".to_string()))
+    }
+
+    /// The available reset grants in full (id, title, expiry), for
+    /// `seat reset --dry-run`. Ids are never persisted.
+    fn list_resets(&self, seat: &SeatEntry) -> Result<ResetListing, UsageFetchError> {
+        let _ = seat;
+        Err(UsageFetchError::Protocol("not supported by this client".to_string()))
+    }
+}
+
+/// One redeemable grant, as listed by `seat reset --dry-run`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResetCredit {
+    pub id: String,
+    pub title: Option<String>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// What `--dry-run` found: how many grants the backend reports, and the detail
+/// rows when it supplied them (it may report only a count).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResetListing {
+    pub available: u32,
+    pub credits: Vec<ResetCredit>,
 }
 
 /// A client that never fetches (every call fails). Used where automatic
@@ -127,6 +224,40 @@ impl UsageClient for AppServerClient {
     fn fetch(&self, seat: &SeatEntry) -> Result<UsageSnapshot, UsageFetchError> {
         let timeout = self.timeout;
         fetch_usage_with(seat, Utc::now(), |home| app_server_rate_limits(home, timeout))
+    }
+
+    fn consume_reset(
+        &self,
+        seat: &SeatEntry,
+        credit_id: Option<&str>,
+    ) -> Result<ResetOutcome, UsageFetchError> {
+        let timeout = self.timeout;
+        with_seat_scratch(seat, |home| app_server_consume_reset(home, timeout, credit_id))
+    }
+
+    fn thread_cost(&self, seat: &SeatEntry, thread_id: &str) -> Result<ThreadCost, UsageFetchError> {
+        let timeout = self.timeout;
+        with_seat_scratch(seat, |home| app_server_thread_cost(home, timeout, thread_id))
+    }
+
+    fn account_usage(&self, seat: &SeatEntry) -> Result<AccountUsage, UsageFetchError> {
+        let timeout = self.timeout;
+        with_seat_scratch(seat, |home| app_server_account_usage(home, timeout))
+    }
+
+    fn list_resets(&self, seat: &SeatEntry) -> Result<ResetListing, UsageFetchError> {
+        let timeout = self.timeout;
+        let v = with_seat_scratch(seat, |home| app_server_rate_limits(home, timeout))?;
+        let now = Utc::now();
+        Ok(ResetListing {
+            // The backend may report only a count, with no detail rows.
+            available: parse_rate_limits_result(&v, now)
+                .ok()
+                .and_then(|s| s.resets)
+                .map(|r| r.available)
+                .unwrap_or(0),
+            credits: parse_reset_credits(&v, now),
+        })
     }
 }
 
@@ -175,6 +306,18 @@ pub fn fetch_usage_with<F>(
 where
     F: FnOnce(&Path) -> Result<Value, UsageFetchError>,
 {
+    let value = with_seat_scratch(seat, call)?;
+    parse_rate_limits_result(&value, now).map_err(|e| UsageFetchError::Protocol(e.to_string()))
+}
+
+/// Stage a seat's auth blob into an isolated scratch `CODEX_HOME`, run `call`
+/// against it, then persist any token the child rotated back into the seat's
+/// slot (identity-guarded) and remove the scratch home — whether the call
+/// succeeded or not. Every app-server call goes through here.
+pub fn with_seat_scratch<T, F>(seat: &SeatEntry, call: F) -> Result<T, UsageFetchError>
+where
+    F: FnOnce(&Path) -> Result<T, UsageFetchError>,
+{
     let slot = seat::seat_auth_path(&seat.name)?;
     let bytes = fs::read(&slot).with_context(|| {
         format!(
@@ -203,9 +346,86 @@ where
         ),
     }
     drop(scratch);
+    result
+}
 
-    let value = result?;
-    parse_rate_limits_result(&value, now).map_err(|e| UsageFetchError::Protocol(e.to_string()))
+/// Every available grant in a rate-limits response, for `--dry-run`.
+pub fn parse_reset_credits(result: &Value, now: DateTime<Utc>) -> Vec<ResetCredit> {
+    result
+        .get("rateLimitResetCredits")
+        .and_then(|rc| rc.get("credits"))
+        .and_then(|c| c.as_array())
+        .map(|list| {
+            list.iter()
+                .filter(|c| c.get("status").and_then(|s| s.as_str()) == Some("available"))
+                .filter_map(|c| {
+                    let expires_at = c
+                        .get("expiresAt")
+                        .and_then(|t| t.as_i64())
+                        .and_then(|ts| DateTime::from_timestamp(ts, 0));
+                    if expires_at.is_some_and(|e| e <= now) {
+                        return None;
+                    }
+                    Some(ResetCredit {
+                        id: c.get("id").and_then(|i| i.as_str())?.to_string(),
+                        title: c.get("title").and_then(|t| t.as_str()).map(|t| sanitize_text(t, 60)),
+                        expires_at,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_thread_cost(v: &Value) -> Option<ThreadCost> {
+    let t = v.get("threadUsage").unwrap_or(v);
+    Some(ThreadCost {
+        credits_micros: t.get("estimatedUsageCreditsMicros").and_then(|n| n.as_i64())?,
+        usd_micros: t.get("estimatedUsageUsdMicros").and_then(|n| n.as_i64()),
+    })
+}
+
+fn parse_account_usage(v: &Value) -> AccountUsage {
+    let lifetime_tokens = v
+        .pointer("/summary/lifetimeTokens")
+        .and_then(|n| n.as_i64());
+    // Daily buckets are ISO dates; sum the last 7 entries the backend sent.
+    let mut buckets: Vec<(String, i64)> = v
+        .get("dailyUsageBuckets")
+        .and_then(|b| b.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|b| {
+                    Some((
+                        b.get("startDate").and_then(|d| d.as_str())?.to_string(),
+                        b.get("tokens").and_then(|t| t.as_i64()).unwrap_or(0),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    buckets.sort_by(|a, b| a.0.cmp(&b.0));
+    let last_7d_tokens = buckets.iter().rev().take(7).map(|(_, t)| *t).sum();
+    AccountUsage { lifetime_tokens, last_7d_tokens }
+}
+
+/// "≈0.42 credits (≈$0.05)", or credits alone when no dollar figure is given.
+pub fn format_cost(cost: &ThreadCost) -> String {
+    let credits = cost.credits_micros as f64 / 1_000_000.0;
+    match cost.usd_micros {
+        Some(usd) => format!("≈{:.2} credits (≈${:.2})", credits, usd as f64 / 1_000_000.0),
+        None => format!("≈{:.2} credits", credits),
+    }
+}
+
+/// "1.33B" / "46.3M" / "9,120" for token counts.
+pub fn format_tokens(n: i64) -> String {
+    match n {
+        n if n >= 1_000_000_000 => format!("{:.2}B", n as f64 / 1e9),
+        n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1e6),
+        n if n >= 1_000 => format!("{:.1}k", n as f64 / 1e3),
+        n => n.to_string(),
+    }
 }
 
 /// The seat's configured identity, with gaps filled from its own blob.
@@ -299,6 +519,75 @@ fn env_allowed(key: &OsStr) -> bool {
 /// down (stdin closed, exited or killed, reaped, readers joined) before this
 /// returns, so the caller may safely read the scratch auth.json afterwards.
 pub fn app_server_rate_limits(home: &Path, timeout: Duration) -> Result<Value, UsageFetchError> {
+    Ok(app_server_calls(home, timeout, &[("account/rateLimits/read", Value::Null)])?
+        .pop()
+        .expect("one call, one answer"))
+}
+
+/// Redeem a free usage-limit reset. `credit_id` picks a specific grant; the
+/// backend chooses the next available one when it is `None`.
+pub fn app_server_consume_reset(
+    home: &Path,
+    timeout: Duration,
+    credit_id: Option<&str>,
+) -> Result<ResetOutcome, UsageFetchError> {
+    // One logical attempt = one key. We never retry a consume automatically,
+    // so a fresh key per call is right.
+    let key = format!(
+        "codex-clean-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let mut params = json!({ "idempotencyKey": key });
+    if let Some(id) = credit_id {
+        params["creditId"] = json!(id);
+    }
+    let v = app_server_calls(home, timeout, &[("account/rateLimitResetCredit/consume", params)])?
+        .pop()
+        .expect("one call, one answer");
+    ResetOutcome::parse(v.get("outcome").and_then(|o| o.as_str()).unwrap_or(""))
+        .ok_or_else(|| UsageFetchError::Protocol("unrecognised reset outcome".to_string()))
+}
+
+/// Estimated cost of one session (thread).
+pub fn app_server_thread_cost(
+    home: &Path,
+    timeout: Duration,
+    thread_id: &str,
+) -> Result<ThreadCost, UsageFetchError> {
+    let v = app_server_calls(
+        home,
+        timeout,
+        &[("account/usage/read", json!({ "threadId": thread_id }))],
+    )?
+    .pop()
+    .expect("one call, one answer");
+    parse_thread_cost(&v).ok_or_else(|| {
+        UsageFetchError::Protocol("codex reported no usage for that session".to_string())
+    })
+}
+
+/// Account-wide token usage (no credit figure exists at this level).
+pub fn app_server_account_usage(
+    home: &Path,
+    timeout: Duration,
+) -> Result<AccountUsage, UsageFetchError> {
+    let v = app_server_calls(home, timeout, &[("account/usage/read", Value::Null)])?
+        .pop()
+        .expect("one call, one answer");
+    Ok(parse_account_usage(&v))
+}
+
+/// Spawn one `codex app-server`, handshake, issue `calls` in order, and tear
+/// the child down completely before returning. Results are in call order.
+pub fn app_server_calls(
+    home: &Path,
+    timeout: Duration,
+    calls: &[(&str, Value)],
+) -> Result<Vec<Value>, UsageFetchError> {
     let deadline = Instant::now() + timeout;
 
     let mut cmd = Command::new("codex");
@@ -335,7 +624,7 @@ pub fn app_server_rate_limits(home: &Path, timeout: Duration) -> Result<Value, U
         let _ = tail_tx.send(drain_tail(stderr, STDERR_TAIL_BYTES));
     });
 
-    let result = (|| -> Result<Value, UsageFetchError> {
+    let result = (|| -> Result<Vec<Value>, UsageFetchError> {
         write_frame(
             &mut stdin,
             &json!({
@@ -344,7 +633,7 @@ pub fn app_server_rate_limits(home: &Path, timeout: Duration) -> Result<Value, U
                 "params": {
                     "clientInfo": {
                         "name": "codex-clean",
-                        "title": "codex-clean seat status",
+                        "title": "codex-clean",
                         "version": env!("CARGO_PKG_VERSION")
                     }
                 }
@@ -352,8 +641,17 @@ pub fn app_server_rate_limits(home: &Path, timeout: Duration) -> Result<Value, U
         )?;
         wait_for_response(&rx, 1, deadline)?;
         write_frame(&mut stdin, &json!({"method": "initialized"}))?;
-        write_frame(&mut stdin, &json!({"id": 2, "method": "account/rateLimits/read"}))?;
-        wait_for_response(&rx, 2, deadline)
+        let mut out = Vec::with_capacity(calls.len());
+        for (i, (method, params)) in calls.iter().enumerate() {
+            let id = i as u64 + 2;
+            let mut frame = json!({ "id": id, "method": method });
+            if !params.is_null() {
+                frame["params"] = params.clone();
+            }
+            write_frame(&mut stdin, &frame)?;
+            out.push(wait_for_response(&rx, id, deadline)?);
+        }
+        Ok(out)
     })();
 
     // Teardown, in order: close stdin, let it exit (within the remaining
@@ -375,6 +673,7 @@ pub fn app_server_rate_limits(home: &Path, timeout: Duration) -> Result<Value, U
     });
     let result = match (result, teardown) {
         (Ok(v), Ok(())) => Ok(v),
+        #[allow(unreachable_patterns)]
         (Ok(_), Err(t)) => Err(UsageFetchError::Protocol(format!(
             "codex app-server answered but could not be shut down cleanly ({}); \
              not trusting the scratch auth state",
@@ -621,7 +920,41 @@ pub fn parse_rate_limits_result(result: &Value, fetched_at: DateTime<Utc>) -> Re
             },
         });
 
+    let resets = result
+        .get("rateLimitResetCredits")
+        .filter(|v| v.is_object())
+        .map(|rc| {
+            // Only entries the backend still calls `available` can be redeemed;
+            // report the earliest future expiry among them.
+            let mut next: Option<(DateTime<Utc>, Option<String>)> = None;
+            for c in rc.get("credits").and_then(|c| c.as_array()).into_iter().flatten() {
+                if c.get("status").and_then(|s| s.as_str()) != Some("available") {
+                    continue;
+                }
+                let Some(exp) = c.get("expiresAt").and_then(|t| t.as_i64()).and_then(|ts| DateTime::from_timestamp(ts, 0)) else {
+                    continue;
+                };
+                if exp <= fetched_at {
+                    continue;
+                }
+                let title = c.get("title").and_then(|t| t.as_str()).map(|t| sanitize_text(t, 60));
+                if next.as_ref().is_none_or(|(cur, _)| exp < *cur) {
+                    next = Some((exp, title));
+                }
+            }
+            UsageResets {
+                available: rc
+                    .get("availableCount")
+                    .and_then(|n| n.as_u64())
+                    .unwrap_or(0)
+                    .min(u32::MAX as u64) as u32,
+                next_expires_at: next.as_ref().map(|(e, _)| *e),
+                next_title: next.and_then(|(_, t)| t),
+            }
+        });
+
     Ok(UsageSnapshot {
+        resets,
         fetched_at,
         plan_type: rl.get("planType").and_then(|p| p.as_str()).map(String::from),
         buckets,
@@ -837,6 +1170,50 @@ fn cooldown_until_for(
         rotation.cooldown_max_seconds,
         rotation.cooldown_jitter_seconds,
     )
+}
+
+/// A successful reset whose follow-up reading failed: the recorded snapshot
+/// is now known to be wrong (it still says exhausted), so drop it and lift the
+/// window cooldown the reset removed. Login, credits and spend-cap blockers
+/// stay. Without this the grant would be spent and the seat still blocked.
+pub fn invalidate_after_reset(state: &mut SeatState, seat: &str, now: DateTime<Utc>) -> bool {
+    let st = state.get(seat);
+    let reason = CooldownReason::parse(st.cooldown_reason.as_deref().unwrap_or(""));
+    let entry = state.entry_mut(seat);
+    entry.usage = None;
+    if entry.cooldown_until.is_some_and(|u| u > now) && reason.is_window_based() {
+        entry.cooldown_until = None;
+        entry.cooldown_reason = None;
+        return true;
+    }
+    false
+}
+
+/// After a successful free reset, drop the cooldown the reset just lifted.
+///
+/// `reconcile_snapshots` only clears cooldowns on credit evidence, so without
+/// this the seat would stay cooling and the grant would be wasted. Only
+/// window-based reasons are cleared, and only when the refreshed reading
+/// agrees the seat is usable; `credits`, `spend_control` and `needs_login`
+/// are left alone.
+pub fn clear_window_cooldown_after_reset(
+    state: &mut SeatState,
+    seat: &str,
+    now: DateTime<Utc>,
+) -> bool {
+    let st = state.get(seat);
+    let Some(snap) = st.usage.as_ref() else { return false };
+    if matches!(verdict(snap, now), UsageVerdict::Exhausted { .. }) {
+        return false;
+    }
+    let reason = CooldownReason::parse(st.cooldown_reason.as_deref().unwrap_or(""));
+    if st.cooldown_until.is_none_or(|u| u <= now) || !reason.is_window_based() {
+        return false;
+    }
+    let entry = state.entry_mut(seat);
+    entry.cooldown_until = None;
+    entry.cooldown_reason = None;
+    true
 }
 
 /// Re-establish cooldowns from **cached** readings: a seat with no active
@@ -1412,6 +1789,7 @@ mod tests {
             }],
             credits: Some(UsageCredits { has_credits: false, unlimited: false, balance: None }),
             spend_control_reached: Some(false),
+            resets: None,
         }
     }
 
@@ -1525,6 +1903,7 @@ mod tests {
             buckets: vec![snap.buckets[1].clone()],
             credits: None,
             spend_control_reached: None,
+            resets: None,
         };
         assert_eq!(verdict(&premium_only, now()), UsageVerdict::Healthy);
         assert!(enforcement_bucket(&premium_only).is_none());
@@ -1675,6 +2054,111 @@ mod tests {
         // snapshot that still shows 100% without credits starts a new one.
         reconcile_snapshots(&cfg, &mut state, vec![("a".into(), snap)], expiry);
         assert!(state.get("a").cooldown_until.unwrap() > expiry);
+    }
+
+    #[test]
+    fn parse_reads_free_reset_grants() {
+        let mk = |status: &str, exp_offset: i64, id: &str| {
+            json!({"id": id, "resetType": "codexRateLimits", "status": status,
+                   "grantedAt": now().timestamp() - 100,
+                   "expiresAt": now().timestamp() + exp_offset,
+                   "title": "Full reset (Weekly + 5 hr)"})
+        };
+        let v = json!({"rateLimits": {"primary": {"usedPercent": 5}},
+            "rateLimitResetCredits": {"availableCount": 3, "credits": [
+                mk("available", 900_000, "later"),
+                mk("available", 300_000, "soonest"),
+                mk("redeemed", 100, "spent"),
+                mk("available", -60, "expired")]}});
+        let snap = parse_rate_limits_result(&v, now()).unwrap();
+        let r = snap.resets.clone().unwrap();
+        assert_eq!(r.available, 3, "the backend's own count is reported");
+        assert_eq!(r.next_expires_at, Some(now() + chrono::Duration::seconds(300_000)),
+            "earliest expiry among redeemable grants (redeemed and expired ignored)");
+        assert_eq!(r.next_title.as_deref(), Some("Full reset (Weekly + 5 hr)"));
+        // --dry-run listing sees the same two, with ids.
+        let listed = parse_reset_credits(&v, now());
+        assert_eq!(listed.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["later", "soonest"]);
+        // No section at all.
+        let snap = parse_rate_limits_result(&json!({"rateLimits": {}}), now()).unwrap();
+        assert!(snap.resets.is_none());
+        assert!(parse_reset_credits(&json!({"rateLimits": {}}), now()).is_empty());
+    }
+
+    #[test]
+    fn reset_outcomes_and_cost_formatting() {
+        for (raw, parsed) in [
+            ("reset", ResetOutcome::Reset),
+            ("nothingToReset", ResetOutcome::NothingToReset),
+            ("noCredit", ResetOutcome::NoCredit),
+            ("alreadyRedeemed", ResetOutcome::AlreadyRedeemed),
+        ] {
+            assert_eq!(ResetOutcome::parse(raw), Some(parsed));
+        }
+        assert_eq!(ResetOutcome::parse("somethingNew"), None);
+        assert!(ResetOutcome::Reset.is_reset() && !ResetOutcome::NothingToReset.is_reset());
+
+        assert_eq!(
+            format_cost(&ThreadCost { credits_micros: 420_000, usd_micros: Some(52_000) }),
+            "≈0.42 credits (≈$0.05)"
+        );
+        assert_eq!(format_cost(&ThreadCost { credits_micros: 0, usd_micros: None }), "≈0.00 credits");
+        assert_eq!(
+            format_cost(&ThreadCost { credits_micros: 12_500_000, usd_micros: None }),
+            "≈12.50 credits"
+        );
+        assert_eq!(
+            parse_thread_cost(&json!({"threadUsage": {"estimatedUsageCreditsMicros": 1, "estimatedUsageUsdMicros": null}})),
+            Some(ThreadCost { credits_micros: 1, usd_micros: None })
+        );
+        assert!(parse_thread_cost(&json!({"threadUsage": {}})).is_none());
+        assert_eq!(format_tokens(1_329_690_061), "1.33B");
+        assert_eq!(format_tokens(46_303_727), "46.3M");
+        assert_eq!(format_tokens(912), "912");
+
+        let u = parse_account_usage(&json!({"summary": {"lifetimeTokens": 100},
+            "dailyUsageBuckets": [{"startDate":"2026-09-01","tokens":1},{"startDate":"2026-09-02","tokens":2},
+                                  {"startDate":"2026-09-03","tokens":4},{"startDate":"2026-09-04","tokens":8},
+                                  {"startDate":"2026-09-05","tokens":16},{"startDate":"2026-09-06","tokens":32},
+                                  {"startDate":"2026-09-07","tokens":64},{"startDate":"2026-09-08","tokens":128}]}));
+        assert_eq!(u.lifetime_tokens, Some(100));
+        assert_eq!(u.last_7d_tokens, 2 + 4 + 8 + 16 + 32 + 64 + 128, "last seven buckets only");
+    }
+
+    #[test]
+    fn clear_after_reset_only_lifts_what_a_reset_lifts() {
+        let mut state = SeatState::default();
+        // Cooling for a window limit, and the refreshed reading is healthy.
+        state.entry_mut("a").cooldown_until = Some(now() + chrono::Duration::hours(20));
+        state.entry_mut("a").cooldown_reason = Some("rate_limit".into());
+        state.entry_mut("a").usage = Some(snap_with(&[(300, 2, Some(600))]));
+        assert!(clear_window_cooldown_after_reset(&mut state, "a", now()));
+        assert!(state.get("a").cooldown_until.is_none());
+
+        // A credits or spend-cap cooldown is not something a reset lifts.
+        for reason in ["credits", "spend_control"] {
+            let mut state = SeatState::default();
+            state.entry_mut("a").cooldown_until = Some(now() + chrono::Duration::hours(20));
+            state.entry_mut("a").cooldown_reason = Some(reason.into());
+            state.entry_mut("a").usage = Some(snap_with(&[(300, 2, Some(600))]));
+            assert!(!clear_window_cooldown_after_reset(&mut state, "a", now()), "{}", reason);
+            assert!(state.get("a").cooldown_until.is_some(), "{}", reason);
+        }
+        // A reading that still says exhausted keeps the cooldown.
+        let mut state = SeatState::default();
+        state.entry_mut("a").cooldown_until = Some(now() + chrono::Duration::hours(20));
+        state.entry_mut("a").cooldown_reason = Some("rate_limit".into());
+        state.entry_mut("a").usage = Some(snap_with(&[(10080, 100, Some(600))]));
+        assert!(!clear_window_cooldown_after_reset(&mut state, "a", now()));
+        // Cached reset counts survive a state round-trip.
+        let mut snap = snap_with(&[(300, 1, None)]);
+        snap.resets = Some(UsageResets { available: 2, next_expires_at: Some(now()), next_title: Some("t".into()) });
+        let mut st = SeatState::default();
+        st.entry_mut("a").usage = Some(snap);
+        let back: SeatState = serde_json::from_str(&serde_json::to_string(&st).unwrap()).unwrap();
+        assert_eq!(back.get("a").usage.unwrap().resets.unwrap().available, 2);
+        let legacy: SeatState = serde_json::from_str(r#"{"seats":{"a":{"usage":{"fetched_at":"2026-09-01T00:00:00Z"}}}}"#).unwrap();
+        assert!(legacy.get("a").usage.unwrap().resets.is_none());
     }
 
     #[test]

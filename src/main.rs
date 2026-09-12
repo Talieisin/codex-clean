@@ -44,6 +44,20 @@ enum Commands {
         #[command(subcommand)]
         action: SeatAction,
     },
+    /// Estimated credit cost of a finished session
+    Cost {
+        /// Session (thread) id; omit with --last
+        session_id: Option<String>,
+        /// Use the most recent session this wrapper ran
+        #[arg(long)]
+        last: bool,
+        /// Seat that ran it (default: inferred)
+        #[arg(long, value_name = "NAME")]
+        seat: Option<String>,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -74,6 +88,23 @@ enum SeatAction {
         /// Clear the recorded cooldown for this seat (the only way `status` removes one)
         #[arg(long, value_name = "NAME")]
         clear_cooldown: Option<String>,
+        /// Also show account token activity (one extra call per seat)
+        #[arg(long)]
+        usage: bool,
+    },
+    /// Redeem a free usage-limit reset (codex grants these; they expire unused)
+    Reset {
+        /// Seat to reset (default: the seat a run would pick)
+        name: Option<String>,
+        /// Redeem this specific grant (see --dry-run for ids)
+        #[arg(long, value_name = "ID")]
+        credit_id: Option<String>,
+        /// List the available resets without redeeming one
+        #[arg(long)]
+        dry_run: bool,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
     },
     /// Show or set the rotation strategy: least-recently-used (lru), round-robin (rr), fixed <seat>, balanced
     Strategy {
@@ -127,6 +158,12 @@ fn main() -> ExitCode {
         }) => run_resume(last, session_id, prompt),
         Some(Commands::Review { args }) => run_review(args),
         Some(Commands::Seat { action }) => run_seat(action),
+        Some(Commands::Cost {
+            session_id,
+            last,
+            seat,
+            json,
+        }) => seat_cmd::cost(session_id.as_deref(), last, seat.as_deref(), json),
         None => run_exec(cli.args),
     };
 
@@ -152,7 +189,14 @@ fn run_seat(action: SeatAction) -> anyhow::Result<i32> {
             name,
             json,
             clear_cooldown,
-        } => seat_cmd::status(name.as_deref(), json, clear_cooldown.as_deref()),
+            usage,
+        } => seat_cmd::status(name.as_deref(), json, clear_cooldown.as_deref(), usage),
+        SeatAction::Reset {
+            name,
+            credit_id,
+            dry_run,
+            json,
+        } => seat_cmd::reset(name.as_deref(), credit_id.as_deref(), dry_run, json),
         SeatAction::Strategy { name, seat } => {
             seat_cmd::strategy(name.as_deref(), seat.as_deref()).map(|()| 0)
         }

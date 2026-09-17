@@ -539,10 +539,22 @@ where
             .as_ref()
             .ok()
             .is_some_and(|n| matches!(quota_state(&state.get(n), Utc::now()), QuotaState::OnCredits { .. }));
+        //
+        // "Could not proceed anyway" is not only a failed pick: a paid seat can
+        // be picked and still be unrunnable because the attempt budget is spent
+        // or it has already been tried this run. The loop `break`s there
+        // assuming the reset decision has had its say, so that case must reach
+        // the gate too — otherwise the run ends on the child's exit code and
+        // the free reset is never offered.
+        let paid_pick_unusable = would_pay
+            && pick
+                .as_ref()
+                .ok()
+                .is_some_and(|n| !budget_left || ctx.tried_seats.contains(n));
         let reset_gate = match cfg.rotation.resets {
             ResetPolicy::Never => false,
             ResetPolicy::Auto => pick_is_blocked(&pick) || would_pay,
-            ResetPolicy::Ask => pick_is_blocked(&pick),
+            ResetPolicy::Ask => pick_is_blocked(&pick) || paid_pick_unusable,
         };
         if reset_gate {
             match reset_candidates(&cfg, &state, override_seat, Utc::now()) {

@@ -3409,6 +3409,43 @@ fn every_consent_route_proceeds_and_still_advertises_the_free_reset() {
 }
 
 #[test]
+fn a_consented_seat_that_cannot_be_attempted_still_offers_the_reset() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // The budget is one attempt. An in-quota seat takes it and hits a
+    // resettable rate limit; the remaining seat is on credits with standing
+    // consent, so the pick SUCCEEDS — but it can never be attempted. The run
+    // cannot proceed, so the free reset must still be offered rather than the
+    // failed child's exit code returned.
+    let env = TestEnv::new();
+    setup_blocked_with_resets(&env, CreditPolicy::Always, ResetPolicy::Ask);
+    let mut cfg = SeatConfig::load().unwrap().unwrap();
+    cfg.rotation.max_retries = 0;
+    env.save_config(&cfg);
+    let mut st = env.load_state();
+    // main is in quota and least recently used, so it runs first and fails.
+    st.entry_mut("main").usage = Some(with_resets(snapshot(10, 10), 3));
+    st.entry_mut("main").last_used = None;
+    st.entry_mut("backup1").last_used = Some(chrono::Utc::now());
+    env.save_state(&st);
+
+    let client = ResetClient::new(ResetOutcome::Reset, snapshot(1, 1));
+    let codex_home = env.codex_home_path.clone();
+    let attempt = mock_attempt(&codex_home, |acct| {
+        if acct == "user-bob" {
+            panic!("the paid seat has no budget left; it must not run");
+        }
+        rate_limit_attempt()
+    });
+    assert_eq!(
+        runner::run_codex_with_client(&[], "hi", Mode::Exec, attempt, &client).unwrap(),
+        EXIT_RESET_AVAILABLE,
+        "a run that cannot proceed must offer the free reset, consent or not"
+    );
+    assert_eq!(client.consumed(), 0, "ask still does not redeem by itself");
+    let _ = env;
+}
+
+#[test]
 fn seat_reset_policy_shows_sets_and_rejects() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let env = TestEnv::new();

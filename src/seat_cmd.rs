@@ -788,6 +788,7 @@ fn print_status_json(
         .collect();
     let doc = json!({
         "credits_mode": config.rotation.credits.as_str(),
+        "resets_mode": config.rotation.resets.as_str(),
         "credit_grants": active_grants_json(config, state, now),
         "seats": seats,
         "notices": global_notices,
@@ -1174,6 +1175,31 @@ pub fn strategy(name: Option<&str>, fixed_seat: Option<&str>) -> Result<()> {
             .map(|s| format!(" (preferring seat '{}')", s))
             .unwrap_or_default()
     );
+    Ok(())
+}
+
+/// `codex-clean seat reset-policy [ask|never|auto]`: show or set whether a
+/// blocked run may redeem a free usage-limit reset.
+///
+/// Named `reset-policy` rather than `resets` on purpose: `seat reset` redeems a
+/// finite grant immediately, so a dropped "s" on `seat resets never` would spend
+/// one. This name cannot be fat-fingered into a redemption.
+pub fn reset_policy(action: Option<&str>) -> Result<()> {
+    let _lock = if action.is_some() { Some(CodexLock::acquire()?) } else { None };
+    let mut config = SeatConfig::load()?
+        .ok_or_else(|| anyhow!("no seats configured; run `codex-clean seat add <name>` first"))?;
+    let Some(action) = action else {
+        println!("{}", config.rotation.resets);
+        println!("Available: ask (default), never, auto");
+        return Ok(());
+    };
+    let policy = seat::ResetPolicy::parse(action)
+        .ok_or_else(|| anyhow!("unknown reset policy '{}'; use ask, never or auto", action))?;
+    config.rotation.resets = policy;
+    config.validate()?;
+    config.save()?;
+    log_event("reset_policy", "-", &format!("set to {}", policy));
+    eprintln!("Free-reset policy is now {}.", policy);
     Ok(())
 }
 

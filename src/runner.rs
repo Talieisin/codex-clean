@@ -526,14 +526,25 @@ where
 
         // A free usage-limit reset beats both waiting and paying, so it is
         // decided here — under the lock, before the credits question — and
-        // only for blocks a reset can actually lift. This covers the run that
-        // *would* proceed on credits (consent already given): a free reset is
-        // still better than spending money, so it is offered first.
+        // only for blocks a reset can actually lift.
+        //
+        // The two policies differ in what they may act on, because they differ
+        // in what they do. `auto` redeems instead of paying, so it also covers
+        // a run that *would* have proceeded on credits: free beats paid, and an
+        // automatic redemption leaves the caller nothing to do. `ask` STOPS the
+        // run, so it may only stop a run that could not proceed anyway —
+        // blocking a run the user has already consented to pay for leaves them
+        // no next step but to redeem, which is not consent.
         let would_pay = pick
             .as_ref()
             .ok()
             .is_some_and(|n| matches!(quota_state(&state.get(n), Utc::now()), QuotaState::OnCredits { .. }));
-        if cfg.rotation.resets != ResetPolicy::Never && (pick_is_blocked(&pick) || would_pay) {
+        let reset_gate = match cfg.rotation.resets {
+            ResetPolicy::Never => false,
+            ResetPolicy::Auto => pick_is_blocked(&pick) || would_pay,
+            ResetPolicy::Ask => pick_is_blocked(&pick),
+        };
+        if reset_gate {
             match reset_candidates(&cfg, &state, override_seat, Utc::now()) {
                 candidates if candidates.is_empty() => {}
                 candidates => {
@@ -566,6 +577,24 @@ where
                             print_attempt(&prev);
                             print_failed_seat_line(&cfg, &state, override_seat, &ctx.last_failed_seat);
                         }
+                        // Why the run stopped, and every way out of it. Named
+                        // only when credits could actually help: pointing at
+                        // them when the block is a cooldown is a dead end.
+                        // Printed here so the `Seats:` notice stays the last
+                        // line — parsers treat that trailing paragraph as
+                        // status and everything above it as agent output.
+                        let credits_escape = matches!(pick, Err(SeatPickError::QuotaUsedCreditsAvailable { .. }));
+                        println!();
+                        println!(
+                            "Stopped for a free reset (exit {}) — redeem with `codex-clean seat reset {}`{}.",
+                            EXIT_RESET_AVAILABLE,
+                            candidates[0],
+                            if credits_escape {
+                                ", or re-run with CODEX_CLEAN_USE_CREDITS=1 to spend credits instead"
+                            } else {
+                                ""
+                            }
+                        );
                         print_seat_notice(&cfg, &state, this_run);
                         return Ok(Step::Done(EXIT_RESET_AVAILABLE));
                     }

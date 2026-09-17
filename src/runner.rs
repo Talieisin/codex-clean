@@ -595,17 +595,20 @@ where
                         // Printed here so the `Seats:` notice stays the last
                         // line — parsers treat that trailing paragraph as
                         // status and everything above it as agent output.
-                        let credits_escape = matches!(pick, Err(SeatPickError::QuotaUsedCreditsAvailable { .. }));
+                        let other_way_out = if matches!(pick, Err(SeatPickError::QuotaUsedCreditsAvailable { .. })) {
+                            ", or re-run with CODEX_CLEAN_USE_CREDITS=1 to spend credits instead"
+                        } else if paid_pick_unusable {
+                            // Consent is already in hand here — what ran out is
+                            // this invocation's attempt budget, so setting the
+                            // variable again would change nothing.
+                            ", or re-run to give the already-consented seat another attempt"
+                        } else {
+                            ""
+                        };
                         println!();
                         println!(
                             "Stopped for a free reset (exit {}) — redeem with `codex-clean seat reset {}`{}.",
-                            EXIT_RESET_AVAILABLE,
-                            candidates[0],
-                            if credits_escape {
-                                ", or re-run with CODEX_CLEAN_USE_CREDITS=1 to spend credits instead"
-                            } else {
-                                ""
-                            }
+                            EXIT_RESET_AVAILABLE, candidates[0], other_way_out
                         );
                         print_seat_notice(&cfg, &state, this_run);
                         return Ok(Step::Done(EXIT_RESET_AVAILABLE));

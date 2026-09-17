@@ -250,7 +250,7 @@ Seat: backup1 (balanced; usage 5h 48% wk 14%, as of 2m ago)
 
 - **Session ID** is displayed first for easy copying/resuming
 - **`Seat:` line** (multi-seat only) — the last line of the normal output (after `Tokens:` when codex reported usage; a run that failed before reporting usage has no `Tokens:` line, so anchor on the `Seat:` prefix rather than on position). It names the seat that ran, the strategy (or `pinned via CODEX_CLEAN_SEAT`), that seat's last recorded usage and its age, any seats exhausted earlier in the same run, and the outcome if the run failed, e.g. `Seat: backup1 (balanced; usage 5h 48% wk 14%, as of 2m ago)`. Seat names and quota percentages therefore reach any log that captures stdout; set `CODEX_CLEAN_NO_SEAT_LINE=1` to suppress the line
-- **`Seats:` trailer** (multi-seat only) — one extra paragraph after `Tokens:` whenever a seat needs login, is cooling, or has used its included quota while credits are available but not allowed (then it states that the user's consent is needed), or a free usage-limit reset is available — so it can appear on a fully usable pool, because a seat running on consented credits counts as usable while the reset is still worth mentioning. Parsers should treat any trailing paragraph beginning `Seats:` as status, not agent output
+- **`Seats:` trailer** (multi-seat only) — one extra paragraph after `Tokens:` whenever a seat needs login, is cooling, or has used its included quota while credits are available but not allowed (then it states that the user's consent is needed), or (unless `rotation.resets = never`, which never mentions resets) a free usage-limit reset is available — so it can appear on a fully usable pool, because a seat running on consented credits counts as usable while the reset is still worth mentioning. Parsers should treat any trailing paragraph beginning `Seats:` as status, not agent output
 - **Stderr is suppressed** on success (no thinking tokens cluttering output)
 - **Stderr is shown** on failure to aid debugging
 - **Agent messages** are aggregated with newline separators
@@ -345,7 +345,7 @@ codex-clean seat remove <NAME> [--yes]
 | `1` | Codex error (rate-limit on a pinned seat, auth error, or any other non-zero codex exit); also when every seat needs a login |
 | `75` | All seats cooling (`EX_TEMPFAIL`), whether detected up front or after rotation exhausted every seat within the run — try again after the soonest cooldown expiry |
 | `77` | Included quota is used up and only workspace credits remain, without consent (`EX_NOPERM`) — ask the user, then re-run with `CODEX_CLEAN_USE_CREDITS=1` or run `codex-clean seat credits allow` |
-| `78` | The run **cannot proceed** and a **free** usage-limit reset would unblock it, with `rotation.resets = ask` — ask the user, then run `codex-clean seat reset <seat>`. Takes precedence over 77 and 75. If the user would rather pay than redeem, re-running with `CODEX_CLEAN_USE_CREDITS=1` proceeds on credits and leaves the grant intact |
+| `78` | The run **cannot proceed** and a **free** usage-limit reset would unblock it, with `rotation.resets = ask` — ask the user, then run `codex-clean seat reset <seat>`. Takes precedence over 77 and 75. When the stopped line names `CODEX_CLEAN_USE_CREDITS=1`, re-running with it proceeds on credits and leaves the grant intact; when it does not, credits cannot lift this block and only the reset (or waiting) will |
 
 ## Features
 

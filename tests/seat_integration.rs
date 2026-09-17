@@ -3446,6 +3446,35 @@ fn a_consented_seat_that_cannot_be_attempted_still_offers_the_reset() {
 }
 
 #[test]
+fn the_stopped_line_offers_a_re_run_when_consent_is_already_held() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Budget exhausted with consent already given: telling the caller to set
+    // CODEX_CLEAN_USE_CREDITS=1 would be useless — it is already effectively
+    // set. What unblocks the seat is a fresh invocation.
+    let env = TestEnv::new();
+    setup_blocked_with_resets(&env, CreditPolicy::Always, ResetPolicy::Ask);
+    let mut cfg = SeatConfig::load().unwrap().unwrap();
+    cfg.rotation.max_retries = 0;
+    env.save_config(&cfg);
+    let mut st = env.load_state();
+    st.entry_mut("main").usage = Some(with_resets(snapshot(10, 10), 3));
+    st.entry_mut("main").last_used = None;
+    st.entry_mut("backup1").last_used = Some(chrono::Utc::now());
+    env.save_state(&st);
+
+    let bin = tempfile::tempdir().unwrap();
+    install_fake_codex_exec(bin.path(), "{\"type\":\"error\",\"message\":\"You've hit your usage limit.\"}", 1);
+    let (code, out) = run_binary(&env, bin.path(), &[]);
+    assert_eq!(code, 78, "{}", out);
+    let stopped = out
+        .lines()
+        .find(|l| l.starts_with("Stopped for a free reset"))
+        .unwrap_or_else(|| panic!("no stopped line in: {}", out));
+    assert!(stopped.contains("re-run to give the already-consented seat another attempt"), "{}", stopped);
+    assert!(!stopped.contains("CODEX_CLEAN_USE_CREDITS"), "consent is already held: {}", stopped);
+}
+
+#[test]
 fn seat_reset_policy_shows_sets_and_rejects() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let env = TestEnv::new();

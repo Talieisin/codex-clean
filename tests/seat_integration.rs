@@ -3088,6 +3088,49 @@ fn stdout_tells_a_headless_caller_about_the_free_reset() {
     assert!(last.contains("3 free usage-limit reset(s) available on main"), "{}", last);
     assert!(last.contains("codex-clean seat reset main"), "{}", last);
     assert!(last.contains("next expires"), "{}", last);
+    // Why the run stopped, and both ways out — above the `Seats:` line, which
+    // stays last because parsers treat it as the status paragraph.
+    let stopped = out
+        .lines()
+        .find(|l| l.starts_with("Stopped for a free reset"))
+        .unwrap_or_else(|| panic!("no stopped line in: {}", out));
+    assert!(stopped.contains("exit 78"), "{}", stopped);
+    assert!(stopped.contains("codex-clean seat reset main"), "{}", stopped);
+    assert!(
+        stopped.contains("CODEX_CLEAN_USE_CREDITS=1"),
+        "credits are available here, so the paid way out must be named: {}",
+        stopped
+    );
+}
+
+#[test]
+fn the_stopped_line_names_credits_only_when_they_could_help() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Cooling on a plain rate limit with no credits: a reset lifts it, money
+    // does not, so pointing at CODEX_CLEAN_USE_CREDITS=1 would be a dead end.
+    let env = TestEnv::new();
+    setup_blocked_with_resets(&env, CreditPolicy::Ask, ResetPolicy::Ask);
+    let mut st = env.load_state();
+    for n in ["main", "backup1"] {
+        let e = st.entry_mut(n);
+        e.usage = Some(with_resets(snapshot(100, 100), 3));
+        e.cooldown_until = Some(chrono::Utc::now() + chrono::Duration::hours(2));
+        e.cooldown_reason = Some("rate_limit".into());
+    }
+    env.save_state(&st);
+    let bin = tempfile::tempdir().unwrap();
+    install_fake_codex_exec(bin.path(), "{\"type\":\"thread.started\",\"thread_id\":\"t\"}", 0);
+    let (code, out) = run_binary(&env, bin.path(), &[]);
+    assert_eq!(code, 78, "{}", out);
+    let stopped = out
+        .lines()
+        .find(|l| l.starts_with("Stopped for a free reset"))
+        .unwrap_or_else(|| panic!("no stopped line in: {}", out));
+    assert!(
+        !stopped.contains("CODEX_CLEAN_USE_CREDITS"),
+        "credits cannot lift a rate-limit cooldown: {}",
+        stopped
+    );
 }
 
 
@@ -3287,23 +3330,24 @@ fn cost_last_follows_the_session_clock_not_the_run_clock() {
 
 
 #[test]
-fn a_free_reset_is_offered_even_when_credits_are_already_allowed() {
+fn consent_to_pay_is_honoured_while_a_free_reset_is_pending() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    // Credits are permitted (always), so the seat is runnable — but spending
-    // money when a free reset exists is exactly what this must avoid.
+    // Credits are permitted (always), so the seat is runnable. Under `ask` the
+    // run must PROCEED: stopping a run the user has already consented to pay
+    // for leaves a headless caller no way to act on its own approval — it
+    // re-runs with consent, gets 78 again, and loops. The free reset is still
+    // advertised on the `Seats:` line.
     let env = TestEnv::new();
     setup_blocked_with_resets(&env, CreditPolicy::Always, ResetPolicy::Ask);
     let client = ResetClient::new(ResetOutcome::Reset, snapshot(1, 1));
-    let attempt = |_a: &[String], _p: &str, _m: &Mode, _s: bool| -> anyhow::Result<AttemptResult> {
-        panic!("must not spend credits while a free reset is available")
-    };
+    let codex_home = env.codex_home_path.clone();
     assert_eq!(
-        runner::run_codex_with_client(&[], "hi", Mode::Exec, attempt, &client).unwrap(),
-        EXIT_RESET_AVAILABLE
+        runner::run_codex_with_client(&[], "hi", Mode::Exec, mock_attempt(&codex_home, |_| ok_attempt()), &client).unwrap(),
+        0
     );
-    assert_eq!(client.consumed(), 0, "ask still does not redeem by itself");
+    assert_eq!(client.consumed(), 0, "ask must never redeem by itself");
 
-    // With auto it redeems and then runs, still without spending credits.
+    // With auto it redeems instead of paying, and then runs.
     let env = TestEnv::new();
     setup_blocked_with_resets(&env, CreditPolicy::Always, ResetPolicy::Auto);
     let client = ResetClient::new(ResetOutcome::Reset, with_resets(snapshot(2, 2), 2));
@@ -3314,6 +3358,166 @@ fn a_free_reset_is_offered_even_when_credits_are_already_allowed() {
     );
     assert_eq!(client.consumed(), 1);
     let _ = env;
+}
+
+#[test]
+fn every_consent_route_proceeds_and_still_advertises_the_free_reset() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Route 1: the per-run env var. This is the exact loop that was reported —
+    // 78, user approves credits, re-run with the var, 78 again.
+    let env = TestEnv::new();
+    setup_blocked_with_resets(&env, CreditPolicy::Ask, ResetPolicy::Ask);
+    std::env::set_var("CODEX_CLEAN_USE_CREDITS", "1");
+    let client = ResetClient::new(ResetOutcome::Reset, snapshot(1, 1));
+    let codex_home = env.codex_home_path.clone();
+    assert_eq!(
+        runner::run_codex_with_client(&[], "hi", Mode::Exec, mock_attempt(&codex_home, |_| ok_attempt()), &client).unwrap(),
+        0,
+        "consent given by env var must let the run proceed, not return 78 again"
+    );
+    assert_eq!(client.consumed(), 0, "the grant is not spent on the user's behalf");
+    // The free option is still put in front of the caller, as advice.
+    let cfg = SeatConfig::load().unwrap().unwrap();
+    let notice = seat::seat_notice(&cfg, &env.load_state(), chrono::Utc::now(), &|_| true).unwrap();
+    assert!(notice.contains("codex-clean seat reset main"), "{}", notice);
+    std::env::remove_var("CODEX_CLEAN_USE_CREDITS");
+
+    // Route 2: a `seat credits allow` grant recorded in state.
+    let env = TestEnv::new();
+    setup_blocked_with_resets(&env, CreditPolicy::Ask, ResetPolicy::Ask);
+    let cfg = SeatConfig::load().unwrap().unwrap();
+    let mut st = env.load_state();
+    let resets_at = chrono::Utc::now() + chrono::Duration::days(3);
+    seat::grant_credits_until_reset(
+        &cfg,
+        &mut st,
+        &[("main".to_string(), Some(resets_at)), ("backup1".to_string(), Some(resets_at))],
+        chrono::Utc::now(),
+    )
+    .unwrap();
+    env.save_state(&st);
+    let client = ResetClient::new(ResetOutcome::Reset, snapshot(1, 1));
+    let codex_home = env.codex_home_path.clone();
+    assert_eq!(
+        runner::run_codex_with_client(&[], "hi", Mode::Exec, mock_attempt(&codex_home, |_| ok_attempt()), &client).unwrap(),
+        0,
+        "a standing grant is consent too"
+    );
+    assert_eq!(client.consumed(), 0);
+    let _ = env;
+}
+
+#[test]
+fn a_consented_seat_that_cannot_be_attempted_still_offers_the_reset() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // The budget is one attempt. An in-quota seat takes it and hits a
+    // resettable rate limit; the remaining seat is on credits with standing
+    // consent, so the pick SUCCEEDS — but it can never be attempted. The run
+    // cannot proceed, so the free reset must still be offered rather than the
+    // failed child's exit code returned.
+    let env = TestEnv::new();
+    setup_blocked_with_resets(&env, CreditPolicy::Always, ResetPolicy::Ask);
+    let mut cfg = SeatConfig::load().unwrap().unwrap();
+    cfg.rotation.max_retries = 0;
+    env.save_config(&cfg);
+    let mut st = env.load_state();
+    // main is in quota and least recently used, so it runs first and fails.
+    st.entry_mut("main").usage = Some(with_resets(snapshot(10, 10), 3));
+    st.entry_mut("main").last_used = None;
+    st.entry_mut("backup1").last_used = Some(chrono::Utc::now());
+    env.save_state(&st);
+
+    let client = ResetClient::new(ResetOutcome::Reset, snapshot(1, 1));
+    let codex_home = env.codex_home_path.clone();
+    let attempt = mock_attempt(&codex_home, |acct| {
+        if acct == "user-bob" {
+            panic!("the paid seat has no budget left; it must not run");
+        }
+        rate_limit_attempt()
+    });
+    assert_eq!(
+        runner::run_codex_with_client(&[], "hi", Mode::Exec, attempt, &client).unwrap(),
+        EXIT_RESET_AVAILABLE,
+        "a run that cannot proceed must offer the free reset, consent or not"
+    );
+    assert_eq!(client.consumed(), 0, "ask still does not redeem by itself");
+    let _ = env;
+}
+
+#[test]
+fn the_stopped_line_offers_a_re_run_when_consent_is_already_held() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Budget exhausted with consent already given: telling the caller to set
+    // CODEX_CLEAN_USE_CREDITS=1 would be useless — it is already effectively
+    // set. What unblocks the seat is a fresh invocation.
+    let env = TestEnv::new();
+    setup_blocked_with_resets(&env, CreditPolicy::Always, ResetPolicy::Ask);
+    let mut cfg = SeatConfig::load().unwrap().unwrap();
+    cfg.rotation.max_retries = 0;
+    env.save_config(&cfg);
+    let mut st = env.load_state();
+    st.entry_mut("main").usage = Some(with_resets(snapshot(10, 10), 3));
+    st.entry_mut("main").last_used = None;
+    st.entry_mut("backup1").last_used = Some(chrono::Utc::now());
+    env.save_state(&st);
+
+    let bin = tempfile::tempdir().unwrap();
+    install_fake_codex_exec(bin.path(), "{\"type\":\"error\",\"message\":\"You've hit your usage limit.\"}", 1);
+    let (code, out) = run_binary(&env, bin.path(), &[]);
+    assert_eq!(code, 78, "{}", out);
+    let stopped = out
+        .lines()
+        .find(|l| l.starts_with("Stopped for a free reset"))
+        .unwrap_or_else(|| panic!("no stopped line in: {}", out));
+    assert!(stopped.contains("re-run to give the already-consented seat another attempt"), "{}", stopped);
+    assert!(!stopped.contains("CODEX_CLEAN_USE_CREDITS"), "consent is already held: {}", stopped);
+}
+
+#[test]
+fn seat_reset_policy_shows_sets_and_rejects() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    setup_blocked_with_resets(&env, CreditPolicy::Ask, ResetPolicy::Ask);
+    let run = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_codex-clean"))
+            .args(args)
+            .env("CODEX_CLEAN_HOME", &env.clean_home_path)
+            .env("CODEX_HOME", &env.codex_home_path)
+            .output()
+            .unwrap()
+    };
+
+    let out = run(&["seat", "reset-policy"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(text.contains("ask"), "{}", text);
+    assert!(text.contains("Available: ask (default), never, auto"), "{}", text);
+
+    for value in ["never", "auto", "ask"] {
+        let out = run(&["seat", "reset-policy", value]);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            SeatConfig::load().unwrap().unwrap().rotation.resets,
+            ResetPolicy::parse(value).unwrap(),
+            "{} did not round-trip through seats.toml",
+            value
+        );
+    }
+
+    let out = run(&["seat", "reset-policy", "sometimes"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unknown reset policy"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A headless caller can read the policy it is subject to.
+    let out = run(&["seat", "status", "--json"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {}", e, text));
+    assert_eq!(v["resets_mode"], "ask");
 }
 
 #[test]

@@ -165,11 +165,11 @@ Credits that were bought after seats started cooling are picked up automatically
 
 | Mode | Behaviour when a free reset would unblock the run |
 |---|---|
-| `ask` (default) | never redeems by itself; says one is available and exits **78** |
+| `ask` (default) | never redeems by itself; when the run **cannot proceed at all**, says one is available and exits **78** |
 | `never` | does not redeem and does not mention resets (77/75 as before) |
 | `auto` | redeems one, re-reads usage, clears the cooldown and carries on (at most one per invocation) |
 
-A reset is only ever redeemed for a block it can actually lift — the account's own usage windows. A seat that needs login, or is cooling because of a per-model cap, depleted workspace credits or a spend cap, is left alone so the grant is not wasted. The free option is also offered ahead of a run that *would* have proceeded on credits, so an available reset is used before money is. `codex-clean seat reset [SEAT]` redeems one by hand; `seat reset --dry-run` lists the grants (id, title, expiry) without redeeming. `seat status` shows a `RESETS` column and `seat credits` lists them alongside credits.
+A reset is only ever redeemed for a block it can actually lift — the account's own usage windows. A seat that needs login, or is cooling because of a per-model cap, depleted workspace credits or a spend cap, is left alone so the grant is not wasted. Under `auto` the free option is also taken ahead of a run that *would* have proceeded on credits, so an available reset is used before money is. Under `ask` it is not: once you have consented to credits by any route (`CODEX_CLEAN_USE_CREDITS=1`, `seat credits allow`, or `credits = always`) the run proceeds and the reset becomes advice on the `Seats:` line — otherwise approving credits would leave a headless caller with no way to act on its own approval. `codex-clean seat reset [SEAT]` redeems one by hand; `seat reset --dry-run` lists the grants (id, title, expiry) without redeeming. `seat status` shows a `RESETS` column and `seat credits` lists them alongside credits.
 
 **Exit-code precedence: 78 before 77 before 75.** The free option is offered before the paid one, and both before simply waiting. A headless caller should treat 78 as "ask the user whether to redeem a free reset", 77 as "ask whether to spend credits", and 75 as "retry later". The `Seats:` line names the seat, the expiry and the command:
 
@@ -250,7 +250,7 @@ Seat: backup1 (balanced; usage 5h 48% wk 14%, as of 2m ago)
 
 - **Session ID** is displayed first for easy copying/resuming
 - **`Seat:` line** (multi-seat only) — the last line of the normal output (after `Tokens:` when codex reported usage; a run that failed before reporting usage has no `Tokens:` line, so anchor on the `Seat:` prefix rather than on position). It names the seat that ran, the strategy (or `pinned via CODEX_CLEAN_SEAT`), that seat's last recorded usage and its age, any seats exhausted earlier in the same run, and the outcome if the run failed, e.g. `Seat: backup1 (balanced; usage 5h 48% wk 14%, as of 2m ago)`. Seat names and quota percentages therefore reach any log that captures stdout; set `CODEX_CLEAN_NO_SEAT_LINE=1` to suppress the line
-- **`Seats:` trailer** (multi-seat only) — one extra paragraph after `Tokens:` whenever a seat needs login, is cooling, or has used its included quota while credits are available but not allowed (then it states that the user's consent is needed); absent when every seat is usable. Parsers should treat any trailing paragraph beginning `Seats:` as status, not agent output
+- **`Seats:` trailer** (multi-seat only) — one extra paragraph after `Tokens:` whenever a seat needs login, is cooling, or has used its included quota while credits are available but not allowed (then it states that the user's consent is needed), or (unless `rotation.resets = never`, which never mentions resets) a free usage-limit reset is available — so it can appear on a fully usable pool, because a seat running on consented credits counts as usable while the reset is still worth mentioning. Parsers should treat any trailing paragraph beginning `Seats:` as status, not agent output
 - **Stderr is suppressed** on success (no thinking tokens cluttering output)
 - **Stderr is shown** on failure to aid debugging
 - **Agent messages** are aggregated with newline separators
@@ -293,6 +293,7 @@ codex-clean seat status [NAME] [--json] [--clear-cooldown NAME]
 codex-clean seat strategy [NAME [SEAT]]
 codex-clean seat credits [ask|never|always|allow|revoke]
 codex-clean seat reset [NAME] [--credit-id ID] [--dry-run] [--json]
+codex-clean seat reset-policy [ask|never|auto]
 codex-clean cost [SESSION_ID | --last] [--seat NAME] [--json]
 codex-clean seat events [--tail N]
 codex-clean seat login <NAME> [--browser]
@@ -318,6 +319,7 @@ codex-clean seat remove <NAME> [--yes]
 | `seat strategy [name [seat]]` | Show the rotation strategy, or set it: `least-recently-used`/`lru`, `round-robin`/`rr`, `fixed <seat>`, `balanced` |
 | `seat credits [action]` | Show the credits mode, grants and each seat's credit and quota state; set the mode (`ask`, `never`, `always`); `allow` grants every workspace whose quota is used up until its quota resets; `revoke` removes all grants |
 | `seat reset [name]` | Redeem one free usage-limit reset (`--dry-run` lists them without redeeming). Exits 0 when a window was reset, 1 otherwise |
+| `seat reset-policy [action]` | Show the free-reset policy, or set it: `ask` (default), `never`, `auto`. Named apart from `seat reset` on purpose — that one spends a finite grant |
 | `cost [session\|--last]` | Estimated credits and dollars for a finished session |
 | `seat events [--tail N]` | Print the last N entries (default 20) of `seat-events.log` |
 | `seat login <name>` | Re-authenticate a seat. The new login's workspace and user identity are verified against the stored values and a mismatch refuses to overwrite |
@@ -343,7 +345,7 @@ codex-clean seat remove <NAME> [--yes]
 | `1` | Codex error (rate-limit on a pinned seat, auth error, or any other non-zero codex exit); also when every seat needs a login |
 | `75` | All seats cooling (`EX_TEMPFAIL`), whether detected up front or after rotation exhausted every seat within the run — try again after the soonest cooldown expiry |
 | `77` | Included quota is used up and only workspace credits remain, without consent (`EX_NOPERM`) — ask the user, then re-run with `CODEX_CLEAN_USE_CREDITS=1` or run `codex-clean seat credits allow` |
-| `78` | A **free** usage-limit reset would unblock the run and `rotation.resets = ask` — ask the user, then run `codex-clean seat reset <seat>`. Takes precedence over 77 and 75 |
+| `78` | The run **cannot proceed** and a **free** usage-limit reset would unblock it, with `rotation.resets = ask` — ask the user, then run `codex-clean seat reset <seat>`. Takes precedence over 77 and 75. When the stopped line names `CODEX_CLEAN_USE_CREDITS=1`, re-running with it proceeds on credits and leaves the grant intact; when it does not, credits cannot lift this block and only the reset (or waiting) will |
 
 ## Features
 

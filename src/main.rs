@@ -118,6 +118,12 @@ enum SeatAction {
         /// ask (default) | never | always | allow (until quota resets) | revoke; omit to show
         action: Option<String>,
     },
+    /// Show or set whether a blocked run may redeem a free usage-limit reset
+    #[command(name = "reset-policy")]
+    ResetPolicy {
+        /// ask (default) | never | auto; omit to show
+        action: Option<String>,
+    },
     /// Show the seat event log (limits hit, auth failures, cooldowns, orphaned blobs, logins)
     Events {
         /// Number of most recent entries to show
@@ -201,6 +207,7 @@ fn run_seat(action: SeatAction) -> anyhow::Result<i32> {
             seat_cmd::strategy(name.as_deref(), seat.as_deref()).map(|()| 0)
         }
         SeatAction::Credits { action } => seat_cmd::credits(action.as_deref()).map(|()| 0),
+        SeatAction::ResetPolicy { action } => seat_cmd::reset_policy(action.as_deref()).map(|()| 0),
         SeatAction::Events { tail } => seat_cmd::events(tail).map(|()| 0),
         SeatAction::Login { name, browser } => seat_cmd::login(&name, browser).map(|()| 0),
         SeatAction::Use { name } => seat_cmd::use_seat(&name).map(|()| 0),

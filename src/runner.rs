@@ -1128,8 +1128,11 @@ fn redeem_reset(
     }
 }
 
-/// Seats to cool for a failure on `chosen`: just it for a personal limit;
-/// every seat in the same workspace for credits / spend caps.
+/// Seats to cool for a failure on `chosen`: just it for a personal limit.
+/// For a workspace blocker, the same-workspace seats the blocker actually
+/// reaches — every one of them for a spend cap, and for credits only those
+/// with no included quota left (`usage::blocker_targets`). `chosen` is always
+/// included: it just failed, whatever its recorded reading says.
 fn affected_seats(
     cfg: &SeatConfig,
     state: &SeatState,

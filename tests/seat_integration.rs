@@ -1589,6 +1589,55 @@ fn workspace_cooldown_never_shortens_a_siblings_longer_cooldown() {
 }
 
 #[test]
+fn credits_failure_leaves_a_sibling_with_cached_headroom_runnable() {
+    // The run path, not the snapshot path: `main` fails with a credits error
+    // and `backup1` shares its workspace but has a cached reading showing
+    // plenty of included quota. `backup1` runs on that quota for free, so the
+    // credits blocker must not reach it. Before the blocker was scoped, it
+    // was cooled alongside `main` and the run ended 75 with a usable seat
+    // sitting idle.
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    let mut cfg = cfg_with_seats(&[("main", "ws-1"), ("backup1", "ws-1")]);
+    cfg.seats[0].user_id = Some("user-alice".into());
+    cfg.seats[1].user_id = Some("user-bob".into());
+    env.save_config(&cfg);
+    let seat_dir = env.clean_home_path.join("seats");
+    fs::create_dir_all(seat_dir.join("main")).unwrap();
+    fs::create_dir_all(seat_dir.join("backup1")).unwrap();
+    fs::write(seat_dir.join("main/auth.json"), seat::fake_auth_json_for_tests("ws-1", "user-alice", "a")).unwrap();
+    fs::write(seat_dir.join("backup1/auth.json"), seat::fake_auth_json_for_tests("ws-1", "user-bob", "b")).unwrap();
+
+    let mut state = SeatState::default();
+    // backup1 used more recently, so LRU reaches for main first.
+    state.entry_mut("backup1").last_used = Some(chrono::Utc::now());
+    state.entry_mut("backup1").usage = Some(snapshot(10, 10));
+    env.save_state(&state);
+
+    // First attempt (main) fails for credits; the second (backup1) succeeds.
+    let calls = RefCell::new(0usize);
+    let attempt = move |_args: &[String], _prompt: &str, _mode: &Mode, _scrub: bool| -> anyhow::Result<AttemptResult> {
+        *calls.borrow_mut() += 1;
+        if *calls.borrow() == 1 {
+            let mut a = rate_limit_attempt();
+            a.output.errors = vec!["Your workspace is out of credits. Add credits to continue.".to_string()];
+            return Ok(a);
+        }
+        Ok(ok_attempt())
+    };
+    let exit = runner::run_codex_with(&[], "hi", Mode::Exec, attempt).unwrap();
+
+    assert_eq!(exit, 0, "the run falls through to the seat that still has quota");
+    let st = env.load_state();
+    assert_eq!(st.get("main").cooldown_reason.as_deref(), Some("credits"), "the seat that failed is cooled");
+    assert!(
+        st.get("backup1").cooldown_until.is_none(),
+        "a sibling with included quota left is not cooled by the workspace credits blocker"
+    );
+    assert!(st.get("backup1").is_eligible(chrono::Utc::now()), "and stays eligible for the next run");
+}
+
+#[test]
 fn status_propagates_workspace_wide_exhaustion_to_siblings() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let env = TestEnv::new();

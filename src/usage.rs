@@ -1303,7 +1303,10 @@ pub fn reapply_cached_exhaustion(
 ///    member shows credits available, cooldowns that credits make moot
 ///    (`rate_limit`, `credits`) are cleared on every member. Clearing never
 ///    spends anything: the credit policy still gates `OnCredits` seats.
-/// 4. `needs_login` is never touched.
+/// 4. A seat whose fresh reading is `Healthy` while it still carries a
+///    `credits` cooldown has that cooldown cleared: credits are never that
+///    seat's own block, and nothing else would lift it.
+/// 5. `needs_login` is never touched.
 ///
 /// Returns `(seat, notice)` pairs for display and the events log.
 pub fn reconcile_snapshots(
@@ -1446,19 +1449,46 @@ pub fn reconcile_snapshots(
             continue;
         }
         let st = state.get(name);
-        if let Some(u) = st.cooldown_until.filter(|u| *u > now) {
+        let Some(u) = st.cooldown_until.filter(|u| *u > now) else {
+            continue;
+        };
+        let reason = CooldownReason::parse(st.cooldown_reason.as_deref().unwrap_or(""));
+        // A `credits` cooldown is never about this seat's own limits: it was
+        // propagated from a workspace sibling, at a moment when this seat's
+        // own headroom was unknown or stale. A fresh `Healthy` reading proves
+        // it can run on included quota, and `cool_seats` only ever extends a
+        // cooldown, so without this nothing would ever lift it and the
+        // blocked-run probe would reach the same dead end every time.
+        //
+        // `Healthy` is the whole condition: an `OnCredits` seat has no
+        // included quota left and must keep the cooldown. `rate_limit`,
+        // `model_limit` and `spend_control` are left alone — those are the
+        // seat's own block, not one inherited from a sibling.
+        if reason == CooldownReason::Credits && matches!(v, UsageVerdict::Healthy) {
+            let entry = state.entry_mut(name);
+            entry.cooldown_until = None;
+            entry.cooldown_reason = None;
             notices.push((
                 name.clone(),
                 format!(
-                    "seat '{}' is cooling until {} ({}) but reports {}; clear with `codex-clean seat status --clear-cooldown {}`",
+                    "seat '{}' has included quota left ({}); cleared the credits cooldown propagated to it",
                     name,
-                    format_local(u),
-                    st.cooldown_reason.as_deref().unwrap_or("rate_limit"),
-                    st.usage.as_ref().map(summarize_usage_short).unwrap_or_else(|| "-".into()),
-                    name
+                    st.usage.as_ref().map(summarize_usage_short).unwrap_or_else(|| "-".into())
                 ),
             ));
+            continue;
         }
+        notices.push((
+            name.clone(),
+            format!(
+                "seat '{}' is cooling until {} ({}) but reports {}; clear with `codex-clean seat status --clear-cooldown {}`",
+                name,
+                format_local(u),
+                st.cooldown_reason.as_deref().unwrap_or("rate_limit"),
+                st.usage.as_ref().map(summarize_usage_short).unwrap_or_else(|| "-".into()),
+                name
+            ),
+        ));
     }
     notices
 }
@@ -2133,12 +2163,18 @@ mod tests {
         reconcile_snapshots(&cfg, &mut state, vec![("b".into(), b)], now());
         assert_eq!(state.get("a").cooldown_reason.as_deref(), Some("credits"), "unknown sibling cooled");
 
-        // Now `a` reports headroom: the next reconcile must not re-cool it.
-        state.entry_mut("a").cooldown_until = None;
-        state.entry_mut("a").cooldown_reason = None;
+        // Now `a` reports headroom. The propagated cooldown must be lifted by
+        // that evidence alone: cool_seats only ever extends, so if this does
+        // not clear it, nothing does, and the blocked-run probe dead-ends here
+        // every time.
         let a = snap_with(&[(300, 46, Some(7200))]);
-        reconcile_snapshots(&cfg, &mut state, vec![("a".into(), a)], now());
-        assert!(state.get("a").cooldown_until.is_none());
+        let n = reconcile_snapshots(&cfg, &mut state, vec![("a".into(), a)], now());
+        assert!(state.get("a").cooldown_until.is_none(), "fresh headroom lifts the propagated cooldown");
+        assert!(
+            n.iter().any(|(s, m)| s == "a" && m.contains("cleared the credits cooldown propagated to it")),
+            "{:?}",
+            n
+        );
     }
 
     #[test]

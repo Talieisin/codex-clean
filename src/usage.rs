@@ -1152,6 +1152,47 @@ pub fn quota_state(st: &SeatRuntimeState, now: DateTime<Utc>) -> QuotaState {
     }
 }
 
+/// True when the seat's recorded reading shows it still has included quota to
+/// run on. A seat with no reading at all does **not** count as having
+/// headroom: with no evidence either way a workspace blocker stands, and the
+/// next refresh corrects it.
+pub fn has_included_headroom(st: &SeatRuntimeState, now: DateTime<Utc>) -> bool {
+    st.usage
+        .as_ref()
+        .is_some_and(|snap| matches!(verdict(snap, now), UsageVerdict::Healthy))
+}
+
+/// Narrow a workspace-wide blocker to the seats it actually blocks.
+///
+/// `credits` only bites a seat that has used up its included quota. A sibling
+/// still inside its own windows runs for free and was never going to spend
+/// credits, so cooling it takes a usable seat out of rotation for nothing —
+/// and, because `credits` is neither lifted by a free reset nor given a real
+/// reset time, it would stay out for a full `default_cooldown_seconds` and be
+/// re-applied on every refresh for as long as the sibling stays blocked.
+///
+/// `spend_control` is an admin-set hard stop on the workspace, so it keeps
+/// cooling every member regardless of their own headroom.
+///
+/// `always` is the seat whose own failure produced the blocker: it is cooled
+/// whatever its (possibly stale) reading says.
+pub fn blocker_targets(
+    state: &SeatState,
+    members: &[String],
+    reason: CooldownReason,
+    always: Option<&str>,
+    now: DateTime<Utc>,
+) -> Vec<String> {
+    if reason != CooldownReason::Credits {
+        return members.to_vec();
+    }
+    members
+        .iter()
+        .filter(|m| always == Some(m.as_str()) || !has_included_headroom(&state.get(m), now))
+        .cloned()
+        .collect()
+}
+
 fn cooldown_until_for(
     reason: CooldownReason,
     resets_at: Option<DateTime<Utc>>,
@@ -1255,8 +1296,10 @@ pub fn reapply_cached_exhaustion(
 /// 2. A seat's own personal exhaustion (a window at 100% with no credits, a
 ///    per-seat reached flag) cools that seat, through `merge_cooldown`.
 /// 3. Per workspace, over the fetched members: a workspace-wide blocker
-///    (spend cap, or a credits-depleted flag) cools every member of the
-///    workspace — **blockers dominate regardless of order**; otherwise, if any
+///    (spend cap, or a credits-depleted flag) cools the members it actually
+///    blocks — every member for a spend cap, and for credits only those with
+///    no included quota left to run on (see [`blocker_targets`]).
+///    **Blockers dominate regardless of order**; otherwise, if any
 ///    member shows credits available, cooldowns that credits make moot
 ///    (`rate_limit`, `credits`) are cleared on every member. Clearing never
 ///    spends anything: the credit policy still gates `OnCredits` seats.
@@ -1341,7 +1384,8 @@ pub fn reconcile_snapshots(
             .max_by_key(|(r, _)| r.strength());
         if let Some((reason, resets_at)) = blocker {
             let until = cooldown_until_for(reason, resets_at, &cfg.rotation, now);
-            let changed = seat::cool_seats(state, &members, until, reason, now);
+            let targets = blocker_targets(state, &members, reason, None, now);
+            let changed = seat::cool_seats(state, &targets, until, reason, now);
             if !changed.is_empty() {
                 notices.push((
                     first.clone(),
@@ -2029,7 +2073,10 @@ mod tests {
         let cfg = cfg_ws(&[("a", "ws"), ("b", "ws")]);
         let mut blocked = snap_with(&[(10080, 50, Some(60))]);
         blocked.buckets[0].rate_limit_reached_type = Some("workspace_member_credits_depleted".into());
-        let credits = with_credits(snap_with(&[(10080, 50, Some(60))]));
+        // b has no included quota left, so the workspace blocker reaches it;
+        // its own reading still claims credits, which must not mask the
+        // blocker whichever order the pair arrives in.
+        let credits = with_credits(snap_with(&[(10080, 100, Some(60))]));
         for order in [
             vec![("a".to_string(), blocked.clone()), ("b".to_string(), credits.clone())],
             vec![("b".to_string(), credits.clone()), ("a".to_string(), blocked.clone())],
@@ -2040,6 +2087,77 @@ mod tests {
                 assert!(state.get(s).cooldown_until.is_some(), "{} cooled", s);
                 assert_eq!(state.get(s).cooldown_reason.as_deref(), Some("credits"));
             }
+        }
+    }
+
+    #[test]
+    fn credits_blocker_spares_a_sibling_that_still_has_included_quota() {
+        // The workspace has no credits and `b` is flagged for it, but `a` is
+        // only part-way through its own windows: `a` runs for free and must
+        // stay usable. Cooling it would take the last good seat out of
+        // rotation, for a reason no free reset lifts, on every refresh.
+        let cfg = cfg_ws(&[("a", "ws"), ("b", "ws")]);
+        let a = snap_with(&[(300, 46, Some(7200)), (10080, 7, Some(600_000))]);
+        let mut b = snap_with(&[(300, 100, Some(9000)), (10080, 31, Some(600_000))]);
+        b.buckets[0].rate_limit_reached_type = Some("workspace_member_credits_depleted".into());
+
+        let mut state = SeatState::default();
+        let n = reconcile_snapshots(
+            &cfg,
+            &mut state,
+            vec![("a".into(), a), ("b".into(), b)],
+            now(),
+        );
+        assert!(state.get("a").cooldown_until.is_none(), "in-quota sibling left usable");
+        assert_eq!(state.get("b").cooldown_reason.as_deref(), Some("credits"), "the flagged seat still cools");
+        assert!(
+            n.iter().any(|(_, m)| m.starts_with("credits is workspace-wide; cooling b until ")),
+            "the notice names only the seat actually cooled: {:?}",
+            n
+        );
+        assert!(
+            !n.iter().any(|(_, m)| m.contains("--clear-cooldown a")),
+            "no 'cooling but reports fine' advice for a seat that was never cooled: {:?}",
+            n
+        );
+    }
+
+    #[test]
+    fn credits_blocker_cools_a_sibling_with_no_reading_of_its_own() {
+        // No evidence of headroom: the blocker stands, and the blocked-run
+        // probe lifts it again once `a` has a reading.
+        let cfg = cfg_ws(&[("a", "ws"), ("b", "ws")]);
+        let mut b = snap_with(&[(300, 100, Some(9000))]);
+        b.buckets[0].rate_limit_reached_type = Some("workspace_member_credits_depleted".into());
+        let mut state = SeatState::default();
+        reconcile_snapshots(&cfg, &mut state, vec![("b".into(), b)], now());
+        assert_eq!(state.get("a").cooldown_reason.as_deref(), Some("credits"), "unknown sibling cooled");
+
+        // Now `a` reports headroom: the next reconcile must not re-cool it.
+        state.entry_mut("a").cooldown_until = None;
+        state.entry_mut("a").cooldown_reason = None;
+        let a = snap_with(&[(300, 46, Some(7200))]);
+        reconcile_snapshots(&cfg, &mut state, vec![("a".into(), a)], now());
+        assert!(state.get("a").cooldown_until.is_none());
+    }
+
+    #[test]
+    fn spend_control_still_cools_every_member_whatever_their_headroom() {
+        // An admin-set hard stop is not about included quota, so headroom
+        // does not spare a sibling the way it does for credits.
+        let cfg = cfg_ws(&[("a", "ws"), ("b", "ws")]);
+        let a = snap_with(&[(300, 46, Some(7200))]);
+        let mut b = snap_with(&[(300, 12, Some(7200))]);
+        b.spend_control_reached = Some(true);
+        let mut state = SeatState::default();
+        reconcile_snapshots(&cfg, &mut state, vec![("a".into(), a), ("b".into(), b)], now());
+        for seat in ["a", "b"] {
+            assert_eq!(
+                state.get(seat).cooldown_reason.as_deref(),
+                Some("spend_control"),
+                "{} cooled",
+                seat
+            );
         }
     }
 

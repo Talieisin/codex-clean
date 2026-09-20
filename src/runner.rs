@@ -788,10 +788,10 @@ where
                     cfg.rotation.cooldown_jitter_seconds,
                 );
                 // Personal limits cool this seat only. Credits and spend caps
-                // are per *workspace*: every seat sharing this seat's
-                // account_id is equally blocked, so cool them together rather
-                // than burning an attempt discovering it.
-                let affected = affected_seats(&cfg, &chosen, reason);
+                // are per *workspace*: the seats sharing this seat's
+                // account_id that the blocker really reaches are cooled
+                // together rather than burning an attempt discovering it.
+                let affected = affected_seats(&cfg, &state, &chosen, reason, Utc::now());
                 cool_seats(&mut state, &affected, cd, reason, Utc::now());
                 let entry = state.entry_mut(&chosen);
                 entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
@@ -1128,14 +1128,24 @@ fn redeem_reset(
     }
 }
 
-/// Seats to cool for a failure on `chosen`: just it for a personal limit;
-/// every seat in the same workspace for credits / spend caps.
-fn affected_seats(cfg: &SeatConfig, chosen: &str, reason: ratelimit::CooldownReason) -> Vec<String> {
+/// Seats to cool for a failure on `chosen`: just it for a personal limit.
+/// For a workspace blocker, the same-workspace seats the blocker actually
+/// reaches — every one of them for a spend cap, and for credits only those
+/// with no included quota left (`usage::blocker_targets`). `chosen` is always
+/// included: it just failed, whatever its recorded reading says.
+fn affected_seats(
+    cfg: &SeatConfig,
+    state: &SeatState,
+    chosen: &str,
+    reason: ratelimit::CooldownReason,
+    now: DateTime<Utc>,
+) -> Vec<String> {
     if reason.is_window_based() {
-        vec![chosen.to_string()]
-    } else {
-        workspace_siblings(cfg, chosen)
+        return vec![chosen.to_string()];
     }
+    // A workspace blocker does not necessarily block every seat: see
+    // `usage::blocker_targets`. `chosen` is always included — it just failed.
+    usage::blocker_targets(state, &workspace_siblings(cfg, chosen), reason, Some(chosen), now)
 }
 
 /// Compose the `Seat:` line: which seat ran, under which strategy (or pin),

@@ -196,6 +196,130 @@ fn no_seats_falls_through_to_attempt() {
     assert_eq!(exit, 0);
 }
 
+const MARKER: &str = "END-OF-ANSWER";
+
+fn answer_attempt(text: &str) -> AttemptResult {
+    let mut a = ok_attempt();
+    a.output.add_message(text.to_string());
+    a
+}
+
+/// `run_codex_checked` with no usage fetching and no credits prompt.
+fn run_checked<F>(attempt: F, marker: Option<&str>) -> i32
+where
+    F: Fn(&[String], &str, &Mode, bool) -> anyhow::Result<AttemptResult>,
+{
+    runner::run_codex_checked(
+        &[],
+        "hi",
+        Mode::Exec,
+        attempt,
+        &usage::NoUsageClient,
+        &runner::NoPrompt,
+        marker,
+    )
+    .unwrap()
+}
+
+#[test]
+fn end_marker_flag_absent_leaves_exit_unchanged() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = TestEnv::new();
+    let cut = |_: &[String], _: &str, _: &Mode, _: bool| Ok(answer_attempt("Now checking the tests..."));
+    assert_eq!(run_checked(cut, None), 0);
+    let failed = |_: &[String], _: &str, _: &Mode, _: bool| {
+        let mut a = answer_attempt("Now checking the tests...");
+        a.exit_code = 3;
+        a.child_exit = 3;
+        a.status_success = false;
+        Ok(a)
+    };
+    assert_eq!(run_checked(failed, None), 3);
+}
+
+#[test]
+fn end_marker_present_with_trailing_whitespace_exits_0() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = TestEnv::new();
+    let done = |_: &[String], _: &str, _: &Mode, _: bool| {
+        Ok(answer_attempt("No findings.\nEND-OF-ANSWER\n  \n"))
+    };
+    assert_eq!(run_checked(done, Some(MARKER)), 0);
+}
+
+#[test]
+fn end_marker_missing_exits_incomplete_answer() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = TestEnv::new();
+    let cut = |_: &[String], _: &str, _: &Mode, _: bool| Ok(answer_attempt("Now checking the tests..."));
+    assert_eq!(run_checked(cut, Some(MARKER)), runner::EXIT_INCOMPLETE_ANSWER);
+    // Only the final message counts: a marker in an earlier one does not.
+    let earlier = |_: &[String], _: &str, _: &Mode, _: bool| {
+        let mut a = answer_attempt("Part one.\nEND-OF-ANSWER");
+        a.output.add_message("Now checking the tests...".to_string());
+        Ok(a)
+    };
+    assert_eq!(run_checked(earlier, Some(MARKER)), runner::EXIT_INCOMPLETE_ANSWER);
+    let silent = |_: &[String], _: &str, _: &Mode, _: bool| Ok(ok_attempt());
+    assert_eq!(run_checked(silent, Some(MARKER)), runner::EXIT_INCOMPLETE_ANSWER);
+}
+
+#[test]
+fn end_marker_does_not_override_a_codex_failure() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = TestEnv::new();
+    let failed = |_: &[String], _: &str, _: &Mode, _: bool| {
+        let mut a = answer_attempt("Now checking the tests...");
+        a.exit_code = 1;
+        a.child_exit = 1;
+        a.status_success = false;
+        Ok(a)
+    };
+    assert_eq!(run_checked(failed, Some(MARKER)), 1);
+}
+
+#[test]
+fn end_marker_does_not_override_all_seats_cooling() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    env.write_seat("a", "acc-a");
+    env.write_seat("b", "acc-b");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a"), ("b", "acc-b")]));
+    env.save_state(&SeatState::default());
+
+    let attempt = mock_attempt(&env.codex_home_path, |_| rate_limit_attempt());
+    assert_eq!(run_checked(attempt, Some(MARKER)), runner::EXIT_ALL_SEATS_COOLING);
+}
+
+#[test]
+fn end_marker_checks_the_answer_of_the_seat_that_succeeded() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    env.write_seat("a", "acc-a");
+    env.write_seat("b", "acc-b");
+    env.save_config(&cfg_with_seats(&[("a", "acc-a"), ("b", "acc-b")]));
+    env.save_state(&SeatState::default());
+
+    // The rate-limited attempt's message carries the marker; the attempt
+    // that ran last and was printed does not, so the run is incomplete.
+    let attempt = mock_attempt(&env.codex_home_path, |aid| match aid {
+        "acc-a" => {
+            let mut a = rate_limit_attempt();
+            a.output.add_message("Partial.\nEND-OF-ANSWER".to_string());
+            a
+        }
+        _ => answer_attempt("Now checking the tests..."),
+    });
+    assert_eq!(run_checked(attempt, Some(MARKER)), runner::EXIT_INCOMPLETE_ANSWER);
+
+    env.save_state(&SeatState::default());
+    let attempt = mock_attempt(&env.codex_home_path, |aid| match aid {
+        "acc-a" => rate_limit_attempt(),
+        _ => answer_attempt("Done.\nEND-OF-ANSWER"),
+    });
+    assert_eq!(run_checked(attempt, Some(MARKER)), 0);
+}
+
 #[test]
 fn rotation_picks_lru_seat_and_marks_last_used() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

@@ -32,7 +32,13 @@ codex-clean -C /path/to/project "analyze the codebase"
 
 # Read prompt from stdin
 echo "what does this code do?" | codex-clean -
+
+# Exit 76 unless the final answer ends with the line END-OF-ANSWER
+# (the flag goes before any codex options or subcommand)
+codex-clean --require-end-marker END-OF-ANSWER -m gpt-5.5 "review this; end with the line END-OF-ANSWER"
 ```
+
+`--require-end-marker <TEXT>` is opt-in. A run that is cut short (credits or capacity ran out, the process was interrupted) can still exit 0 with only a progress note as its answer. When the prompt asks codex to end its answer with a fixed line, this flag makes codex-clean check that the final agent message (the one codex also writes to `-o`) ends with that line, ignoring trailing whitespace. If it does not, codex-clean prints one line on stderr and exits **76** instead of 0. Any other non-zero exit (a codex failure, 75, 77, 78) is kept as is. Without the flag nothing is checked.
 
 ### Resume Sessions
 
@@ -282,11 +288,11 @@ Seat: backup1 (balanced; usage 5h 48% wk 14%, as of 2m ago)
 ## CLI Reference
 
 ```
-codex-clean [OPTIONS...] <prompt>
-codex-clean [OPTIONS...] -
-codex-clean resume <SESSION_ID> [prompt]
-codex-clean resume --last [prompt]
-codex-clean review [OPTIONS...] [prompt]
+codex-clean [--require-end-marker TEXT] [OPTIONS...] <prompt>
+codex-clean [--require-end-marker TEXT] [OPTIONS...] -
+codex-clean [--require-end-marker TEXT] resume <SESSION_ID> [prompt]
+codex-clean [--require-end-marker TEXT] resume --last [prompt]
+codex-clean [--require-end-marker TEXT] review [OPTIONS...] [prompt]
 codex-clean seat add <NAME> [--label LABEL] [--import] [--browser]
 codex-clean seat list
 codex-clean seat status [NAME] [--json] [--clear-cooldown NAME]
@@ -303,6 +309,7 @@ codex-clean seat remove <NAME> [--yes]
 
 | Argument | Description |
 |----------|-------------|
+| `--require-end-marker <TEXT>` | Opt-in: exit 76 when a run that would exit 0 has a final agent message that does not end with the line `TEXT` (trailing whitespace ignored). Must come before any codex options or subcommand name; anything after them is passed to codex. Not accepted with `seat` or `cost` |
 | `OPTIONS` | Passed through to `codex exec` (e.g., `-m`, `--sandbox`, `-C`) |
 | `prompt` | The prompt to send to codex |
 | `-` | Read prompt from stdin |
@@ -344,6 +351,7 @@ codex-clean seat remove <NAME> [--yes]
 | `0` | Success |
 | `1` | Codex error (rate-limit on a pinned seat, auth error, or any other non-zero codex exit); also when every seat needs a login |
 | `75` | All seats cooling (`EX_TEMPFAIL`), whether detected up front or after rotation exhausted every seat within the run — try again after the soonest cooldown expiry |
+| `76` | `--require-end-marker` was given and the final answer does not end with that line: codex stopped mid-answer — re-run. Only replaces what would have been `0`; every other code takes precedence. (sysexits `EX_PROTOCOL`) |
 | `77` | Included quota is used up and only workspace credits remain, without consent (`EX_NOPERM`) — ask the user, then re-run with `CODEX_CLEAN_USE_CREDITS=1` or run `codex-clean seat credits allow` |
 | `78` | The run **cannot proceed** and a **free** usage-limit reset would unblock it, with `rotation.resets = ask` — ask the user, then run `codex-clean seat reset <seat>`. Takes precedence over 77 and 75. When the stopped line names `CODEX_CLEAN_USE_CREDITS=1`, re-running with it proceeds on credits and leaves the grant intact; when it does not, credits cannot lift this block and only the reset (or waiting) will |
 

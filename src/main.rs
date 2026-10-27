@@ -1,7 +1,6 @@
 use std::io::{self, BufRead};
 use std::process::ExitCode;
 
-use clap::builder::NonEmptyStringValueParser;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand};
 
@@ -17,7 +16,7 @@ struct Cli {
 
     /// Exit 76 when the final agent message does not end with this line (e.g. END-OF-ANSWER).
     /// Must come before any codex options or subcommand name. Runs only (exec, resume, review)
-    #[arg(long, value_name = "TEXT", value_parser = NonEmptyStringValueParser::new())]
+    #[arg(long, value_name = "TEXT", value_parser = parse_end_marker)]
     require_end_marker: Option<String>,
 
     /// Arguments to pass to codex exec (e.g., -m gpt-5.2-codex --sandbox read-only)
@@ -197,6 +196,19 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// `--require-end-marker` value: one line with visible text. A blank or
+/// multi-line marker can never match the trimmed last line of an answer, so
+/// every run would exit 76 and no re-run could fix it.
+fn parse_end_marker(s: &str) -> Result<String, String> {
+    if s.trim().is_empty() {
+        return Err("the marker must not be empty or only whitespace".to_string());
+    }
+    if s.contains(['\n', '\r']) {
+        return Err("the marker must be a single line (no newline characters)".to_string());
+    }
+    Ok(s.to_string())
 }
 
 fn run_seat(action: SeatAction) -> anyhow::Result<i32> {
@@ -501,6 +513,17 @@ mod tests {
         assert_eq!(cli.require_end_marker, None);
 
         assert!(Cli::try_parse_from(["codex-clean", "--require-end-marker", "", "prompt"]).is_err());
+        for bad in ["   ", "\t", "END\nOF", "END-OF-ANSWER\n", "END\rOF"] {
+            let err = match Cli::try_parse_from(["codex-clean", "--require-end-marker", bad, "prompt"]) {
+                Ok(_) => panic!("marker {:?} should be rejected", bad),
+                Err(e) => e,
+            };
+            assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation, "marker {:?}", bad);
+            assert_eq!(err.exit_code(), 2, "usage error for {:?}", bad);
+        }
+        // Surrounding spaces are accepted (the comparison trims them).
+        let cli = Cli::parse_from(["codex-clean", "--require-end-marker", "  END-OF-ANSWER ", "prompt"]);
+        assert_eq!(cli.require_end_marker.as_deref(), Some("  END-OF-ANSWER "));
     }
 
     #[test]

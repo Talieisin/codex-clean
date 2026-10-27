@@ -98,8 +98,8 @@ pub fn run_codex(
 }
 
 /// [`run_codex_with_deps`], then the `--require-end-marker` check. With
-/// `end_marker` set, the last agent message of the last codex attempt (the
-/// answer that was printed, and what codex writes to `-o`) must end with that
+/// `end_marker` set, the last agent message of the last codex attempt (what
+/// codex writes to `-o`; an empty one counts) must end with that
 /// line, or a run that would exit 0 exits [`EXIT_INCOMPLETE_ANSWER`] instead.
 /// Without it, identical to [`run_codex_with_deps`].
 pub fn run_codex_checked<F>(
@@ -126,7 +126,7 @@ where
         mode,
         |a: &[String], p: &str, m: &Mode, scrub: bool| -> Result<AttemptResult> {
             let result = attempt(a, p, m, scrub)?;
-            *last_answer.borrow_mut() = result.output.messages.last().cloned();
+            *last_answer.borrow_mut() = result.output.final_message.clone();
             Ok(result)
         },
         usage_client,
@@ -1641,9 +1641,9 @@ pub fn parse_codex_stream<R: BufRead>(reader: R) -> io::Result<CodexOutput> {
                     output.add_thread_id(thread_id);
                 }
                 Event::AgentMessage { text } => {
-                    if let Some(t) = text {
-                        output.add_message(t);
-                    }
+                    // A message without text still counts as the final
+                    // message (as ""); `add_message` keeps it out of `messages`.
+                    output.add_message(text.unwrap_or_default());
                 }
                 Event::TurnCompleted {
                     input_tokens,
@@ -1847,6 +1847,36 @@ not json at all
         for code in [0, 1, 2, EXIT_ALL_SEATS_COOLING, EXIT_CREDITS_CONSENT_NEEDED, EXIT_RESET_AVAILABLE] {
             assert_ne!(EXIT_INCOMPLETE_ANSWER, code);
         }
+    }
+
+    #[test]
+    fn empty_final_agent_message_is_tracked_and_fails_the_marker_check() {
+        let data = r#"{"type":"thread.started","thread_id":"t"}
+{"type":"item.completed","item":{"type":"agent_message","text":"Findings.\nEND-OF-ANSWER"}}
+{"type":"item.completed","item":{"type":"agent_message","text":""}}
+"#;
+        let output = parse_codex_stream(BufReader::new(Cursor::new(data))).unwrap();
+        assert_eq!(output.messages, vec!["Findings.\nEND-OF-ANSWER".to_string()], "messages unchanged");
+        assert_eq!(output.final_message.as_deref(), Some(""));
+        assert_eq!(
+            check_end_marker(0, output.final_message.as_deref(), "END-OF-ANSWER"),
+            EXIT_INCOMPLETE_ANSWER
+        );
+
+        let no_text = r#"{"type":"item.completed","item":{"type":"agent_message","text":"Done.\nEND-OF-ANSWER"}}
+{"type":"item.completed","item":{"type":"agent_message"}}
+"#;
+        let output = parse_codex_stream(BufReader::new(Cursor::new(no_text))).unwrap();
+        assert_eq!(output.messages.len(), 1);
+        assert_eq!(output.final_message.as_deref(), Some(""), "missing text recorded as empty");
+
+        let marked = r#"{"type":"item.completed","item":{"type":"agent_message","text":"Done.\nEND-OF-ANSWER\n"}}
+"#;
+        let output = parse_codex_stream(BufReader::new(Cursor::new(marked))).unwrap();
+        assert_eq!(check_end_marker(0, output.final_message.as_deref(), "END-OF-ANSWER"), 0);
+
+        let none = parse_codex_stream(BufReader::new(Cursor::new("{\"type\":\"thread.started\",\"thread_id\":\"t\"}\n"))).unwrap();
+        assert_eq!(none.final_message, None);
     }
 
     #[test]

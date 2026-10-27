@@ -309,7 +309,7 @@ codex-clean seat remove <NAME> [--yes]
 
 | Argument | Description |
 |----------|-------------|
-| `--require-end-marker <TEXT>` | Opt-in: exit 76 when a run that would exit 0 has a final agent message that does not end with the line `TEXT` (trailing whitespace ignored). Must come before any codex options or subcommand name; anything after them is passed to codex. Not accepted with `seat` or `cost` |
+| `--require-end-marker <TEXT>` | Opt-in: exit 76 when a run that would exit 0 has a final agent message that does not end with the line `TEXT` (trailing whitespace ignored; an empty final message counts as missing the marker). `TEXT` must be a single non-blank line, or it is a usage error (exit 2). Must come before any codex options or subcommand name; anything after them is passed to codex. Not accepted with `seat` or `cost` |
 | `OPTIONS` | Passed through to `codex exec` (e.g., `-m`, `--sandbox`, `-C`) |
 | `prompt` | The prompt to send to codex |
 | `-` | Read prompt from stdin |

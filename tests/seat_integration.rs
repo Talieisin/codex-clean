@@ -260,6 +260,13 @@ fn end_marker_missing_exits_incomplete_answer() {
         Ok(a)
     };
     assert_eq!(run_checked(earlier, Some(MARKER)), runner::EXIT_INCOMPLETE_ANSWER);
+    // An empty final agent message after a marked one is still incomplete.
+    let empty_last = |_: &[String], _: &str, _: &Mode, _: bool| {
+        let mut a = answer_attempt("Part one.\nEND-OF-ANSWER");
+        a.output.add_message(String::new());
+        Ok(a)
+    };
+    assert_eq!(run_checked(empty_last, Some(MARKER)), runner::EXIT_INCOMPLETE_ANSWER);
     let silent = |_: &[String], _: &str, _: &Mode, _: bool| Ok(ok_attempt());
     assert_eq!(run_checked(silent, Some(MARKER)), runner::EXIT_INCOMPLETE_ANSWER);
 }

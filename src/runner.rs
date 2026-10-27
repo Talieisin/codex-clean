@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::env;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::{Command, ExitStatus, Stdio};
@@ -30,6 +31,14 @@ pub const EXIT_CREDITS_CONSENT_NEEDED: i32 = 77;
 /// `ask`. Offered ahead of 77 (which spends money) and 75 (which just waits),
 /// so an agent can put the free option to the user first.
 pub const EXIT_RESET_AVAILABLE: i32 = 78;
+
+/// `--require-end-marker` was given and the final agent message does not end
+/// with that line: codex stopped mid-answer (credits or capacity ran out, the
+/// process was interrupted) yet would have exited 0. Re-run. Applies only to
+/// a run that would otherwise exit 0, so every other code wins over it. 76 is
+/// sysexits `EX_PROTOCOL` (the remote side broke the agreed exchange) and is
+/// unused by codex-clean, next to 75/77/78.
+pub const EXIT_INCOMPLETE_ANSWER: i32 = 76;
 
 /// `(seat, reason)` pairs for seats exhausted earlier in a run.
 type Exhausted = Vec<(String, String)>;
@@ -68,9 +77,89 @@ pub struct AttemptResult {
 /// orchestration if seats are configured; otherwise behaves identically to
 /// the pre-seat version. `interactive` says whether a credits prompt may be
 /// shown (a terminal on stdin and stderr, prompt not read from stdin).
-pub fn run_codex(args: &[String], prompt: &str, mode: Mode, interactive: bool) -> Result<i32> {
+/// `end_marker` is `--require-end-marker` (see [`run_codex_checked`]).
+pub fn run_codex(
+    args: &[String],
+    prompt: &str,
+    mode: Mode,
+    interactive: bool,
+    end_marker: Option<&str>,
+) -> Result<i32> {
     let decider: &dyn CreditDecider = if interactive { &TerminalPrompt } else { &NoPrompt };
-    run_codex_with_deps(args, prompt, mode, attempt_codex, &AppServerClient::default(), decider)
+    run_codex_checked(
+        args,
+        prompt,
+        mode,
+        attempt_codex,
+        &AppServerClient::default(),
+        decider,
+        end_marker,
+    )
+}
+
+/// [`run_codex_with_deps`], then the `--require-end-marker` check. With
+/// `end_marker` set, the last agent message of the last codex attempt (what
+/// codex writes to `-o`; an empty one counts) must end with that
+/// line, or a run that would exit 0 exits [`EXIT_INCOMPLETE_ANSWER`] instead.
+/// Without it, identical to [`run_codex_with_deps`].
+pub fn run_codex_checked<F>(
+    args: &[String],
+    prompt: &str,
+    mode: Mode,
+    attempt: F,
+    usage_client: &dyn UsageClient,
+    decider: &dyn CreditDecider,
+    end_marker: Option<&str>,
+) -> Result<i32>
+where
+    F: Fn(&[String], &str, &Mode, bool) -> Result<AttemptResult>,
+{
+    let Some(marker) = end_marker else {
+        return run_codex_with_deps(args, prompt, mode, attempt, usage_client, decider);
+    };
+    // Every code that ends a run on an attempt's output comes from the last
+    // attempt made, so recording each attempt's final message is enough.
+    let last_answer: RefCell<Option<String>> = RefCell::new(None);
+    let code = run_codex_with_deps(
+        args,
+        prompt,
+        mode,
+        |a: &[String], p: &str, m: &Mode, scrub: bool| -> Result<AttemptResult> {
+            let result = attempt(a, p, m, scrub)?;
+            *last_answer.borrow_mut() = result.output.final_message.clone();
+            Ok(result)
+        },
+        usage_client,
+        decider,
+    )?;
+    let answer = last_answer.into_inner();
+    Ok(check_end_marker(code, answer.as_deref(), marker))
+}
+
+/// Whether `text`, ignoring trailing whitespace, ends with the line `marker`
+/// (surrounding whitespace on that line is ignored too).
+pub fn ends_with_marker(text: &str, marker: &str) -> bool {
+    text.trim_end()
+        .lines()
+        .next_back()
+        .is_some_and(|line| line.trim() == marker.trim())
+}
+
+/// The exit code after the `--require-end-marker` check: `code` unchanged
+/// unless it is 0 and `answer` (the final agent message, if any) does not end
+/// with `marker`, which prints one line on stderr and returns
+/// [`EXIT_INCOMPLETE_ANSWER`].
+pub fn check_end_marker(code: i32, answer: Option<&str>, marker: &str) -> i32 {
+    if code != 0 || answer.is_some_and(|a| ends_with_marker(a, marker)) {
+        return code;
+    }
+    eprintln!(
+        "Incomplete answer: the final message does not end with the line {:?}; \
+         codex stopped early. Re-run (exit {}).",
+        marker.trim(),
+        EXIT_INCOMPLETE_ANSWER
+    );
+    EXIT_INCOMPLETE_ANSWER
 }
 
 /// Non-interactive orchestration with an injected spawner and **no** usage
@@ -1552,9 +1641,9 @@ pub fn parse_codex_stream<R: BufRead>(reader: R) -> io::Result<CodexOutput> {
                     output.add_thread_id(thread_id);
                 }
                 Event::AgentMessage { text } => {
-                    if let Some(t) = text {
-                        output.add_message(t);
-                    }
+                    // A message without text still counts as the final
+                    // message (as ""); `add_message` keeps it out of `messages`.
+                    output.add_message(text.unwrap_or_default());
                 }
                 Event::TurnCompleted {
                     input_tokens,
@@ -1725,6 +1814,69 @@ not json at all
         assert_eq!(output.events_recognized, 0);
         let rendered = output.render();
         assert!(rendered.stderr.contains("none matched known event types"));
+    }
+
+    #[test]
+    fn ends_with_marker_ignores_trailing_whitespace_only() {
+        let m = "END-OF-ANSWER";
+        assert!(ends_with_marker("Findings.\nEND-OF-ANSWER", m));
+        assert!(ends_with_marker("Findings.\nEND-OF-ANSWER\n", m));
+        assert!(ends_with_marker("Findings.\r\nEND-OF-ANSWER  \r\n \n\t", m));
+        assert!(ends_with_marker("END-OF-ANSWER", m));
+        assert!(!ends_with_marker("Now checking the tests...", m));
+        assert!(!ends_with_marker("END-OF-ANSWER\nOne more thing.", m));
+        assert!(!ends_with_marker("Findings. END-OF-ANSWER", m), "must be its own line");
+        assert!(!ends_with_marker("", m));
+        assert!(!ends_with_marker("  \n ", m));
+    }
+
+    #[test]
+    fn check_end_marker_only_overrides_a_zero_exit() {
+        let m = "END-OF-ANSWER";
+        assert_eq!(check_end_marker(0, Some("done\nEND-OF-ANSWER\n"), m), 0);
+        assert_eq!(check_end_marker(0, Some("Now checking..."), m), EXIT_INCOMPLETE_ANSWER);
+        assert_eq!(check_end_marker(0, None, m), EXIT_INCOMPLETE_ANSWER, "no answer at all");
+        for code in [1, EXIT_ALL_SEATS_COOLING, EXIT_CREDITS_CONSENT_NEEDED, EXIT_RESET_AVAILABLE] {
+            assert_eq!(check_end_marker(code, Some("Now checking..."), m), code);
+            assert_eq!(check_end_marker(code, None, m), code);
+        }
+    }
+
+    #[test]
+    fn incomplete_answer_exit_is_distinct() {
+        for code in [0, 1, 2, EXIT_ALL_SEATS_COOLING, EXIT_CREDITS_CONSENT_NEEDED, EXIT_RESET_AVAILABLE] {
+            assert_ne!(EXIT_INCOMPLETE_ANSWER, code);
+        }
+    }
+
+    #[test]
+    fn empty_final_agent_message_is_tracked_and_fails_the_marker_check() {
+        let data = r#"{"type":"thread.started","thread_id":"t"}
+{"type":"item.completed","item":{"type":"agent_message","text":"Findings.\nEND-OF-ANSWER"}}
+{"type":"item.completed","item":{"type":"agent_message","text":""}}
+"#;
+        let output = parse_codex_stream(BufReader::new(Cursor::new(data))).unwrap();
+        assert_eq!(output.messages, vec!["Findings.\nEND-OF-ANSWER".to_string()], "messages unchanged");
+        assert_eq!(output.final_message.as_deref(), Some(""));
+        assert_eq!(
+            check_end_marker(0, output.final_message.as_deref(), "END-OF-ANSWER"),
+            EXIT_INCOMPLETE_ANSWER
+        );
+
+        let no_text = r#"{"type":"item.completed","item":{"type":"agent_message","text":"Done.\nEND-OF-ANSWER"}}
+{"type":"item.completed","item":{"type":"agent_message"}}
+"#;
+        let output = parse_codex_stream(BufReader::new(Cursor::new(no_text))).unwrap();
+        assert_eq!(output.messages.len(), 1);
+        assert_eq!(output.final_message.as_deref(), Some(""), "missing text recorded as empty");
+
+        let marked = r#"{"type":"item.completed","item":{"type":"agent_message","text":"Done.\nEND-OF-ANSWER\n"}}
+"#;
+        let output = parse_codex_stream(BufReader::new(Cursor::new(marked))).unwrap();
+        assert_eq!(check_end_marker(0, output.final_message.as_deref(), "END-OF-ANSWER"), 0);
+
+        let none = parse_codex_stream(BufReader::new(Cursor::new("{\"type\":\"thread.started\",\"thread_id\":\"t\"}\n"))).unwrap();
+        assert_eq!(none.final_message, None);
     }
 
     #[test]

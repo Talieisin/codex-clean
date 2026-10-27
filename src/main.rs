@@ -1,7 +1,8 @@
 use std::io::{self, BufRead};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser, Subcommand};
 
 use codex_clean::{runner, seat_cmd};
 
@@ -12,6 +13,11 @@ use codex_clean::{runner, seat_cmd};
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+
+    /// Exit 76 when the final agent message does not end with this line (e.g. END-OF-ANSWER).
+    /// Must come before any codex options or subcommand name. Runs only (exec, resume, review)
+    #[arg(long, value_name = "TEXT", value_parser = parse_end_marker)]
+    require_end_marker: Option<String>,
 
     /// Arguments to pass to codex exec (e.g., -m gpt-5.2-codex --sandbox read-only)
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -156,13 +162,23 @@ enum SeatAction {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
+    let marker = cli.require_end_marker.as_deref();
+    if marker.is_some() && matches!(cli.command, Some(Commands::Seat { .. } | Commands::Cost { .. })) {
+        Cli::command()
+            .error(
+                ErrorKind::ArgumentConflict,
+                "--require-end-marker applies only to codex runs (exec, resume, review)",
+            )
+            .exit();
+    }
+
     let result = match cli.command {
         Some(Commands::Resume {
             last,
             session_id,
             prompt,
-        }) => run_resume(last, session_id, prompt),
-        Some(Commands::Review { args }) => run_review(args),
+        }) => run_resume(last, session_id, prompt, marker),
+        Some(Commands::Review { args }) => run_review(args, marker),
         Some(Commands::Seat { action }) => run_seat(action),
         Some(Commands::Cost {
             session_id,
@@ -170,7 +186,7 @@ fn main() -> ExitCode {
             seat,
             json,
         }) => seat_cmd::cost(session_id.as_deref(), last, seat.as_deref(), json),
-        None => run_exec(cli.args),
+        None => run_exec(cli.args, marker),
     };
 
     match result {
@@ -180,6 +196,19 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// `--require-end-marker` value: one line with visible text. A blank or
+/// multi-line marker can never match the trimmed last line of an answer, so
+/// every run would exit 76 and no re-run could fix it.
+fn parse_end_marker(s: &str) -> Result<String, String> {
+    if s.trim().is_empty() {
+        return Err("the marker must not be empty or only whitespace".to_string());
+    }
+    if s.contains(['\n', '\r']) {
+        return Err("the marker must be a single line (no newline characters)".to_string());
+    }
+    Ok(s.to_string())
 }
 
 fn run_seat(action: SeatAction) -> anyhow::Result<i32> {
@@ -215,7 +244,7 @@ fn run_seat(action: SeatAction) -> anyhow::Result<i32> {
     }
 }
 
-fn run_exec(args: Vec<String>) -> anyhow::Result<i32> {
+fn run_exec(args: Vec<String>, end_marker: Option<&str>) -> anyhow::Result<i32> {
     let (codex_args, prompt_arg) = split_codex_args(&args)?;
 
     // Handle stdin input
@@ -234,6 +263,7 @@ fn run_exec(args: Vec<String>) -> anyhow::Result<i32> {
         &prompt,
         runner::Mode::Exec,
         interactive_session(prompt_arg == "-"),
+        end_marker,
     )
 }
 
@@ -241,6 +271,7 @@ fn run_resume(
     last: bool,
     session_id: Option<String>,
     prompt: Option<String>,
+    end_marker: Option<&str>,
 ) -> anyhow::Result<i32> {
     // When --last is used, both positionals are prompt fragments
     // (e.g., `resume --last add error` → prompt "add error")
@@ -260,13 +291,20 @@ fn run_resume(
         &actual_prompt,
         runner::Mode::Resume(resume_target),
         interactive_session(false),
+        end_marker,
     )
 }
 
-fn run_review(args: Vec<String>) -> anyhow::Result<i32> {
+fn run_review(args: Vec<String>, end_marker: Option<&str>) -> anyhow::Result<i32> {
     // Pass all args through to codex exec review — it handles its own
     // flag and optional trailing prompt parsing. No heuristic needed.
-    runner::run_codex(&args, "", runner::Mode::Review, interactive_session(false))
+    runner::run_codex(
+        &args,
+        "",
+        runner::Mode::Review,
+        interactive_session(false),
+        end_marker,
+    )
 }
 
 /// Whether a credits prompt may be shown: stdin and stderr are terminals,
@@ -459,6 +497,33 @@ mod tests {
         assert!(!interactive_from(false, true, false, None), "stderr not a terminal");
         assert!(!interactive_from(false, true, true, Some("1")), "explicitly non-interactive");
         assert!(interactive_from(false, true, true, Some("0")));
+    }
+
+    #[test]
+    fn require_end_marker_is_parsed_before_codex_args_and_subcommands() {
+        let cli = Cli::parse_from(["codex-clean", "--require-end-marker", "END-OF-ANSWER", "-p", "role", "-"]);
+        assert_eq!(cli.require_end_marker.as_deref(), Some("END-OF-ANSWER"));
+        assert_eq!(cli.args, vec!["-p".to_string(), "role".to_string(), "-".to_string()]);
+
+        let cli = Cli::parse_from(["codex-clean", "--require-end-marker", "END", "review", "--base", "main"]);
+        assert_eq!(cli.require_end_marker.as_deref(), Some("END"));
+        assert!(matches!(cli.command, Some(Commands::Review { .. })));
+
+        let cli = Cli::parse_from(["codex-clean", "-m", "x", "prompt"]);
+        assert_eq!(cli.require_end_marker, None);
+
+        assert!(Cli::try_parse_from(["codex-clean", "--require-end-marker", "", "prompt"]).is_err());
+        for bad in ["   ", "\t", "END\nOF", "END-OF-ANSWER\n", "END\rOF"] {
+            let err = match Cli::try_parse_from(["codex-clean", "--require-end-marker", bad, "prompt"]) {
+                Ok(_) => panic!("marker {:?} should be rejected", bad),
+                Err(e) => e,
+            };
+            assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation, "marker {:?}", bad);
+            assert_eq!(err.exit_code(), 2, "usage error for {:?}", bad);
+        }
+        // Surrounding spaces are accepted (the comparison trims them).
+        let cli = Cli::parse_from(["codex-clean", "--require-end-marker", "  END-OF-ANSWER ", "prompt"]);
+        assert_eq!(cli.require_end_marker.as_deref(), Some("  END-OF-ANSWER "));
     }
 
     #[test]

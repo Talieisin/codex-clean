@@ -5,6 +5,11 @@ use std::fmt::Write as FmtWrite;
 pub struct CodexOutput {
     pub session_id: Option<String>,
     pub messages: Vec<String>,
+    /// Text of the last agent-message event, kept even when empty (or when
+    /// the event had no text, recorded as ""). `None` when no agent message
+    /// was seen. Unlike `messages`, an empty final message is not skipped, so
+    /// it is what `--require-end-marker` checks.
+    pub final_message: Option<String>,
     pub multiple_threads_seen: bool,
     /// Token usage: (input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens)
     pub usage: Option<(u64, u64, u64, u64)>,
@@ -46,11 +51,13 @@ impl CodexOutput {
         self.usage = Some((input, cached, output, reasoning));
     }
 
-    /// Add an agent message text
+    /// Add an agent message text. Every call becomes `final_message`; only
+    /// non-empty text is added to `messages`.
     pub fn add_message(&mut self, text: String) {
         if !text.is_empty() {
-            self.messages.push(text);
+            self.messages.push(text.clone());
         }
+        self.final_message = Some(text);
     }
 
     /// Record an error surfaced by codex (turn.failed or stream error).
@@ -184,6 +191,7 @@ mod tests {
         output.add_message("".to_string());
         assert_eq!(output.messages.len(), 1);
         assert_eq!(output.aggregated_message(), "content");
+        assert_eq!(output.final_message.as_deref(), Some(""), "empty final message is kept");
     }
 
     #[test]

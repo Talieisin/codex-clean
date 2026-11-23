@@ -19,7 +19,7 @@ struct Cli {
     #[arg(long, value_name = "TEXT", value_parser = parse_end_marker)]
     require_end_marker: Option<String>,
 
-    /// Arguments to pass to codex exec (e.g., -m gpt-5.2-codex --sandbox read-only)
+    /// Arguments to pass to codex exec (e.g., -m gpt-6.2-sol --sandbox read-only)
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
 }

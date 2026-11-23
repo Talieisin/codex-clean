@@ -22,10 +22,10 @@ cargo build --release
 codex-clean "summarize this repo"
 
 # With codex options
-codex-clean -m gpt-5.5 --sandbox read-only "explain the main function"
+codex-clean -m gpt-6.2-sol --sandbox read-only "explain the main function"
 
 # With config options
-codex-clean -m gpt-5.5 --config model_reasoning_effort="high" --sandbox read-only "review this code"
+codex-clean -m gpt-6.2-sol --config model_reasoning_effort="high" --sandbox read-only "review this code"
 
 # Change working directory
 codex-clean -C /path/to/project "analyze the codebase"
@@ -35,7 +35,7 @@ echo "what does this code do?" | codex-clean -
 
 # Exit 76 unless the final answer ends with the line END-OF-ANSWER
 # (the flag goes before any codex options or subcommand)
-codex-clean --require-end-marker END-OF-ANSWER -m gpt-5.5 "review this; end with the line END-OF-ANSWER"
+codex-clean --require-end-marker END-OF-ANSWER -m gpt-6.2-sol "review this; end with the line END-OF-ANSWER"
 ```
 
 `--require-end-marker <TEXT>` is opt-in. A run that is cut short (credits or capacity ran out, the process was interrupted) can still exit 0 with only a progress note as its answer. When the prompt asks codex to end its answer with a fixed line, this flag makes codex-clean check that the final agent message (the one codex also writes to `-o`) ends with that line, ignoring trailing whitespace. If it does not, codex-clean prints one line on stderr and exits **76** instead of 0. Any other non-zero exit (a codex failure, 75, 77, 78) is kept as is. Without the flag nothing is checked.
@@ -66,7 +66,7 @@ codex-clean review --commit abc1234
 codex-clean review --base main "focus on error handling"
 
 # Review with model options
-codex-clean review -m gpt-5.5 --uncommitted
+codex-clean review -m gpt-6.2-sol --uncommitted
 ```
 
 ### Multi-seat (rotate across multiple ChatGPT accounts)
@@ -134,14 +134,14 @@ codex-clean seat remove work
 
 **How rotation works.** Before each codex invocation, `codex-clean` acquires a per-host advisory lock, picks a seat by the configured strategy, first copies any token refresh the previously active seat received (from plain `codex`, or from the last run) back into that seat's slot, then atomically copies the chosen seat's auth blob into `~/.codex/auth.json`, runs codex, and copies any token refresh codex performed back into the seat's slot. If the run fails with one of codex's exhaustion messages, the seat is cooled and the next eligible seat is tried. Recognised messages and how long the seat cools:
 
-| Message (codex 0.153.x wording) | Recorded reason | Scope | Cooldown |
+| Message (codex 0.153–0.171 wording) | Recorded reason | Scope | Cooldown |
 |---|---|---|---|
 | "You've hit your usage limit for <model> …" | `model_limit` | this seat | until the "try again at HH:MM" codex reports, else `default_cooldown_seconds` |
 | "You've hit your usage limit …", "Usage limit reached. You've reached your usage limit …" | `rate_limit` | this seat | until the "try again at HH:MM" codex reports, else `default_cooldown_seconds` |
 | "Your workspace is out of credits …", "You've reached your workspace credit limit" | `credits` | **every seat in the same workspace** | `default_cooldown_seconds` (top up and carry on) |
 | "You hit your spend cap set in your workspace …" | `spend_control` | **every seat in the same workspace** | `cooldown_max_seconds` (admin-set hard stop) |
 
-Codex sometimes delivers these sentences as the *final agent message* rather than an error event (the out-of-credits case does), so on a failed run the last agent message is classified too. Credits and spend caps are workspace-wide (typically the `premium` credit pool for premium models), so seats sharing an `account_id` are cooled together instead of rotating into the same wall. Transient per-minute 429s are left to codex's own retries and are not treated as exhaustion.
+Matching is case-insensitive and treats a curly apostrophe (`’`, which codex 0.171 prints) the same as a straight one. Codex sometimes delivers these sentences as the *final agent message* rather than an error event (the out-of-credits case does), so on a failed run the last agent message is classified too. Credits and spend caps are workspace-wide (typically the `premium` credit pool for premium models), so seats sharing an `account_id` are cooled together instead of rotating into the same wall. Transient per-minute 429s are left to codex's own retries and are not treated as exhaustion.
 
 **Cooldown rules.** Every cooldown goes through one merge rule. Seeing the same limit again never pushes an existing cooldown later, so repeated `seat status` checks cannot slide it forward. A different reason keeps the later deadline and records the stronger reason (`spend_control` > `model_limit` > `credits` > `rate_limit`), so a hard stop is never hidden behind a weaker one. A fresh usage snapshot counts as the check: once a cooldown expires, a snapshot that still shows the seat exhausted (and no credits) starts a new one without needing a failed run.
 
@@ -371,7 +371,7 @@ codex-clean seat remove <NAME> [--yes]
 
 ## Requirements
 
-- [Codex CLI](https://github.com/openai/codex) v0.124.0+ installed and in PATH (v0.125.0+ recommended for the device-code login flow used by `seat add`; v0.153.0+ required for `seat status`)
+- [Codex CLI](https://github.com/openai/codex) v0.124.0+ installed and in PATH (v0.125.0+ recommended for the device-code login flow used by `seat add`; v0.153.0+ required for `seat status`; tested against v0.171.0, the first release with GPT-6.2 Sol and Astra)
 - Rust 1.82+ (for building from source)
 
 ## Licence

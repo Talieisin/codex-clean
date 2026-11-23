@@ -2,7 +2,9 @@
 //!
 //! Pure parsing — no I/O. The strings we anchor on are sourced from
 //! `codex-rs/protocol/src/error.rs` and `codex-rs/login/src/auth/manager.rs`
-//! (codex 0.125.0). They're hardcoded English upstream; no i18n.
+//! (codex 0.125.0, rechecked against 0.171.0). They're hardcoded English
+//! upstream; no i18n. Typography is not stable across releases (0.171 switched
+//! "You've" to "You’ve"), so text is folded by [`normalise`] before matching.
 
 use chrono::{DateTime, Duration, Local, NaiveDateTime, NaiveTime, TimeZone, Utc};
 
@@ -115,8 +117,9 @@ pub fn classify_text(blob: &str) -> FailureKind {
     FailureKind::Other
 }
 
-/// Exhaustion phrases codex 0.153.x emits in `turn.failed` / `error`
-/// messages. `codex exec --json` carries prose only (no error code), so
+/// Exhaustion phrases codex emits in `turn.failed` / `error` messages
+/// (worded as in 0.153.x through 0.171.x; 0.171 prints a curly apostrophe,
+/// which [`normalise`] folds back to the ASCII one written here). `codex exec --json` carries prose only (no error code), so
 /// detection is text-based. Compared case-insensitively.
 ///
 /// Deliberately absent: transient per-minute 429 text (codex retries those
@@ -145,8 +148,21 @@ const RATE_LIMIT_PHRASES: &[(&str, CooldownReason)] = &[
     ("you've reached your usage limit", CooldownReason::RateLimit),
 ];
 
+/// Lower-case `s` and fold typographic apostrophes to `'`, so the phrase
+/// tables (written with ASCII apostrophes) match either spelling. Only for
+/// containment checks: byte offsets into the result do not map back to `s`.
+fn normalise(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| match c {
+            '\u{2019}' | '\u{2018}' | '\u{02BC}' => '\'',
+            other => other,
+        })
+        .collect()
+}
+
 fn rate_limit_reason(s: &str) -> Option<CooldownReason> {
-    let lower = s.to_lowercase();
+    let lower = normalise(s);
     RATE_LIMIT_PHRASES
         .iter()
         .find(|(phrase, _)| lower.contains(phrase))
@@ -171,7 +187,7 @@ const AUTH_ERROR_PHRASES: &[&str] = &[
 ];
 
 pub(crate) fn is_auth_error(s: &str) -> bool {
-    let lower = s.to_lowercase();
+    let lower = normalise(s);
     AUTH_ERROR_PHRASES.iter().any(|p| lower.contains(p))
 }
 
@@ -285,6 +301,47 @@ mod tests {
 
     fn local(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<Local> {
         Local.with_ymd_and_hms(y, m, d, h, min, 0).single().unwrap()
+    }
+
+    /// codex 0.171 prints these with U+2019 ("You’ve"); 0.153 used ASCII.
+    #[test]
+    fn curly_apostrophe_wordings_classify_like_ascii() {
+        let cases = [
+            (
+                "You\u{2019}ve hit your usage limit for gpt-6.2-sol. Switch to another model now, or try again at 5:32 PM.",
+                CooldownReason::ModelLimit,
+            ),
+            (
+                "You\u{2019}ve hit your usage limit. To get more access now, send a request to your admin or try again at 5:32 PM.",
+                CooldownReason::RateLimit,
+            ),
+            (
+                "You\u{2019}ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at 5:32 PM.",
+                CooldownReason::RateLimit,
+            ),
+            (
+                "Usage limit reached. You\u{2019}ve reached your usage limit. Increase your limits to continue using codex.",
+                CooldownReason::RateLimit,
+            ),
+            (
+                "You\u{2019}re out of credits. Add credits to continue using Codex.",
+                CooldownReason::Credits,
+            ),
+        ];
+        for (msg, want) in cases {
+            match classify_text(msg) {
+                FailureKind::RateLimit { reason, .. } => assert_eq!(reason, want, "{msg}"),
+                other => panic!("expected RateLimit for {msg:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn curly_apostrophe_keeps_recovery_time() {
+        let now = local(2026, 11, 22, 12, 0);
+        let msg = "You\u{2019}ve hit your usage limit. Try again at 5:32 PM.";
+        let t = parse_recovery_time(msg, now).expect("recovery time");
+        assert_eq!(t, local(2026, 11, 22, 17, 32));
     }
 
     #[test]
